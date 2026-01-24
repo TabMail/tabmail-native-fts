@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Test artifacts
+.pytest_cache/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temp files
+*.tmp
+*.bak
+*.backup
+
+# Rust
+target/
+Cargo.lock
+.cargo/config.toml.bak
+
+# Secrets (local only)
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+.secrets/
+
+# Local build artifacts
+dist/
+build/

@@ -1,0 +1,36 @@
+[package]
+name = "tabmail-native-fts"
+version = "0.6.9"
+edition = "2021"
+license-file = "LICENSE"
+
+# NOTE:
+# - This is a native messaging host for Thunderbird (MV3).
+# - We bundle SQLite so the resulting binary has no external runtime deps.
+
+[dependencies]
+anyhow = "1.0.95"
+chrono = { version = "0.4.39", default-features = false, features = ["clock", "std"] }
+base64 = "0.22.1"
+ed25519-dalek = { version = "2.1.1", default-features = false, features = ["std"] }
+hex = "0.4.3"
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.134"
+sha2 = "0.10.8"
+ureq = { version = "2.12.1", default-features = true }
+
+# Logging with rotation
+flexi_logger = { version = "0.29.8", features = ["specfile_without_notification"] }
+log = "0.4.22"
+
+[dev-dependencies]
+assert_cmd = "2.0.16"
+predicates = "3.1.2"
+
+[[bin]]
+# Keep the historical executable name expected by manifests/installers.
+name = "fts_helper"
+path = "src/main.rs"
+
+

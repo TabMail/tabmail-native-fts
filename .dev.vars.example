@@ -1,0 +1,10 @@
+# TabMail Native FTS - Local Development Secrets
+#
+# Copy this file to `.dev.vars` and fill in the real values.
+# `.dev.vars` is gitignored.
+
+# --- Ed25519 update signing ---
+# Path to the Ed25519 private key PEM file used to sign update manifests.
+# Generate with: ./scripts/rotate-update-signing-key.sh
+# The corresponding public key is compiled into the Rust binary.
+TM_UPDATE_PRIVATE_KEY_PEM_PATH=""

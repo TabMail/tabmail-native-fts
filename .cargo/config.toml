@@ -1,0 +1,6 @@
+[env]
+# Force bundled SQLite to compile with FTS5 enabled (feature parity requirement).
+# This is picked up by libsqlite3-sys build script when using rusqlite's bundled feature.
+LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_FTS4 -DSQLITE_ENABLE_FTS3 -DSQLITE_ENABLE_JSON1"
+
+
