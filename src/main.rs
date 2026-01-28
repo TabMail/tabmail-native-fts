@@ -14,6 +14,7 @@ use anyhow::{Context, bail};
 use serde_json::Value;
 
 use crate::fts::db::{DbState, open_or_create_db};
+use crate::fts::memory_db;
 
 fn main() {
     if let Err(e) = real_main() {
@@ -91,8 +92,12 @@ fn real_main() -> anyhow::Result<()> {
 
 fn handle_request(state: &mut DbState, method: &str, msg_id: &str, params: &Value) -> anyhow::Result<Value> {
     match method {
+        // Core handlers
         "hello" => handle_hello(msg_id, params),
         "init" => handle_init(state, msg_id, params),
+        "updateCheck" => handle_update_check(msg_id, params),
+        "updateRequest" => handle_update_request(state, msg_id, params),
+        // Email FTS handlers
         "indexBatch" => handle_index_batch(state, msg_id, params),
         "search" => handle_search(state, msg_id, params),
         "stats" => handle_stats(state, msg_id),
@@ -103,8 +108,13 @@ fn handle_request(state: &mut DbState, method: &str, msg_id: &str, params: &Valu
         "getMessageByMsgId" => handle_get_message_by_msgid(state, msg_id, params),
         "queryByDateRange" => handle_query_by_date_range(state, msg_id, params),
         "debugSample" => handle_debug_sample(state, msg_id),
-        "updateCheck" => handle_update_check(msg_id, params),
-        "updateRequest" => handle_update_request(state, msg_id, params),
+        // Memory database handlers
+        "memoryIndexBatch" => handle_memory_index_batch(state, msg_id, params),
+        "memorySearch" => handle_memory_search(state, msg_id, params),
+        "memoryStats" => handle_memory_stats(state, msg_id),
+        "memoryClear" => handle_memory_clear(state, msg_id),
+        "memoryRemoveBatch" => handle_memory_remove_batch(state, msg_id, params),
+        "memoryDebugSample" => handle_memory_debug_sample(state, msg_id),
         _ => Ok(serde_json::json!({ "id": msg_id, "error": format!("Unknown method: {method}") })),
     }
 }
@@ -237,7 +247,7 @@ fn handle_init(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Res
         log::warn!("Could not create addon data dir: {}", e);
     }
 
-    // Initialize DB at new location
+    // Initialize email FTS DB at new location
     let (db_path, conn) = open_or_create_db(&new_fts_parent)?;
     state.db_path = Some(db_path.clone());
     state.conn = Some(conn);
@@ -247,13 +257,27 @@ fn handle_init(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Res
         crate::fts::db::db_count(conn)?
     };
 
+    // Initialize memory DB (separate database file)
+    let (memory_db_path, memory_conn) = memory_db::open_or_create_memory_db(&new_fts_dir)?;
+    state.memory_db_path = Some(memory_db_path.clone());
+    state.memory_conn = Some(memory_conn);
+
+    let memory_docs = {
+        let conn = state.memory_conn.as_ref().context("memory db connection missing after init")?;
+        memory_db::memory_db_count(conn)?
+    };
+
+    log::info!("Both databases initialized: {} email docs, {} memory entries", docs, memory_docs);
+
     Ok(serde_json::json!({
         "id": msg_id,
         "result": {
             "ok": true,
             "dbPath": db_path.to_string_lossy(),
+            "memoryDbPath": memory_db_path.to_string_lossy(),
             "persistent": true,
             "docs": docs,
+            "memoryDocs": memory_docs,
             "vfs": "native",
             "tbProfile": tb_profile.to_string_lossy(),
             "addonDataDir": new_fts_parent.to_string_lossy()
@@ -454,5 +478,67 @@ fn handle_query_by_date_range(state: &mut DbState, msg_id: &str, params: &Value)
 fn handle_debug_sample(state: &mut DbState, msg_id: &str) -> anyhow::Result<Value> {
     let conn = require_conn(state)?;
     let res = crate::fts::db::debug_sample(conn)?;
+    Ok(serde_json::json!({ "id": msg_id, "result": res }))
+}
+
+// ============================================================================
+// Memory database handlers
+// ============================================================================
+
+fn require_memory_conn_mut<'a>(state: &'a mut DbState) -> anyhow::Result<&'a mut rusqlite::Connection> {
+    state.memory_conn.as_mut().context("Memory database not initialized. Call 'init' first.")
+}
+
+fn require_memory_conn<'a>(state: &'a DbState) -> anyhow::Result<&'a rusqlite::Connection> {
+    state.memory_conn.as_ref().context("Memory database not initialized. Call 'init' first.")
+}
+
+fn handle_memory_index_batch(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Result<Value> {
+    let rows = params.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let conn = require_memory_conn_mut(state)?;
+    let (count, skipped) = memory_db::memory_index_batch(conn, &rows)?;
+
+    Ok(serde_json::json!({
+        "id": msg_id,
+        "result": { "ok": true, "count": count, "skippedDuplicates": skipped }
+    }))
+}
+
+fn handle_memory_search(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Result<Value> {
+    let q = params.get("q").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let conn = require_memory_conn(state)?;
+    let results = memory_db::memory_search(conn, &q, params, &state.synonyms)?;
+    Ok(serde_json::json!({ "id": msg_id, "result": results }))
+}
+
+fn handle_memory_stats(state: &mut DbState, msg_id: &str) -> anyhow::Result<Value> {
+    let conn = require_memory_conn(state)?;
+    let docs = memory_db::memory_db_count(conn)?;
+    let db_bytes = state
+        .memory_db_path
+        .as_ref()
+        .and_then(|p| std::fs::metadata(p).ok().map(|m| m.len() as i64))
+        .unwrap_or(0);
+    Ok(serde_json::json!({
+        "id": msg_id,
+        "result": { "ok": true, "docs": docs, "dbBytes": db_bytes }
+    }))
+}
+
+fn handle_memory_clear(state: &mut DbState, msg_id: &str) -> anyhow::Result<Value> {
+    memory_db::memory_clear_rebuild(&mut state.memory_db_path, &mut state.memory_conn)?;
+    Ok(serde_json::json!({ "id": msg_id, "result": { "ok": true } }))
+}
+
+fn handle_memory_remove_batch(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Result<Value> {
+    let ids = params.get("ids").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let conn = require_memory_conn_mut(state)?;
+    let removed = memory_db::memory_remove_batch(conn, &ids)?;
+    Ok(serde_json::json!({ "id": msg_id, "result": { "ok": true, "count": removed } }))
+}
+
+fn handle_memory_debug_sample(state: &mut DbState, msg_id: &str) -> anyhow::Result<Value> {
+    let conn = require_memory_conn(state)?;
+    let res = memory_db::memory_debug_sample(conn)?;
     Ok(serde_json::json!({ "id": msg_id, "result": res }))
 }

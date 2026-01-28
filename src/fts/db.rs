@@ -8,10 +8,14 @@ use serde_json::Value;
 use crate::{config, fts::query::build_fts_match, fts::synonyms::SynonymLookup};
 
 pub struct DbState {
+    // Email FTS database
     pub db_path: Option<PathBuf>,
     pub conn: Option<Connection>,
     pub synonyms: SynonymLookup,
     pub should_exit: bool,
+    // Memory database (separate from email FTS)
+    pub memory_db_path: Option<PathBuf>,
+    pub memory_conn: Option<Connection>,
 }
 
 impl DbState {
@@ -21,6 +25,8 @@ impl DbState {
             conn: None,
             synonyms: SynonymLookup::new(),
             should_exit: false,
+            memory_db_path: None,
+            memory_conn: None,
         }
     }
 }
