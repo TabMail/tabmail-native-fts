@@ -195,10 +195,72 @@ pub fn memory_index_batch(conn: &mut Connection, rows: &[Value]) -> anyhow::Resu
 }
 
 /// Search memory database (uses same FTS5/BM25/synonyms as email search)
+/// If query is empty, returns all entries sorted by date (for browsing)
 pub fn memory_search(conn: &Connection, q: &str, params: &Value, synonyms: &SynonymLookup) -> anyhow::Result<Vec<Value>> {
     let query = q.trim();
+    let ignore_date = params.get("ignoreDate").and_then(|v| v.as_bool()).unwrap_or(false);
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(config::sqlite::SEARCH_DEFAULT_LIMIT);
+
+    // Empty query = list all by date (for browsing mode)
     if query.is_empty() {
-        return Ok(vec![]);
+        log::info!("Memory search with empty query - listing all by date (limit={})", limit);
+        
+        let mut sql = r#"
+            SELECT fts.memId, fts.role, fts.content, fts.sessionId, meta.dateMs
+            FROM memory_fts fts
+            JOIN memory_meta meta ON fts.rowid = meta.rowid
+            WHERE 1=1
+        "#.to_string();
+        
+        let mut bind: Vec<rusqlite::types::Value> = vec![];
+
+        // Date range filtering
+        if !ignore_date {
+            if let Some(from_v) = params.get("from") {
+                if let Some(ts) = super::db::parse_date_param(from_v)? {
+                    sql.push_str(" AND meta.dateMs >= ?");
+                    bind.push(rusqlite::types::Value::from(ts));
+                }
+            }
+            if let Some(to_v) = params.get("to") {
+                if let Some(ts) = super::db::parse_date_param(to_v)? {
+                    sql.push_str(" AND meta.dateMs <= ?");
+                    bind.push(rusqlite::types::Value::from(ts));
+                }
+            }
+        }
+
+        sql.push_str(" ORDER BY meta.dateMs DESC LIMIT ?");
+        bind.push(rusqlite::types::Value::from(limit));
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind.iter()), |r| {
+            let mem_id: String = r.get(0)?;
+            let role: String = r.get(1)?;
+            let content: String = r.get(2)?;
+            let session_id: String = r.get(3)?;
+            let date_ms: i64 = r.get(4)?;
+
+            Ok(serde_json::json!({
+                "memId": mem_id,
+                "role": role,
+                "content": content,
+                "sessionId": session_id,
+                "dateMs": date_ms,
+                "snippet": null,
+                "rank": 0.0
+            }))
+        })?;
+
+        let mut results: Vec<Value> = vec![];
+        for r in rows {
+            results.push(r?);
+        }
+        log::info!("Memory list completed: found {} results", results.len());
+        return Ok(results);
     }
 
     // Use the same query builder as email search (with synonyms enabled)
@@ -212,12 +274,6 @@ pub fn memory_search(conn: &Connection, q: &str, params: &Value, synonyms: &Syno
         log::info!("Empty memory FTS query after normalization");
         return Ok(vec![]);
     }
-
-    let ignore_date = params.get("ignoreDate").and_then(|v| v.as_bool()).unwrap_or(false);
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(config::sqlite::SEARCH_DEFAULT_LIMIT);
 
     // BM25 weights: (memId, role, content, sessionId)
     // memId: 0.0 (not useful for ranking)
