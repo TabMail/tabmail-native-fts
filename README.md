@@ -98,13 +98,27 @@ The native messaging manifest tells Thunderbird where to find the helper binary.
 
 ## Database Storage
 
-The FTS database is stored in the **Thunderbird profile's extension data directory**:
+The FTS databases are stored in the **Thunderbird profile's extension data directory**:
+
+### Email database (`fts.db`)
 
 - **macOS**: `~/Library/Thunderbird/Profiles/<profile>/browser-extension-data/thunderbird@tabmail.ai/tabmail_fts/fts.db`
 - **Linux**: `~/.thunderbird/<profile>/browser-extension-data/thunderbird@tabmail.ai/tabmail_fts/fts.db`
 - **Windows**: `%APPDATA%\Thunderbird\Profiles\<profile>\browser-extension-data\thunderbird@tabmail.ai\tabmail_fts\fts.db`
 
-Each Thunderbird profile gets its own isolated FTS database.
+### Memory database (`memory.db`)
+
+A separate database stores chat history for the agent's memory features:
+
+- **macOS**: `~/Library/Thunderbird/Profiles/<profile>/browser-extension-data/thunderbird@tabmail.ai/tabmail_fts/memory.db`
+- **Linux**: `~/.thunderbird/<profile>/browser-extension-data/thunderbird@tabmail.ai/tabmail_fts/memory.db`
+- **Windows**: `%APPDATA%\Thunderbird\Profiles\<profile>\browser-extension-data\thunderbird@tabmail.ai\tabmail_fts\memory.db`
+
+The memory database enables:
+- **Memory search** — Find past conversations by keyword using FTS5 with stemming and synonyms
+- **Memory read** — Retrieve full chat sessions by timestamp for context continuity
+
+Each Thunderbird profile gets its own isolated FTS and memory databases.
 
 *Note: The helper automatically migrates databases from the old location (`<profile>/tabmail_fts/`) to the new location on first run.*
 
