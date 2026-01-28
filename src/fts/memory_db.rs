@@ -360,6 +360,63 @@ pub fn memory_clear_rebuild(
     Ok(())
 }
 
+/// Read memory entries around a given timestamp (±tolerance_ms)
+/// Returns full conversation content for entries within the time window
+pub fn memory_read_by_timestamp(
+    conn: &Connection,
+    timestamp_ms: i64,
+    tolerance_ms: i64,
+) -> anyhow::Result<Vec<Value>> {
+    let from_ms = timestamp_ms - tolerance_ms;
+    let to_ms = timestamp_ms + tolerance_ms;
+
+    log::info!(
+        "Memory read by timestamp: {} (±{}ms = {} to {})",
+        timestamp_ms,
+        tolerance_ms,
+        from_ms,
+        to_ms
+    );
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT fts.memId, fts.role, fts.content, fts.sessionId, meta.dateMs
+        FROM memory_fts fts
+        JOIN memory_meta meta ON fts.rowid = meta.rowid
+        WHERE meta.dateMs >= ?1 AND meta.dateMs <= ?2
+        ORDER BY meta.dateMs ASC
+        LIMIT 50
+        "#,
+    )?;
+
+    let rows = stmt.query_map(params![from_ms, to_ms], |r| {
+        let mem_id: String = r.get(0)?;
+        let role: String = r.get(1)?;
+        let content: String = r.get(2)?;
+        let session_id: String = r.get(3)?;
+        let date_ms: i64 = r.get(4)?;
+
+        Ok(serde_json::json!({
+            "memId": mem_id,
+            "role": role,
+            "content": content,
+            "sessionId": session_id,
+            "dateMs": date_ms
+        }))
+    })?;
+
+    let mut results: Vec<Value> = vec![];
+    for r in rows {
+        results.push(r?);
+    }
+
+    log::info!(
+        "Memory read by timestamp: found {} entries in time window",
+        results.len()
+    );
+    Ok(results)
+}
+
 /// Get debug sample from memory database
 pub fn memory_debug_sample(conn: &Connection) -> anyhow::Result<Vec<Value>> {
     log::info!("Getting memory debug sample");

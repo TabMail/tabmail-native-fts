@@ -115,6 +115,7 @@ fn handle_request(state: &mut DbState, method: &str, msg_id: &str, params: &Valu
         "memoryClear" => handle_memory_clear(state, msg_id),
         "memoryRemoveBatch" => handle_memory_remove_batch(state, msg_id, params),
         "memoryDebugSample" => handle_memory_debug_sample(state, msg_id),
+        "memoryRead" => handle_memory_read(state, msg_id, params),
         _ => Ok(serde_json::json!({ "id": msg_id, "error": format!("Unknown method: {method}") })),
     }
 }
@@ -541,4 +542,30 @@ fn handle_memory_debug_sample(state: &mut DbState, msg_id: &str) -> anyhow::Resu
     let conn = require_memory_conn(state)?;
     let res = memory_db::memory_debug_sample(conn)?;
     Ok(serde_json::json!({ "id": msg_id, "result": res }))
+}
+
+fn handle_memory_read(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Result<Value> {
+    // Default tolerance: 10 minutes (600,000 ms)
+    const DEFAULT_TOLERANCE_MS: i64 = 600_000;
+
+    let timestamp_ms = params
+        .get("timestampMs")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+
+    let tolerance_ms = params
+        .get("toleranceMs")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(DEFAULT_TOLERANCE_MS);
+
+    if timestamp_ms == 0 {
+        return Ok(serde_json::json!({
+            "id": msg_id,
+            "error": "Missing or invalid timestampMs parameter"
+        }));
+    }
+
+    let conn = require_memory_conn(state)?;
+    let results = memory_db::memory_read_by_timestamp(conn, timestamp_ms, tolerance_ms)?;
+    Ok(serde_json::json!({ "id": msg_id, "result": results }))
 }
