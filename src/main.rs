@@ -117,6 +117,8 @@ fn handle_request(state: &mut DbState, method: &str, msg_id: &str, params: &Valu
         "getMessageByMsgId" => handle_get_message_by_msgid(state, msg_id, params),
         "queryByDateRange" => handle_query_by_date_range(state, msg_id, params),
         "debugSample" => handle_debug_sample(state, msg_id),
+        "rebuildEmbeddingsStart" => handle_rebuild_embeddings_start(state, msg_id),
+        "rebuildEmbeddingsBatch" => handle_rebuild_embeddings_batch(state, msg_id, params),
         // Memory database handlers
         "memoryIndexBatch" => handle_memory_index_batch(state, msg_id, params),
         "memorySearch" => handle_memory_search(state, msg_id, params),
@@ -467,6 +469,7 @@ fn handle_search(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::R
 fn handle_stats(state: &mut DbState, msg_id: &str) -> anyhow::Result<Value> {
     let conn = require_conn(state)?;
     let docs = crate::fts::db::db_count(conn)?;
+    let vec_docs = crate::fts::db::vec_count(conn);
     let db_bytes = state
         .db_path
         .as_ref()
@@ -474,7 +477,7 @@ fn handle_stats(state: &mut DbState, msg_id: &str) -> anyhow::Result<Value> {
         .unwrap_or(0);
     Ok(serde_json::json!({
         "id": msg_id,
-        "result": { "ok": true, "docs": docs, "dbBytes": db_bytes }
+        "result": { "ok": true, "docs": docs, "vecDocs": vec_docs, "dbBytes": db_bytes }
     }))
 }
 
@@ -526,6 +529,58 @@ fn handle_debug_sample(state: &mut DbState, msg_id: &str) -> anyhow::Result<Valu
     Ok(serde_json::json!({ "id": msg_id, "result": res }))
 }
 
+fn handle_rebuild_embeddings_start(state: &mut DbState, msg_id: &str) -> anyhow::Result<Value> {
+    state.embedding_engine.as_ref()
+        .context("Embedding engine not available — cannot rebuild embeddings")?;
+
+    let conn = state.conn.as_mut().context("Database not initialized. Call 'init' first.")?;
+    let email_total = crate::fts::db::rebuild_embeddings_start(conn)?;
+
+    let memory_conn = state.memory_conn.as_mut().context("Memory database not initialized. Call 'init' first.")?;
+    let memory_total = memory_db::rebuild_memory_embeddings_start(memory_conn)?;
+
+    Ok(serde_json::json!({
+        "id": msg_id,
+        "result": {
+            "ok": true,
+            "emailTotal": email_total,
+            "memoryTotal": memory_total
+        }
+    }))
+}
+
+fn handle_rebuild_embeddings_batch(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Result<Value> {
+    let target = params.get("target").and_then(|v| v.as_str()).unwrap_or("email");
+    let last_rowid = params.get("lastRowid").and_then(|v| v.as_i64()).unwrap_or(0);
+    let batch_size = params.get("batchSize").and_then(|v| v.as_i64()).unwrap_or(500);
+
+    let engine = state.embedding_engine.as_ref()
+        .context("Embedding engine not available — cannot rebuild embeddings")?;
+
+    let (new_last_rowid, processed, embedded, done) = match target {
+        "memory" => {
+            let conn = state.memory_conn.as_mut().context("Memory database not initialized.")?;
+            memory_db::rebuild_memory_embeddings_batch(conn, engine, last_rowid, batch_size)?
+        }
+        _ => {
+            let conn = state.conn.as_mut().context("Database not initialized.")?;
+            crate::fts::db::rebuild_embeddings_batch(conn, engine, last_rowid, batch_size)?
+        }
+    };
+
+    Ok(serde_json::json!({
+        "id": msg_id,
+        "result": {
+            "ok": true,
+            "target": target,
+            "lastRowid": new_last_rowid,
+            "processed": processed,
+            "embedded": embedded,
+            "done": done
+        }
+    }))
+}
+
 // ============================================================================
 // Memory database handlers
 // ============================================================================
@@ -561,6 +616,7 @@ fn handle_memory_search(state: &mut DbState, msg_id: &str, params: &Value) -> an
 fn handle_memory_stats(state: &mut DbState, msg_id: &str) -> anyhow::Result<Value> {
     let conn = require_memory_conn(state)?;
     let docs = memory_db::memory_db_count(conn)?;
+    let vec_docs = memory_db::memory_vec_count(conn);
     let db_bytes = state
         .memory_db_path
         .as_ref()
@@ -568,7 +624,7 @@ fn handle_memory_stats(state: &mut DbState, msg_id: &str) -> anyhow::Result<Valu
         .unwrap_or(0);
     Ok(serde_json::json!({
         "id": msg_id,
-        "result": { "ok": true, "docs": docs, "dbBytes": db_bytes }
+        "result": { "ok": true, "docs": docs, "vecDocs": vec_docs, "dbBytes": db_bytes }
     }))
 }
 

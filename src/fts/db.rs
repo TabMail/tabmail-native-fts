@@ -261,6 +261,11 @@ pub fn db_count(conn: &Connection) -> anyhow::Result<i64> {
     Ok(conn.query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))?)
 }
 
+/// Count rows in the vector embedding table (0 if table missing or query fails).
+pub fn vec_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM messages_vec", [], |r| r.get(0)).unwrap_or(0)
+}
+
 pub fn index_batch(conn: &mut Connection, rows: &[Value], engine: Option<&EmbeddingEngine>) -> anyhow::Result<(i64, i64)> {
     log::info!("Indexing batch of {} messages (embeddings={})", rows.len(), engine.is_some());
 
@@ -491,7 +496,15 @@ pub fn search(
     // --- Vector candidates ---
     let query_embedding = engine.embed(query)?;
     let query_blob = f32_vec_to_blob(&query_embedding);
-    let vec_candidates = search_vec_candidates(conn, "messages_vec", &query_blob, candidate_limit)?;
+    let vec_candidates = search_vec_candidates(conn, "messages_vec", &query_blob, candidate_limit)
+        .unwrap_or_default(); // empty vec table during rebuild → graceful empty
+
+    // Fall back to FTS-only when vec table is empty (e.g., during embedding rebuild).
+    // Without this, hybrid weights (text_weight=0.3) penalize text-only results below MIN_SCORE.
+    if vec_candidates.is_empty() {
+        log::info!("No vector candidates (vec table may be empty), falling back to FTS-only search");
+        return search_fts_only(conn, query, params, synonyms, limit);
+    }
 
     // --- Merge ---
     let text_pairs: Vec<(i64, f64)> = fts_candidates.iter().map(|c| (c.rowid, c.rank)).collect();
@@ -734,6 +747,67 @@ fn fetch_message_meta(conn: &Connection, rowid: i64) -> anyhow::Result<Option<Me
     )
     .optional()
     .map_err(Into::into)
+}
+
+/// Start rebuilding vector embeddings: clear vec tables and return total count.
+/// Call this once, then call `rebuild_embeddings_batch` repeatedly until done.
+pub fn rebuild_embeddings_start(conn: &mut Connection) -> anyhow::Result<i64> {
+    log::info!("Starting email embedding rebuild — clearing vector tables");
+    conn.execute("DELETE FROM messages_vec", [])?;
+    conn.execute("DELETE FROM embed_cache", [])?;
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))?;
+    log::info!("Cleared messages_vec and embed_cache, {} documents to embed", total);
+    Ok(total)
+}
+
+/// Process one batch of email embedding rebuild.
+/// Returns (last_rowid, processed_in_batch, embedded_in_batch, done).
+pub fn rebuild_embeddings_batch(
+    conn: &mut Connection,
+    engine: &EmbeddingEngine,
+    last_rowid: i64,
+    batch_size: i64,
+) -> anyhow::Result<(i64, i64, i64, bool)> {
+    let batch: Vec<(i64, String, String, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT rowid, subject, from_, to_, body FROM messages_fts WHERE rowid > ?1 ORDER BY rowid ASC LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(params![last_rowid, batch_size], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    if batch.is_empty() {
+        return Ok((last_rowid, 0, 0, true));
+    }
+
+    let mut new_last_rowid = last_rowid;
+    let mut embedded: i64 = 0;
+    let processed = batch.len() as i64;
+    let done = (batch.len() as i64) < batch_size;
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    for (rowid, subject, from_, to_, body) in &batch {
+        let embed_text = crate::embeddings::text_prep::prepare_email_text(subject, from_, to_, body);
+        match engine.embed(&embed_text) {
+            Ok(embedding) => {
+                let blob = f32_vec_to_blob(&embedding);
+                tx.execute(
+                    "INSERT INTO messages_vec (rowid, embedding) VALUES (?1, ?2)",
+                    params![rowid, blob],
+                )?;
+                embedded += 1;
+            }
+            Err(e) => {
+                log::warn!("Failed to embed rowid {}: {}", rowid, e);
+            }
+        }
+        new_last_rowid = *rowid;
+    }
+    tx.commit()?;
+
+    Ok((new_last_rowid, processed, embedded, done))
 }
 
 pub fn clear_rebuild(state: &mut DbState) -> anyhow::Result<()> {
