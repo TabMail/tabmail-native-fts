@@ -1,7 +1,7 @@
 // IMPORTANT:
 // Keep ALL numeric values centralized here (repo rule: no hardcoded numeric values scattered around).
 
-pub const HOST_VERSION: &str = "0.7.2";
+pub const HOST_VERSION: &str = "0.7.3";
 
 pub mod logging {
     pub const LOG_DIR_REL: &str = ".tabmail/logs";

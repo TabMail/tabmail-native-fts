@@ -757,8 +757,11 @@ pub fn rebuild_memory_embeddings_batch(
         match engine.embed(&embed_text) {
             Ok(embedding) => {
                 let blob = super::db::f32_vec_to_blob(&embedding);
+                // vec0 virtual tables don't support INSERT OR REPLACE,
+                // so delete first to handle checkpoint-resume overlaps.
+                tx.execute("DELETE FROM memory_vec WHERE rowid = ?1", params![rowid])?;
                 tx.execute(
-                    "INSERT OR REPLACE INTO memory_vec (rowid, embedding) VALUES (?1, ?2)",
+                    "INSERT INTO memory_vec (rowid, embedding) VALUES (?1, ?2)",
                     params![rowid, blob],
                 )?;
                 embedded += 1;
