@@ -758,7 +758,7 @@ pub fn rebuild_memory_embeddings_batch(
             Ok(embedding) => {
                 let blob = super::db::f32_vec_to_blob(&embedding);
                 tx.execute(
-                    "INSERT INTO memory_vec (rowid, embedding) VALUES (?1, ?2)",
+                    "INSERT OR REPLACE INTO memory_vec (rowid, embedding) VALUES (?1, ?2)",
                     params![rowid, blob],
                 )?;
                 embedded += 1;

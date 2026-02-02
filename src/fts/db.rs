@@ -794,7 +794,7 @@ pub fn rebuild_embeddings_batch(
             Ok(embedding) => {
                 let blob = f32_vec_to_blob(&embedding);
                 tx.execute(
-                    "INSERT INTO messages_vec (rowid, embedding) VALUES (?1, ?2)",
+                    "INSERT OR REPLACE INTO messages_vec (rowid, embedding) VALUES (?1, ?2)",
                     params![rowid, blob],
                 )?;
                 embedded += 1;
