@@ -1,4 +1,5 @@
 mod config;
+mod embeddings;
 mod fts;
 mod install_paths;
 mod logging;
@@ -35,6 +36,14 @@ fn real_main() -> anyhow::Result<()> {
         let target = read_arg_value(&args, "--target").context("missing --target")?;
         let staged = read_arg_value(&args, "--staged").context("missing --staged")?;
         return self_update::apply_update_mode(Path::new(&target), Path::new(&staged));
+    }
+
+    // Register sqlite-vec as an auto-extension before any DB connections are opened.
+    // This makes vec0 virtual tables available in all connections.
+    unsafe {
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        )));
     }
 
     log::info!("=== TabMail FTS Helper Started ===");
@@ -223,32 +232,42 @@ fn handle_init(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Res
         .and_then(|v| v.as_str())
         .unwrap_or("thunderbird@tabmail.ai");
 
-    // Auto-detect Thunderbird profile
-    let tb_profile = find_thunderbird_profile_dir()?;
-    log::info!("Detected TB profile: {}", tb_profile.display());
+    // profilePath override (for testing): use the provided path directly, skip auto-detection
+    let (tb_profile, new_fts_parent) = if let Some(override_path) = params.get("profilePath").and_then(|v| v.as_str()) {
+        let p = PathBuf::from(override_path);
+        log::info!("Using explicit profilePath: {}", p.display());
+        std::fs::create_dir_all(&p)?;
+        (p.clone(), p)
+    } else {
+        // Auto-detect Thunderbird profile
+        let tb_profile = find_thunderbird_profile_dir()?;
+        log::info!("Detected TB profile: {}", tb_profile.display());
 
-    // Old location: <profile>/tabmail_fts/
-    // New location: <profile>/browser-extension-data/<addon-id>/tabmail_fts/
-    let old_fts_dir = tb_profile.join("tabmail_fts");
-    let new_fts_parent = tb_profile.join("browser-extension-data").join(addon_id);
-    let new_fts_dir = new_fts_parent.join("tabmail_fts");
+        // Old location: <profile>/tabmail_fts/
+        // New location: <profile>/browser-extension-data/<addon-id>/tabmail_fts/
+        let old_fts_dir = tb_profile.join("tabmail_fts");
+        let new_fts_parent = tb_profile.join("browser-extension-data").join(addon_id);
+        let new_fts_dir = new_fts_parent.join("tabmail_fts");
 
-    log::info!("FTS paths:");
-    log::info!("  Old: {}", old_fts_dir.display());
-    log::info!("  New: {}", new_fts_dir.display());
+        log::info!("FTS paths:");
+        log::info!("  Old: {}", old_fts_dir.display());
+        log::info!("  New: {}", new_fts_dir.display());
 
-    // Check for migration from old to new location
-    let migration_result = migrate_fts_data(&old_fts_dir, &new_fts_dir);
-    if let Ok(true) = migration_result {
-        log::info!("✅ Migrated FTS data from old location");
-    }
+        // Check for migration from old to new location
+        let migration_result = migrate_fts_data(&old_fts_dir, &new_fts_dir);
+        if let Ok(true) = migration_result {
+            log::info!("✅ Migrated FTS data from old location");
+        }
 
-    // Ensure new parent directory exists
-    if let Err(e) = std::fs::create_dir_all(&new_fts_parent) {
-        log::warn!("Could not create addon data dir: {}", e);
-    }
+        // Ensure new parent directory exists
+        if let Err(e) = std::fs::create_dir_all(&new_fts_parent) {
+            log::warn!("Could not create addon data dir: {}", e);
+        }
 
-    // Initialize email FTS DB at new location
+        (tb_profile, new_fts_parent)
+    };
+
+    // Initialize email FTS DB
     let (db_path, conn) = open_or_create_db(&new_fts_parent)?;
     state.db_path = Some(db_path.clone());
     state.conn = Some(conn);
@@ -258,8 +277,10 @@ fn handle_init(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Res
         crate::fts::db::db_count(conn)?
     };
 
-    // Initialize memory DB (separate database file)
-    let (memory_db_path, memory_conn) = memory_db::open_or_create_memory_db(&new_fts_dir)?;
+    // Initialize memory DB (separate database file, inside tabmail_fts/ subdir)
+    let fts_subdir = new_fts_parent.join("tabmail_fts");
+    std::fs::create_dir_all(&fts_subdir)?;
+    let (memory_db_path, memory_conn) = memory_db::open_or_create_memory_db(&fts_subdir)?;
     state.memory_db_path = Some(memory_db_path.clone());
     state.memory_conn = Some(memory_conn);
 
@@ -269,6 +290,26 @@ fn handle_init(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Res
     };
 
     log::info!("Both databases initialized: {} email docs, {} memory entries", docs, memory_docs);
+
+    // Initialize embedding engine (lazy model download on first init).
+    // If download or load fails, we continue in FTS-only mode (graceful degradation).
+    let has_embeddings = match crate::embeddings::download::ensure_model_files() {
+        Ok(model_dir) => match crate::embeddings::engine::EmbeddingEngine::load(&model_dir) {
+            Ok(engine) => {
+                log::info!("Embedding engine loaded successfully");
+                state.embedding_engine = Some(engine);
+                true
+            }
+            Err(e) => {
+                log::warn!("Failed to load embedding engine (FTS-only mode): {:?}", e);
+                false
+            }
+        },
+        Err(e) => {
+            log::warn!("Failed to download model files (FTS-only mode): {:?}", e);
+            false
+        }
+    };
 
     Ok(serde_json::json!({
         "id": msg_id,
@@ -281,7 +322,8 @@ fn handle_init(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Res
             "memoryDocs": memory_docs,
             "vfs": "native",
             "tbProfile": tb_profile.to_string_lossy(),
-            "addonDataDir": new_fts_parent.to_string_lossy()
+            "addonDataDir": new_fts_parent.to_string_lossy(),
+            "hasEmbeddings": has_embeddings
         }
     }))
 }
@@ -404,8 +446,9 @@ fn require_conn<'a>(state: &'a DbState) -> anyhow::Result<&'a rusqlite::Connecti
 
 fn handle_index_batch(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Result<Value> {
     let rows = params.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    let conn = require_conn_mut(state)?;
-    let (count, skipped) = crate::fts::db::index_batch(conn, &rows)?;
+    let engine = state.embedding_engine.as_ref();
+    let conn = state.conn.as_mut().context("Database not initialized. Call 'init' first.")?;
+    let (count, skipped) = crate::fts::db::index_batch(conn, &rows, engine)?;
 
     Ok(serde_json::json!({
         "id": msg_id,
@@ -415,8 +458,9 @@ fn handle_index_batch(state: &mut DbState, msg_id: &str, params: &Value) -> anyh
 
 fn handle_search(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Result<Value> {
     let q = params.get("q").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let conn = require_conn(state)?;
-    let results = crate::fts::db::search(conn, &q, params, &state.synonyms)?;
+    let engine = state.embedding_engine.as_ref();
+    let conn = state.conn.as_ref().context("Database not initialized. Call 'init' first.")?;
+    let results = crate::fts::db::search(conn, &q, params, &state.synonyms, engine)?;
     Ok(serde_json::json!({ "id": msg_id, "result": results }))
 }
 
@@ -496,8 +540,9 @@ fn require_memory_conn<'a>(state: &'a DbState) -> anyhow::Result<&'a rusqlite::C
 
 fn handle_memory_index_batch(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Result<Value> {
     let rows = params.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    let conn = require_memory_conn_mut(state)?;
-    let (count, skipped) = memory_db::memory_index_batch(conn, &rows)?;
+    let engine = state.embedding_engine.as_ref();
+    let conn = state.memory_conn.as_mut().context("Memory database not initialized. Call 'init' first.")?;
+    let (count, skipped) = memory_db::memory_index_batch(conn, &rows, engine)?;
 
     Ok(serde_json::json!({
         "id": msg_id,
@@ -507,8 +552,9 @@ fn handle_memory_index_batch(state: &mut DbState, msg_id: &str, params: &Value) 
 
 fn handle_memory_search(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Result<Value> {
     let q = params.get("q").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let conn = require_memory_conn(state)?;
-    let results = memory_db::memory_search(conn, &q, params, &state.synonyms)?;
+    let engine = state.embedding_engine.as_ref();
+    let conn = state.memory_conn.as_ref().context("Memory database not initialized. Call 'init' first.")?;
+    let results = memory_db::memory_search(conn, &q, params, &state.synonyms, engine)?;
     Ok(serde_json::json!({ "id": msg_id, "result": results }))
 }
 

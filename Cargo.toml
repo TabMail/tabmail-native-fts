@@ -1,6 +1,6 @@
 [package]
 name = "tabmail-native-fts"
-version = "0.6.12"
+version = "0.7.0"
 edition = "2021"
 license-file = "LICENSE"
 
@@ -23,6 +23,17 @@ ureq = { version = "2.12.1", default-features = true }
 # Logging with rotation
 flexi_logger = { version = "0.29.8", features = ["specfile_without_notification"] }
 log = "0.4.22"
+
+# Semantic search: sqlite-vec for vector similarity search
+sqlite-vec = "0.1.7-alpha.2"
+zerocopy = { version = "0.8", features = ["derive"] }
+
+# Semantic search: candle for local embedding inference (pure Rust, no C/C++ deps)
+candle-core = "0.8"
+candle-nn = "0.8"
+candle-transformers = "0.8"
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+safetensors = "0.5"
 
 [dev-dependencies]
 assert_cmd = "2.0.16"

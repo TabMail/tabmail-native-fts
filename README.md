@@ -1,6 +1,6 @@
 # TabMail Native FTS Helper
 
-Rust-based native messaging host for full-text search using **bundled SQLite + FTS5** (single self-contained binary per OS).
+Rust-based native messaging host for **hybrid semantic + keyword search** using bundled SQLite + FTS5 + sqlite-vec (single self-contained binary per OS). Generates sentence embeddings locally via candle (pure Rust) with `all-MiniLM-L6-v2`.
 
 This is the native helper component for the **[TabMail Thunderbird Add-on](https://github.com/TabMail/tabmail-thunderbird)**.
 
@@ -209,6 +209,7 @@ Commercial licenses are available from Lisem AI Ltd.
 See:
 - [LICENSE](./LICENSE)
 - [COMMERCIAL-LICENSE.md](./COMMERCIAL-LICENSE.md)
+- [THIRD_PARTY_LICENSES.md](./THIRD_PARTY_LICENSES.md) — Third-party model and library licenses
 
 ---
 

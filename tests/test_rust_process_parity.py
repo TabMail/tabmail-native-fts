@@ -147,7 +147,9 @@ class TestRustHelperProcess(unittest.TestCase):
             response = _read_message(proc)
             self.assertEqual(response["id"], "5")
             self.assert_success(response, "search from:email")
-            self.assertEqual(len(response["result"]), 1)
+            self.assertGreaterEqual(len(response["result"]), 1)
+            # First result should be the billing email (FTS exact field match ranks highest)
+            self.assertIn("billing@vendor.com", response["result"][0].get("author", ""))
 
             # 6. Stats
             _send_message(proc, {"id": "6", "method": "stats", "params": {}})
