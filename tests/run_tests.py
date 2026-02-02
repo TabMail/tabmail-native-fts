@@ -6,6 +6,7 @@ Usage:
     python tests/run_tests.py           # Run all tests
     python tests/run_tests.py rust      # Run Rust helper tests
     python tests/run_tests.py update    # Run update mechanism tests
+    python tests/run_tests.py mt        # Run multi-threaded dispatch tests
     python tests/run_tests.py -v        # Verbose output
 
 Requires:
@@ -40,9 +41,13 @@ def run_tests(test_type=None, verbosity=2):
         # Run update mechanism tests
         from tests import test_rust_update_request
         suite.addTests(loader.loadTestsFromModule(test_rust_update_request))
+    elif test_type == 'mt':
+        # Run multi-threaded dispatch tests
+        from tests import test_multithreaded
+        suite.addTests(loader.loadTestsFromModule(test_multithreaded))
     else:
         print(f"Unknown test type: {test_type}")
-        print("Valid types: all, rust, update")
+        print("Valid types: all, rust, update, mt")
         sys.exit(1)
 
     runner = unittest.TextTestRunner(verbosity=verbosity)
@@ -58,7 +63,7 @@ def main():
         'type',
         nargs='?',
         default='all',
-        choices=['all', 'rust', 'update'],
+        choices=['all', 'rust', 'update', 'mt'],
         help='Type of tests to run (default: all)'
     )
     parser.add_argument(

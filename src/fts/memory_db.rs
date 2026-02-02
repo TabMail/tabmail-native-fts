@@ -189,6 +189,31 @@ fn ensure_memory_vector_tables(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Open a read-only connection to an existing memory database.
+/// Used by the reader thread in multi-threaded mode.
+pub fn open_read_only_memory_connection(db_path: &Path) -> anyhow::Result<Connection> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open read-only memory db {}", db_path.display()))?;
+
+    conn.execute_batch(&format!(
+        "\
+PRAGMA cache_size = {cache_size};\n\
+PRAGMA mmap_size = {mmap_size};\n\
+PRAGMA busy_timeout = {busy_timeout};\n\
+",
+        cache_size = config::sqlite::PRAGMA_CACHE_SIZE_KIB_NEG,
+        mmap_size = config::sqlite::PRAGMA_MMAP_SIZE_BYTES,
+        busy_timeout = config::sqlite::PRAGMA_BUSY_TIMEOUT_MS,
+    ))?;
+
+    log::info!("Opened read-only memory connection to {}", db_path.display());
+    Ok(conn)
+}
+
 /// Get count of entries in memory database
 pub fn memory_db_count(conn: &Connection) -> anyhow::Result<i64> {
     Ok(conn.query_row("SELECT COUNT(*) FROM memory_fts", [], |r| r.get(0))?)
@@ -777,33 +802,24 @@ pub fn rebuild_memory_embeddings_batch(
     Ok((new_last_rowid, processed, embedded, done))
 }
 
-/// Clear and rebuild memory database
-pub fn memory_clear_rebuild(
-    memory_db_path: &mut Option<PathBuf>,
-    memory_conn: &mut Option<Connection>,
-) -> anyhow::Result<()> {
+/// Clear and rebuild memory database.
+/// Takes ownership of the connection, returns a new one after rebuild.
+/// Caller must signal the reader thread to reopen its read-only connection.
+pub fn memory_clear_rebuild_standalone(db_path: &Path, conn: Connection) -> anyhow::Result<Connection> {
     log::info!("Clearing memory database by deleting database file (rebuild from scratch)");
-    let db_path = memory_db_path
-        .clone()
-        .context("Memory DB not initialized (missing db_path)")?;
-
-    // Close connection first
-    memory_conn.take();
+    drop(conn);
     log::info!("Memory database connection closed");
 
-    // Delete db + wal/shm
-    delete_file_if_exists(&db_path)?;
+    delete_file_if_exists(db_path)?;
     delete_file_if_exists(&PathBuf::from(format!("{}-wal", db_path.display())))?;
     delete_file_if_exists(&PathBuf::from(format!("{}-shm", db_path.display())))?;
 
     log::info!("Recreating memory database...");
-    let conn = Connection::open(&db_path)?;
-    super::db::ensure_fts5_available(&conn)?;
-    init_memory_database(&conn)?;
-    *memory_conn = Some(conn);
+    let new_conn = Connection::open(db_path)?;
+    super::db::ensure_fts5_available(&new_conn)?;
+    init_memory_database(&new_conn)?;
     log::info!("Memory database recreated and initialized successfully");
-
-    Ok(())
+    Ok(new_conn)
 }
 
 /// Read memory entries around a given timestamp (±tolerance_ms)

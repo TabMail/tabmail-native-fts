@@ -13,7 +13,6 @@ pub struct DbState {
     pub db_path: Option<PathBuf>,
     pub conn: Option<Connection>,
     pub synonyms: SynonymLookup,
-    pub should_exit: bool,
     // Memory database (separate from email FTS)
     pub memory_db_path: Option<PathBuf>,
     pub memory_conn: Option<Connection>,
@@ -27,7 +26,6 @@ impl DbState {
             db_path: None,
             conn: None,
             synonyms: SynonymLookup::new(),
-            should_exit: false,
             memory_db_path: None,
             memory_conn: None,
             embedding_engine: None,
@@ -255,6 +253,34 @@ pub(crate) fn needs_vec_cosine_migration(conn: &Connection, table_name: &str) ->
         }
         None => Ok(false), // table doesn't exist, nothing to migrate
     }
+}
+
+/// Open a read-only connection to an existing FTS database.
+/// Used by the reader thread in multi-threaded mode.
+/// Applies same cache/mmap/busy_timeout pragmas as the primary connection.
+pub fn open_read_only_connection(db_path: &Path) -> anyhow::Result<Connection> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open read-only db {}", db_path.display()))?;
+
+    // Read-only connections still benefit from cache/mmap and need busy_timeout
+    // for WAL mode coordination. No journal_mode or wal_autocheckpoint needed.
+    conn.execute_batch(&format!(
+        "\
+PRAGMA cache_size = {cache_size};\n\
+PRAGMA mmap_size = {mmap_size};\n\
+PRAGMA busy_timeout = {busy_timeout};\n\
+",
+        cache_size = config::sqlite::PRAGMA_CACHE_SIZE_KIB_NEG,
+        mmap_size = config::sqlite::PRAGMA_MMAP_SIZE_BYTES,
+        busy_timeout = config::sqlite::PRAGMA_BUSY_TIMEOUT_MS,
+    ))?;
+
+    log::info!("Opened read-only connection to {}", db_path.display());
+    Ok(conn)
 }
 
 pub fn db_count(conn: &Connection) -> anyhow::Result<i64> {
@@ -813,30 +839,24 @@ pub fn rebuild_embeddings_batch(
     Ok((new_last_rowid, processed, embedded, done))
 }
 
-pub fn clear_rebuild(state: &mut DbState) -> anyhow::Result<()> {
-    log::info!("Clearing all indexes by deleting database file (rebuild from scratch)");
-    let db_path = state
-        .db_path
-        .clone()
-        .context("DB not initialized (missing db_path)")?;
-
-    // Close connection first.
-    state.conn.take();
+/// Clear and rebuild the email FTS database.
+/// Takes ownership of the connection to close it, returns a new connection after rebuild.
+/// Caller must signal the reader thread to reopen its read-only connection.
+pub fn clear_rebuild_standalone(db_path: &Path, conn: Connection) -> anyhow::Result<Connection> {
+    log::info!("Clearing email FTS by deleting database file (rebuild from scratch)");
+    drop(conn);
     log::info!("Database connection closed");
 
-    // Delete db + wal/shm
-    delete_file_if_exists(&db_path)?;
+    delete_file_if_exists(db_path)?;
     delete_file_if_exists(&PathBuf::from(format!("{}-wal", db_path.display())))?;
     delete_file_if_exists(&PathBuf::from(format!("{}-shm", db_path.display())))?;
 
     log::info!("Recreating database...");
-    let conn = Connection::open(&db_path)?;
-    ensure_fts5_available(&conn)?;
-    init_database(&conn)?;
-    state.conn = Some(conn);
+    let new_conn = Connection::open(db_path)?;
+    ensure_fts5_available(&new_conn)?;
+    init_database(&new_conn)?;
     log::info!("Database recreated and initialized successfully");
-
-    Ok(())
+    Ok(new_conn)
 }
 
 fn delete_file_if_exists(p: &Path) -> anyhow::Result<()> {

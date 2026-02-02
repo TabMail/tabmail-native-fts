@@ -1,6 +1,7 @@
 [package]
 name = "tabmail-native-fts"
-version = "0.7.3"
+# NOTE: Keep in sync with HOST_VERSION in src/config.rs
+version = "0.8.0"
 edition = "2021"
 license-file = "LICENSE"
 
