@@ -2,7 +2,7 @@
 // Keep ALL numeric values centralized here (repo rule: no hardcoded numeric values scattered around).
 
 // NOTE: HOST_VERSION must stay in sync with the `version` field in Cargo.toml.
-pub const HOST_VERSION: &str = "0.8.0";
+pub const HOST_VERSION: &str = "0.8.1";
 
 /// Schema version: bump ONLY when DB schema, FTS tokenizer config, or embedding
 /// model changes. Non-schema host updates (e.g., multi-threading) leave this unchanged.

@@ -1011,6 +1011,27 @@ pub fn get_message_by_msgid(conn: &Connection, msg_id: &str) -> anyhow::Result<O
     Ok(row)
 }
 
+/// Find all FTS entries matching a specific headerMessageId within an account.
+/// Used by incremental indexer when the exact folder path is unknown (deletion events
+/// sometimes have stale/wrong folder info from Gmail virtual folders).
+/// Returns list of matching msgId keys (format: accountId:folderPath:headerMessageId).
+pub fn find_by_header_message_id(conn: &Connection, account_id: &str, header_message_id: &str) -> anyhow::Result<Vec<String>> {
+    // Key format is accountId:folderPath:headerMessageId
+    // We search for entries that start with accountId: and end with :headerMessageId
+    let pattern = format!("{}:%:{}", account_id, header_message_id);
+    log::info!("Finding FTS entries matching pattern: {}", pattern);
+
+    let mut stmt = conn.prepare(
+        "SELECT msgId FROM messages_fts WHERE msgId LIKE ?1"
+    )?;
+
+    let rows = stmt.query_map(params![pattern], |r| r.get::<_, String>(0))?;
+    let results: Vec<String> = rows.filter_map(|r| r.ok()).collect();
+
+    log::info!("Found {} entries matching headerMessageId {}", results.len(), header_message_id);
+    Ok(results)
+}
+
 pub fn query_by_date_range(conn: &Connection, from_v: &Value, to_v: &Value, limit: i64) -> anyhow::Result<Vec<Value>> {
     let Some(from_ts) = parse_date_param(from_v)? else { bail!("from and to parameters are required") };
     let Some(to_ts) = parse_date_param(to_v)? else { bail!("from and to parameters are required") };
@@ -1110,4 +1131,190 @@ fn truncate_for_log(s: &str) -> String {
     s.chars().take(max).collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
 
+    /// Create an in-memory database with the FTS schema for testing.
+    fn setup_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Create the FTS5 table and supporting tables (simplified schema for testing)
+        conn.execute_batch(r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                msgId,
+                subject, from_, to_, cc, bcc, body,
+                tokenize = "unicode61"
+            );
+
+            CREATE TABLE IF NOT EXISTS message_meta (
+                rowid INTEGER PRIMARY KEY,
+                dateMs INTEGER NOT NULL,
+                hasAttachments INTEGER NOT NULL,
+                parsedIcsAttachments TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS message_ids (
+                msgId TEXT PRIMARY KEY
+            );
+        "#).unwrap();
+
+        conn
+    }
+
+    /// Insert a test message into the database.
+    fn insert_test_message(conn: &Connection, msg_id: &str, subject: &str, date_ms: i64) {
+        // Insert into message_ids first
+        conn.execute(
+            "INSERT OR IGNORE INTO message_ids (msgId) VALUES (?1)",
+            params![msg_id],
+        ).unwrap();
+
+        let row_id: i64 = conn.query_row(
+            "SELECT rowid FROM message_ids WHERE msgId = ?1",
+            params![msg_id],
+            |r| r.get(0),
+        ).unwrap();
+
+        // Insert into FTS table
+        conn.execute(
+            "INSERT INTO messages_fts (rowid, msgId, subject, from_, to_, cc, bcc, body) VALUES (?1, ?2, ?3, '', '', '', '', '')",
+            params![row_id, msg_id, subject],
+        ).unwrap();
+
+        // Insert into meta table
+        conn.execute(
+            "INSERT INTO message_meta (rowid, dateMs, hasAttachments, parsedIcsAttachments) VALUES (?1, ?2, 0, '')",
+            params![row_id, date_ms],
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_find_by_header_message_id_basic() {
+        let conn = setup_test_db();
+
+        // Insert messages with the same headerMessageId in different folders
+        insert_test_message(&conn, "account1:/INBOX:msg123", "Test Subject", 1000);
+        insert_test_message(&conn, "account1:/Deleted Messages:msg123", "Test Subject", 1001);
+        insert_test_message(&conn, "account1:/[Gmail]/All Mail:msg123", "Test Subject", 1002);
+
+        // Search for msg123 in account1
+        let results = find_by_header_message_id(&conn, "account1", "msg123").unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert!(results.contains(&"account1:/INBOX:msg123".to_string()));
+        assert!(results.contains(&"account1:/Deleted Messages:msg123".to_string()));
+        assert!(results.contains(&"account1:/[Gmail]/All Mail:msg123".to_string()));
+    }
+
+    #[test]
+    fn test_find_by_header_message_id_different_accounts() {
+        let conn = setup_test_db();
+
+        // Insert same headerMessageId in different accounts
+        insert_test_message(&conn, "account1:/INBOX:msg123", "Test Subject 1", 1000);
+        insert_test_message(&conn, "account2:/INBOX:msg123", "Test Subject 2", 1001);
+        insert_test_message(&conn, "account3:/INBOX:msg123", "Test Subject 3", 1002);
+
+        // Search should only return entries for the specified account
+        let results = find_by_header_message_id(&conn, "account1", "msg123").unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(results.contains(&"account1:/INBOX:msg123".to_string()));
+    }
+
+    #[test]
+    fn test_find_by_header_message_id_different_messages() {
+        let conn = setup_test_db();
+
+        // Insert different headerMessageIds in same account
+        insert_test_message(&conn, "account1:/INBOX:msg123", "Test Subject 1", 1000);
+        insert_test_message(&conn, "account1:/INBOX:msg456", "Test Subject 2", 1001);
+        insert_test_message(&conn, "account1:/INBOX:msg789", "Test Subject 3", 1002);
+
+        // Search should only return entries with matching headerMessageId
+        let results = find_by_header_message_id(&conn, "account1", "msg456").unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(results.contains(&"account1:/INBOX:msg456".to_string()));
+    }
+
+    #[test]
+    fn test_find_by_header_message_id_no_matches() {
+        let conn = setup_test_db();
+
+        // Insert some messages
+        insert_test_message(&conn, "account1:/INBOX:msg123", "Test Subject", 1000);
+
+        // Search for non-existent headerMessageId
+        let results = find_by_header_message_id(&conn, "account1", "nonexistent").unwrap();
+        assert_eq!(results.len(), 0);
+
+        // Search for non-existent account
+        let results = find_by_header_message_id(&conn, "nonexistent", "msg123").unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_find_by_header_message_id_empty_database() {
+        let conn = setup_test_db();
+
+        // Search in empty database
+        let results = find_by_header_message_id(&conn, "account1", "msg123").unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_find_by_header_message_id_special_characters_in_folder() {
+        let conn = setup_test_db();
+
+        // Insert messages with special characters in folder paths
+        insert_test_message(&conn, "account1:/[Gmail]/All Mail:msg123", "Test 1", 1000);
+        insert_test_message(&conn, "account1:/Folder With Spaces:msg123", "Test 2", 1001);
+        insert_test_message(&conn, "account1:/Folder/With/Slashes:msg123", "Test 3", 1002);
+
+        let results = find_by_header_message_id(&conn, "account1", "msg123").unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert!(results.contains(&"account1:/[Gmail]/All Mail:msg123".to_string()));
+        assert!(results.contains(&"account1:/Folder With Spaces:msg123".to_string()));
+        assert!(results.contains(&"account1:/Folder/With/Slashes:msg123".to_string()));
+    }
+
+    #[test]
+    fn test_find_by_header_message_id_gmail_style_folders() {
+        let conn = setup_test_db();
+
+        // Insert Gmail-style virtual folder entries (the original bug scenario)
+        insert_test_message(&conn, "account1:/[Gmail]/All Mail:test@example.com", "Gmail Test", 1000);
+        insert_test_message(&conn, "account1:/[Gmail]/Important:test@example.com", "Gmail Test", 1001);
+        insert_test_message(&conn, "account1:/[Gmail]/Starred:test@example.com", "Gmail Test", 1002);
+        insert_test_message(&conn, "account1:/[Gmail]/Trash:test@example.com", "Gmail Test", 1003);
+        insert_test_message(&conn, "account1:/INBOX:test@example.com", "Gmail Test", 1004);
+
+        // When a message is deleted, we might only know the headerMessageId
+        // This function should find all occurrences regardless of folder
+        let results = find_by_header_message_id(&conn, "account1", "test@example.com").unwrap();
+
+        assert_eq!(results.len(), 5);
+    }
+
+    #[test]
+    fn test_get_message_by_msgid() {
+        let conn = setup_test_db();
+
+        insert_test_message(&conn, "account1:/INBOX:msg123", "Test Subject", 1699900000000);
+
+        // Test exact match
+        let result = get_message_by_msgid(&conn, "account1:/INBOX:msg123").unwrap();
+        assert!(result.is_some());
+        let msg = result.unwrap();
+        assert_eq!(msg["msgId"], "account1:/INBOX:msg123");
+        assert_eq!(msg["subject"], "Test Subject");
+
+        // Test non-existent message
+        let result = get_message_by_msgid(&conn, "account1:/INBOX:nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+}

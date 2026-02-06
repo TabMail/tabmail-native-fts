@@ -143,7 +143,7 @@ fn classify_method(method: &str) -> MethodTarget {
     match method {
         // Read-only email operations
         "search" | "stats" | "filterNewMessages" | "getMessageByMsgId"
-        | "queryByDateRange" | "debugSample" => MethodTarget::Reader,
+        | "findByHeaderMessageId" | "queryByDateRange" | "debugSample" => MethodTarget::Reader,
 
         // Read-only memory operations
         "memorySearch" | "memoryStats" | "memoryDebugSample" | "memoryRead" => MethodTarget::Reader,
@@ -407,6 +407,19 @@ fn handle_read_request(
                 .context("msgId parameter is required and must be a string")?;
             log::info!("Getting message by msgId: {}", target);
             let res = crate::fts::db::get_message_by_msgid(email_conn, target)?;
+            Ok(serde_json::json!({ "id": msg_id, "result": res }))
+        }
+        "findByHeaderMessageId" => {
+            let account_id = params
+                .get("accountId")
+                .and_then(|v| v.as_str())
+                .context("accountId parameter is required")?;
+            let header_message_id = params
+                .get("headerMessageId")
+                .and_then(|v| v.as_str())
+                .context("headerMessageId parameter is required")?;
+            log::info!("Finding by headerMessageId: {} (account={})", header_message_id, account_id);
+            let res = crate::fts::db::find_by_header_message_id(email_conn, account_id, header_message_id)?;
             Ok(serde_json::json!({ "id": msg_id, "result": res }))
         }
         "queryByDateRange" => {
