@@ -13,6 +13,7 @@ Before starting any task in this project, read these files and update them when 
 - **`../DECISIONS.md`** — Cross-cutting architectural decisions.
 
 **This project:**
+- **`PROJECT_STRUCTURE.md`** — Directory tree, entry points, sub-component map.
 - **`PROJECT_MEMORY.md`** — Native FTS specific knowledge, patterns, quirks.
 - **`DECISIONS.md`** — Native FTS specific architectural decisions.
 
