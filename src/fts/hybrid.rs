@@ -96,7 +96,10 @@ pub fn merge_results(
     let mut results: Vec<HybridResult> = candidates
         .into_values()
         .map(|c| {
-            let final_score = vector_weight * c.vector_score + text_weight * c.text_score;
+            // Rescale vector score: scores below threshold → 0, above → 0..1
+            let th = config::hybrid::VECTOR_SCORE_THRESHOLD;
+            let adjusted_vector = ((c.vector_score - th) / (1.0 - th)).max(0.0);
+            let final_score = vector_weight * adjusted_vector + text_weight * c.text_score;
             HybridResult {
                 rowid: c.rowid,
                 final_score,
