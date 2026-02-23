@@ -30,6 +30,34 @@
 
 ---
 
+## ADR-NF-002: Year-Based FTS Sharding
+
+**Context:** The monolithic `messages_fts` FTS5 table grew large over time, slowing down indexing operations. The iOS app already migrated to year-based sharding (`messages_fts_YYYY` tables) with measurable performance improvement.
+
+**Decision:**
+1. Split the monolithic `messages_fts` into year-based shard tables (`messages_fts_2023`, `messages_fts_2024`, etc.), one per calendar year.
+2. Add `shardYear` column to `message_meta` for O(1) shard routing on single-message lookups.
+3. `SCHEMA_VERSION` stays at 1 — crash-safe auto-migration detects the monolithic table's presence and migrates in-place; each step is idempotent.
+4. Writer thread maintains `known_years: HashSet<i32>` locally; reader thread discovers shards via `sqlite_master` per-request (cheap, WAL visibility).
+5. Search functions use `UNION ALL` across all shards in a single SQL statement (no sequential per-shard loops).
+6. `messages_vec` (vector embeddings) stays un-sharded — same global rowid system via `message_ids.rowid`.
+7. `find_by_header_message_id` queries `message_ids` table directly (unsharded, no FTS involvement).
+8. Years < 2000 clamped to `SHARD_MIN_YEAR = 2000` (matches iOS behavior).
+
+**Rationale:**
+- Smaller per-year FTS5 indexes → faster indexing (less b-tree maintenance per write)
+- `UNION ALL` keeps search as a single SQL statement — SQLite evaluates all branches in one pass
+- No `SCHEMA_VERSION` bump = no forced full reindex on existing installs
+- Crash-safe migration uses invariant: monolithic table existing = migration incomplete
+
+**Consequences:**
+- Each shard has its own FTS5 internal structures (content, data, idx, docsize, config shadow tables)
+- Slightly more disk space overhead from per-shard metadata
+- New shard tables created lazily during indexing (not upfront)
+- Migration on very large databases may take several seconds on first boot after upgrade
+
+---
+
 ## Template for New Decisions
 
 ```markdown

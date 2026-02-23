@@ -8,6 +8,7 @@ mod protocol;
 mod self_update;
 mod update_signature;
 
+use std::collections::HashSet;
 use std::io::{stdin, stdout, Stdin, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -170,6 +171,7 @@ fn run_multi_threaded(
     let memory_db_path = state.memory_db_path.context("memory DB path missing after init")?;
     let writer_email_conn = state.conn.context("email conn missing after init")?;
     let writer_memory_conn = state.memory_conn.context("memory conn missing after init")?;
+    let writer_known_years = state.known_years;
     let engine: Option<Arc<EmbeddingEngine>> = state.embedding_engine.map(Arc::new);
     let synonyms = Arc::new(state.synonyms);
 
@@ -232,6 +234,7 @@ fn run_multi_threaded(
                     writer_rx,
                     writer_email_conn,
                     writer_memory_conn,
+                    writer_known_years,
                     engine,
                     stdout,
                     email_path,
@@ -376,7 +379,9 @@ fn handle_read_request(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let results = crate::fts::db::search(email_conn, &q, params, synonyms, engine)?;
+            // Discover current year shards from sqlite_master (sees latest WAL state)
+            let known_years = crate::fts::db::load_known_years(email_conn)?;
+            let results = crate::fts::db::search(email_conn, &q, params, synonyms, engine, &known_years)?;
             Ok(serde_json::json!({ "id": msg_id, "result": results }))
         }
         "stats" => {
@@ -429,11 +434,13 @@ fn handle_read_request(
                 .get("limit")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(config::sqlite::QUERY_BY_DATE_RANGE_DEFAULT_LIMIT);
-            let res = crate::fts::db::query_by_date_range(email_conn, from_v, to_v, limit)?;
+            let known_years = crate::fts::db::load_known_years(email_conn)?;
+            let res = crate::fts::db::query_by_date_range(email_conn, from_v, to_v, limit, &known_years)?;
             Ok(serde_json::json!({ "id": msg_id, "result": res }))
         }
         "debugSample" => {
-            let res = crate::fts::db::debug_sample(email_conn)?;
+            let known_years = crate::fts::db::load_known_years(email_conn)?;
+            let res = crate::fts::db::debug_sample(email_conn, &known_years)?;
             Ok(serde_json::json!({ "id": msg_id, "result": res }))
         }
         "memorySearch" => {
@@ -488,6 +495,7 @@ fn writer_thread_main(
     rx: mpsc::Receiver<ThreadMessage>,
     mut email_conn: Connection,
     mut memory_conn: Connection,
+    mut known_years: HashSet<i32>,
     engine: Option<Arc<EmbeddingEngine>>,
     stdout: Arc<Mutex<Stdout>>,
     email_db_path: PathBuf,
@@ -502,6 +510,7 @@ fn writer_thread_main(
         let resp = handle_write_request(
             &mut email_conn,
             &mut memory_conn,
+            &mut known_years,
             &email_db_path,
             &memory_db_path,
             engine_ref,
@@ -521,6 +530,7 @@ fn writer_thread_main(
 fn handle_write_request(
     email_conn: &mut Connection,
     memory_conn: &mut Connection,
+    known_years: &mut HashSet<i32>,
     email_db_path: &Path,
     memory_db_path: &Path,
     engine: Option<&EmbeddingEngine>,
@@ -537,7 +547,7 @@ fn handle_write_request(
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default();
-            let (count, skipped) = crate::fts::db::index_batch(email_conn, &rows, engine)?;
+            let (count, skipped) = crate::fts::db::index_batch(email_conn, &rows, engine, known_years)?;
             Ok(serde_json::json!({
                 "id": msg_id,
                 "result": { "ok": true, "count": count, "skippedDuplicates": skipped }
@@ -553,7 +563,7 @@ fn handle_write_request(
             Ok(serde_json::json!({ "id": msg_id, "result": { "ok": true, "count": removed } }))
         }
         "optimize" => {
-            crate::fts::db::optimize(email_conn)?;
+            crate::fts::db::optimize(email_conn, known_years)?;
             Ok(serde_json::json!({ "id": msg_id, "result": { "ok": true } }))
         }
         "clear" => {
@@ -561,6 +571,8 @@ fn handle_write_request(
             let old_conn = std::mem::replace(email_conn, Connection::open_in_memory()?);
             let new_conn = crate::fts::db::clear_rebuild_standalone(email_db_path, old_conn)?;
             *email_conn = new_conn;
+            // Clear known years — shards will be recreated lazily during next indexing
+            known_years.clear();
             // Signal reader to reopen its read-only connection
             email_reopen.store(true, Ordering::SeqCst);
             Ok(serde_json::json!({ "id": msg_id, "result": { "ok": true } }))
@@ -802,9 +814,10 @@ fn handle_init(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Res
         };
 
     // Initialize email FTS DB
-    let (db_path, conn) = open_or_create_db(&new_fts_parent)?;
+    let (db_path, conn, known_years) = open_or_create_db(&new_fts_parent)?;
     state.db_path = Some(db_path.clone());
     state.conn = Some(conn);
+    state.known_years = known_years;
 
     let docs = {
         let conn = state

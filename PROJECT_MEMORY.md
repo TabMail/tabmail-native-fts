@@ -2,7 +2,7 @@
 
 > **Native FTS specific knowledge.** Claude reads this before every task and updates it when discovering something new. For cross-cutting knowledge, see `../PROJECT_MEMORY.md`.
 
-**Last updated:** 2026-02-16
+**Last updated:** 2026-02-23
 
 ---
 
@@ -28,6 +28,17 @@ Native messaging host for full-text search + semantic search. Communicates with 
 
 ### SchemaVersion
 `SCHEMA_VERSION: u32 = 1` decouples reindex triggers from host version. JS side compares integer schema version instead of major.minor host version string. Storage key: `ftsLastIndexedSchemaVersion`.
+
+### Year-Based FTS Sharding (ADR-NF-002)
+- FTS5 tables are per-year: `messages_fts_2023`, `messages_fts_2024`, etc. Created lazily via `ensure_shard()`.
+- `message_meta.shardYear` column enables O(1) shard routing for single-message lookups.
+- `year_from_date_ms()` converts dateMs → year (UTC), clamped to `SHARD_MIN_YEAR = 2000` in `config.rs`.
+- Search uses `UNION ALL` across all shards in a single SQL statement (not sequential per-shard queries).
+- Writer thread: `known_years: HashSet<i32>` maintained locally, passed to `index_batch`, `optimize`.
+- Reader thread: calls `load_known_years(conn)` per-request (reads `sqlite_master`, cheap in WAL mode).
+- `messages_vec` (vector embeddings) stays un-sharded — uses global rowid from `message_ids`.
+- `find_by_header_message_id` → queries `message_ids` table directly (unsharded).
+- Crash-safe auto-migration from monolithic `messages_fts` on first boot (idempotent steps).
 
 ---
 
@@ -57,3 +68,5 @@ Native messaging host for full-text search + semantic search. Communicates with 
 - Reader may briefly fail during `clear` operations (between writer clearing and reader reopening connection)
 - Pre-init messages must remain single-threaded (hello/init/updateCheck/updateRequest)
 - JS side handles out-of-order responses via `pendingRPCs` Map — no changes needed for multi-threading
+- FTS5 `CREATE VIRTUAL TABLE` is auto-commit — must be called outside explicit transactions
+- FTS5 shadow tables (`messages_fts_2024_content`, `_data`, etc.) also appear in `sqlite_master` — `load_known_years` uses `.parse::<i32>()` filter to ignore them
