@@ -269,6 +269,28 @@ fn run_multi_threaded(
             req.id
         );
 
+        // Handle update methods on main thread (stateless, no DB needed).
+        // These can arrive post-init when the user triggers a manual update check.
+        match req.method.as_str() {
+            "updateCheck" => {
+                let resp = handle_update_check(&req.id, &req.params)?;
+                let mut out = shared_stdout.lock().unwrap();
+                native_messaging::write_json(&mut *out, &resp)?;
+                continue;
+            }
+            "updateRequest" => {
+                let resp = handle_update_request(&req.id, &req.params)?;
+                let mut out = shared_stdout.lock().unwrap();
+                native_messaging::write_json(&mut *out, &resp)?;
+                if resp.get("result").and_then(|r| r.get("success")).and_then(|v| v.as_bool()).unwrap_or(false) {
+                    log::info!("Update successful, exiting to allow restart with new version");
+                    break;
+                }
+                continue;
+            }
+            _ => {}
+        }
+
         let msg = ThreadMessage {
             method: req.method.clone(),
             id: req.id.clone(),
