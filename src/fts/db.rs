@@ -660,6 +660,102 @@ struct MessageMeta {
     has_attachments: bool,
 }
 
+// Column-scope prefixes used in FTS5 queries after alias translation.
+const COLUMN_SCOPE_PREFIXES: &[&str] = &["from_:", "to_:", "subject:", "cc:", "bcc:", "body:"];
+
+/// Check if a processed FTS5 query contains column-scoped terms.
+fn query_has_column_scope(fts_query: &str) -> bool {
+    COLUMN_SCOPE_PREFIXES.iter().any(|p| fts_query.contains(p))
+}
+
+/// Extract only the column-scoped terms from a processed FTS5 query.
+/// Given `from_:"tmm@cs.ubc.ca" hiring*`, returns `from_:"tmm@cs.ubc.ca"`.
+fn extract_column_scope_filter(fts_query: &str) -> String {
+    let mut scoped_terms: Vec<String> = Vec::new();
+    let bytes = fts_query.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // Skip whitespace
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+
+        let remaining = &fts_query[i..];
+
+        // Check if current position starts with a column scope prefix
+        let matched_prefix = COLUMN_SCOPE_PREFIXES.iter().find(|p| remaining.starts_with(**p));
+
+        if let Some(prefix) = matched_prefix {
+            let start = i;
+            i += prefix.len();
+
+            if i < bytes.len() && bytes[i] == b'"' {
+                // Quoted value: field:"value"
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1; // closing quote
+                }
+            } else {
+                // Unquoted value: field:value*
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+            }
+
+            scoped_terms.push(fts_query[start..i].to_string());
+        } else {
+            // Non-scoped token — skip it
+            if bytes[i] == b'"' {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            } else if bytes[i] == b'(' {
+                let mut depth = 1;
+                i += 1;
+                while i < bytes.len() && depth > 0 {
+                    if bytes[i] == b'(' { depth += 1; }
+                    if bytes[i] == b')' { depth -= 1; }
+                    i += 1;
+                }
+            } else {
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    scoped_terms.join(" ")
+}
+
+/// Fetch all rowids matching a column-scope filter query across all year shards.
+fn fetch_eligible_rowids(
+    conn: &Connection,
+    filter_query: &str,
+    known_years: &HashSet<i32>,
+) -> anyhow::Result<HashSet<i64>> {
+    let mut rowids = HashSet::new();
+    for &year in known_years {
+        let table = fts_table_name(year);
+        let sql = format!("SELECT fts.rowid FROM {table} fts WHERE {table} MATCH ?1");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![filter_query], |r| r.get::<_, i64>(0))?;
+        for rowid in rows {
+            rowids.insert(rowid?);
+        }
+    }
+    Ok(rowids)
+}
+
 pub fn search(
     conn: &Connection,
     q: &str,
@@ -711,11 +807,31 @@ pub fn search(
         vec![]
     };
 
+    // --- Column-scope filter-first: restrict vector candidates to eligible rowids ---
+    let eligible_rowids = if query_has_column_scope(&fts_query) {
+        let filter_query = extract_column_scope_filter(&fts_query);
+        if !filter_query.is_empty() {
+            Some(fetch_eligible_rowids(conn, &filter_query, known_years)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // --- Vector candidates ---
     let query_embedding = engine.embed(query)?;
     let query_blob = f32_vec_to_blob(&query_embedding);
-    let vec_candidates = search_vec_candidates(conn, "messages_vec", &query_blob, candidate_limit)
+    let vec_limit = if eligible_rowids.is_some() { candidate_limit * 2 } else { candidate_limit };
+    let all_vec = search_vec_candidates(conn, "messages_vec", &query_blob, vec_limit)
         .unwrap_or_default(); // empty vec table during rebuild → graceful empty
+
+    // Filter vector candidates to eligible set when column-scoped
+    let vec_candidates: Vec<(i64, f64)> = if let Some(ref eligible) = eligible_rowids {
+        all_vec.into_iter().filter(|(rowid, _)| eligible.contains(rowid)).collect()
+    } else {
+        all_vec
+    };
 
     // Fall back to FTS-only when vec table is empty (e.g., during embedding rebuild).
     // Without this, hybrid weights (text_weight=0.3) penalize text-only results below MIN_SCORE.
@@ -777,11 +893,17 @@ pub fn search(
         }
     }
 
+    let filter_info = if let Some(ref eligible) = eligible_rowids {
+        format!(", filtered to {} eligible", eligible.len())
+    } else {
+        String::new()
+    };
     log::info!(
-        "Hybrid search completed: {} results (FTS cands: {}, Vec cands: {})",
+        "Hybrid search completed: {} results (FTS cands: {}, Vec cands: {}{})",
         results.len(),
         text_pairs.len(),
-        vec_candidates.len()
+        vec_candidates.len(),
+        filter_info
     );
     Ok(results)
 }
@@ -1517,6 +1639,128 @@ mod tests {
             "INSERT INTO message_meta (rowid, dateMs, hasAttachments, parsedIcsAttachments, shardYear) VALUES (?1, ?2, 0, '', ?3)",
             params![row_id, date_ms, year],
         ).unwrap();
+    }
+
+    /// Insert a test message with from/to/body fields for column-scope testing.
+    fn insert_test_message_full(
+        conn: &Connection,
+        known_years: &mut HashSet<i32>,
+        msg_id: &str,
+        subject: &str,
+        from: &str,
+        to: &str,
+        body: &str,
+        date_ms: i64,
+    ) {
+        conn.execute(
+            "INSERT OR IGNORE INTO message_ids (msgId) VALUES (?1)",
+            params![msg_id],
+        ).unwrap();
+
+        let row_id: i64 = conn.query_row(
+            "SELECT rowid FROM message_ids WHERE msgId = ?1",
+            params![msg_id],
+            |r| r.get(0),
+        ).unwrap();
+
+        let year = year_from_date_ms(date_ms);
+        ensure_shard(conn, year, known_years).unwrap();
+        let table = fts_table_name(year);
+
+        conn.execute(
+            &format!("INSERT INTO {table} (rowid, msgId, subject, from_, to_, cc, bcc, body) VALUES (?1, ?2, ?3, ?4, ?5, '', '', ?6)"),
+            params![row_id, msg_id, subject, from, to, body],
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO message_meta (rowid, dateMs, hasAttachments, parsedIcsAttachments, shardYear) VALUES (?1, ?2, 0, '', ?3)",
+            params![row_id, date_ms, year],
+        ).unwrap();
+    }
+
+    // --- Column-scope filter-first tests ---
+
+    #[test]
+    fn test_query_has_column_scope_detects_prefixes() {
+        assert!(query_has_column_scope(r#"from_:"alice@example.com" hiring*"#));
+        assert!(query_has_column_scope(r#"to_:"bob@example.com""#));
+        assert!(query_has_column_scope("subject:budget*"));
+        assert!(query_has_column_scope(r#"cc:"team@example.com""#));
+        assert!(query_has_column_scope(r#"bcc:"secret@example.com""#));
+        assert!(query_has_column_scope("body:quarterly"));
+
+        // No column scope
+        assert!(!query_has_column_scope("hiring budget*"));
+        assert!(!query_has_column_scope(r#""quarterly report""#));
+        assert!(!query_has_column_scope("simple search"));
+    }
+
+    #[test]
+    fn test_extract_column_scope_filter_quoted() {
+        let result = extract_column_scope_filter(r#"from_:"alice@example.com" hiring*"#);
+        assert_eq!(result, r#"from_:"alice@example.com""#);
+    }
+
+    #[test]
+    fn test_extract_column_scope_filter_unquoted() {
+        let result = extract_column_scope_filter("subject:budget* hiring*");
+        assert_eq!(result, "subject:budget*");
+    }
+
+    #[test]
+    fn test_extract_column_scope_filter_multiple() {
+        let result = extract_column_scope_filter(r#"from_:"alice@example.com" to_:"bob@example.com" meeting"#);
+        assert_eq!(result, r#"from_:"alice@example.com" to_:"bob@example.com""#);
+    }
+
+    #[test]
+    fn test_extract_column_scope_filter_no_scope() {
+        let result = extract_column_scope_filter("hiring budget*");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_extract_column_scope_filter_parenthesized_groups() {
+        // Synonym OR expansions should be skipped
+        let result = extract_column_scope_filter(r#"from_:"alice@example.com" (hiring OR recruit)"#);
+        assert_eq!(result, r#"from_:"alice@example.com""#);
+    }
+
+    #[test]
+    fn test_fetch_eligible_rowids_filters_by_sender() {
+        let (conn, mut known_years) = setup_test_db();
+
+        insert_test_message_full(&conn, &mut known_years,
+            "acc:/:msg1", "Budget Report", "alice@example.com", "team@co.com", "Q1 numbers", 1704067200000);
+        insert_test_message_full(&conn, &mut known_years,
+            "acc:/:msg2", "Hiring Plan", "bob@example.com", "team@co.com", "New roles", 1704153600000);
+        insert_test_message_full(&conn, &mut known_years,
+            "acc:/:msg3", "Budget Update", "alice@example.com", "team@co.com", "Q2 forecast", 1704240000000);
+
+        let eligible = fetch_eligible_rowids(&conn, r#"from_:"alice@example.com""#, &known_years).unwrap();
+        assert_eq!(eligible.len(), 2, "Should find 2 messages from alice");
+
+        // Get rowids for alice's messages to verify
+        let msg1_rowid: i64 = conn.query_row("SELECT rowid FROM message_ids WHERE msgId = 'acc:/:msg1'", [], |r| r.get(0)).unwrap();
+        let msg3_rowid: i64 = conn.query_row("SELECT rowid FROM message_ids WHERE msgId = 'acc:/:msg3'", [], |r| r.get(0)).unwrap();
+        assert!(eligible.contains(&msg1_rowid));
+        assert!(eligible.contains(&msg3_rowid));
+    }
+
+    #[test]
+    fn test_fetch_eligible_rowids_across_year_shards() {
+        let (conn, mut known_years) = setup_test_db();
+
+        // Messages in different years from the same sender
+        insert_test_message_full(&conn, &mut known_years,
+            "acc:/:msg1", "Old Report", "alice@example.com", "", "", 946684800000);  // 2000
+        insert_test_message_full(&conn, &mut known_years,
+            "acc:/:msg2", "New Report", "alice@example.com", "", "", 1704067200000); // 2024
+        insert_test_message_full(&conn, &mut known_years,
+            "acc:/:msg3", "Other", "bob@example.com", "", "", 1704067200000); // 2024
+
+        let eligible = fetch_eligible_rowids(&conn, r#"from_:"alice@example.com""#, &known_years).unwrap();
+        assert_eq!(eligible.len(), 2, "Should find alice's messages across year shards");
     }
 
     #[test]
