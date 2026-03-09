@@ -46,13 +46,13 @@ fn fts_table_name(year: i32) -> String {
 
 fn year_from_date_ms(date_ms: i64) -> i32 {
     if date_ms <= 0 {
+        // dateMs=0 or negative = broken/missing date, use fallback shard
         return config::sqlite::SHARD_MIN_YEAR;
     }
     let secs = date_ms / 1000;
-    let year = DateTime::<Utc>::from_timestamp(secs, 0)
+    DateTime::<Utc>::from_timestamp(secs, 0)
         .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap())
-        .year();
-    year.max(config::sqlite::SHARD_MIN_YEAR)
+        .year()
 }
 
 fn ensure_shard(conn: &Connection, year: i32, known_years: &mut HashSet<i32>) -> anyhow::Result<()> {
@@ -126,10 +126,7 @@ fn migrate_monolithic_to_shards(conn: &Connection, known_years: &mut HashSet<i32
 
     // Step 2: Backfill shardYear from dateMs (WHERE shardYear = 0 makes it idempotent)
     let backfilled = conn.execute(
-        &format!(
-            "UPDATE message_meta SET shardYear = MAX(CAST(strftime('%Y', dateMs / 1000, 'unixepoch') AS INTEGER), {min_year}) WHERE shardYear = 0 AND dateMs > 0",
-            min_year = config::sqlite::SHARD_MIN_YEAR
-        ),
+        "UPDATE message_meta SET shardYear = CAST(strftime('%Y', dateMs / 1000, 'unixepoch') AS INTEGER) WHERE shardYear = 0 AND dateMs > 0",
         [],
     )?;
     if backfilled > 0 {
@@ -1897,8 +1894,9 @@ mod tests {
         assert_eq!(year_from_date_ms(1704067200000), 2024); // 2024-01-01T00:00:00Z
         assert_eq!(year_from_date_ms(1672531200000), 2023); // 2023-01-01T00:00:00Z
         assert_eq!(year_from_date_ms(946684800000), 2000); // 2000-01-01T00:00:00Z
+        assert_eq!(year_from_date_ms(852076800000), 1997); // 1997-01-01T00:00:00Z — pre-2000 preserved
 
-        // Edge cases
+        // Edge cases — only dateMs=0/negative gets clamped
         assert_eq!(year_from_date_ms(0), config::sqlite::SHARD_MIN_YEAR); // epoch → clamped
         assert_eq!(year_from_date_ms(-1), config::sqlite::SHARD_MIN_YEAR); // negative → clamped
     }
