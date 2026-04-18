@@ -9,8 +9,12 @@ set -euo pipefail
 # - Updates tabmail-native-fts/.dev.vars to point to the new PEM
 #
 # Rotation support requirements:
-# - The Rust host supports accepting multiple public keys (see TM_UPDATE_PUBLIC_KEYS_BASE64)
-# - During rotation, publish a host build that accepts BOTH old+new pubkeys, then switch signing.
+# - The Rust host supports accepting multiple public keys (see TM_UPDATE_PUBLIC_KEYS_BASE64
+#   and the compiled-in UPDATE_PUBLIC_KEYS_BASE64 array in src/update_signature.rs).
+# - The array is an ACCUMULATING trust pool: on rotation we add the new pubkey,
+#   KEEP the old one, and ship a new binary. Removal only on compromise.
+# - See tabmail-cloudflare/MAINTENANCE.md → "Rotating TM_UPDATE_PRIVATE_KEY_PEM_BASE64"
+#   for the full operator procedure.
 #
 # IMPORTANT: This script does NOT commit anything.
 
@@ -70,10 +74,12 @@ fi
 
 echo ""
 echo "Next steps (manual):"
-echo "1) Add the NEW public key to the host allowlist during rotation:"
-echo "   - Set TM_UPDATE_PUBLIC_KEYS_BASE64=\"<old>,<new>\" during build, or"
-echo "   - Add it to UPDATE_PUBLIC_KEYS_BASE64 in src/update_signature.rs and ship a host update"
-echo "2) Switch release signing to use the NEW PEM (TM_UPDATE_PRIVATE_KEY_PEM_PATH)"
-echo "3) After the fleet is upgraded, remove the old public key from the allowlist"
+echo "1) Add the NEW public key to the ACCUMULATING array (keep the old one):"
+echo "   src/update_signature.rs → UPDATE_PUBLIC_KEYS_BASE64"
+echo "2) Ship a new host binary (cargo build --release → release + installer rebuild)"
+echo "3) Switch release signing to use the NEW PEM (TM_UPDATE_PRIVATE_KEY_PEM_PATH)"
+echo "4) DO NOT remove the old public key. The array is an accumulating trust"
+echo "   pool; removal strands clients that haven't self-updated. Removal is"
+echo "   only a compromise-response action — see MAINTENANCE.md for details."
 echo ""
 
