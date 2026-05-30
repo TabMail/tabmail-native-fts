@@ -1,3 +1,7 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
 // memory_db.rs - Separate memory database for chat history and learned facts
 // This is stored in a separate file from the email FTS database so that:
 // 1. Re-indexing emails doesn't wipe memory

@@ -1,3 +1,7 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
 // engine.rs — Candle BERT embedding engine with attention-mask-aware mean pooling.
 //
 // Loads all-MiniLM-L6-v2 from safetensors, generates 384-dim sentence embeddings.
