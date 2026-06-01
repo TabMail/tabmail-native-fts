@@ -58,6 +58,22 @@
 
 ---
 
+## ADR-NF-003: Relicensed to MPL 2.0 (PolyForm Noncommercial → MPL 2.0)
+
+**Context:** TabMail's clients were source-available under PolyForm Noncommercial 1.0.0, which bars commercial use and is not OSI-approved open source. As the native-messaging FTS host the (now open-source) Thunderbird add-on depends on for desktop search, `tabmail-native-fts` is relicensed in lockstep so the whole desktop stack is genuinely open.
+
+**Decision:** Relicense `tabmail-native-fts` to the **Mozilla Public License 2.0**, in place (no history rewrite). Per-file MPL headers added; root `LICENSE` carries the full MPL 2.0 text. Version bumped `0.8.9 → 0.9.0` to mark the relicense (`Cargo.toml` + `src/config.rs` `HOST_VERSION`), tag `v0.9.0`. Relicensed alongside the Thunderbird add-on (v1.6.0) and the iOS client.
+
+**Rationale:** MPL 2.0 is OSI-approved weak copyleft at file granularity — modifications to MPL files stay open, while integrators may ship proprietary surrounding code; GPL-compatible via the secondary-license clause; well understood by enterprise legal. Makes the desktop search host auditable and forkable while protecting our changes.
+
+**Consequences:**
+- The crate, the prebuilt binary, and the update manifest are genuinely open source — anyone can build, audit, or fork.
+- The hosted TabMail backend (AI orchestration, prompts, infra) and signing identities stay proprietary — out of scope.
+- The "TabMail" name and logo remain trademarks; forks must rebrand.
+- Contributions require a DCO sign-off (`git commit -s`).
+
+---
+
 ## Template for New Decisions
 
 ```markdown
