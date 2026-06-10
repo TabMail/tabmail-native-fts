@@ -106,6 +106,100 @@ pub fn load_known_years(conn: &Connection) -> anyhow::Result<HashSet<i32>> {
     Ok(years)
 }
 
+/// Year shards created with an outdated `tokenize=` string, detected from the
+/// stored CREATE statement in sqlite_master (current marker: anything still
+/// carrying `tokenchars`). Detection is stateless and needs NO schema version —
+/// bumping SCHEMA_VERSION would make the addon run a FULL re-index from
+/// Thunderbird (see config.rs). Newest years first.
+fn stale_tokenizer_years(conn: &Connection) -> anyhow::Result<Vec<i32>> {
+    let mut stmt = conn.prepare(
+        r"SELECT name, sql FROM sqlite_master WHERE type='table' AND name LIKE 'messages\_fts\_%' ESCAPE '\'",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+    })?;
+    let mut years = Vec::new();
+    for row in rows {
+        let (name, sql) = row?;
+        if !sql.unwrap_or_default().contains("tokenchars") {
+            continue;
+        }
+        if let Some(suffix) = name.strip_prefix("messages_fts_") {
+            if let Ok(year) = suffix.parse::<i32>() {
+                years.push(year);
+            }
+        }
+    }
+    years.sort_unstable_by(|a, b| b.cmp(a));
+    Ok(years)
+}
+
+/// In-place tokenizer migration: rebuild each stale shard with the current
+/// `FTS_TOKENIZE` via a rowid-preserving copy (FTS5 tables store their content,
+/// so `INSERT .. SELECT` re-tokenizes locally — NO re-feed from Thunderbird).
+/// One transaction per shard: crash-safe, idempotent, message_meta/messages_vec
+/// rowid alignment untouched. Bounded by RETOKENIZE_TIME_BUDGET_SECS per call so
+/// a huge archive cannot blow the addon's init RPC timeout; leftover shards
+/// convert on the next init.
+pub fn rebuild_stale_tokenizer_shards(conn: &mut Connection) -> anyhow::Result<()> {
+    let stale = stale_tokenizer_years(conn)?;
+    if stale.is_empty() {
+        return Ok(());
+    }
+    log::info!("Tokenizer migration: {} shard(s) to rebuild: {:?}", stale.len(), stale);
+    let started = std::time::Instant::now();
+    let mut converted = 0usize;
+    for year in &stale {
+        if started.elapsed().as_secs() >= config::sqlite::RETOKENIZE_TIME_BUDGET_SECS {
+            log::info!(
+                "Tokenizer migration: time budget reached after {}/{} shards — rest convert on next start",
+                converted, stale.len()
+            );
+            return Ok(());
+        }
+        let shard_start = std::time::Instant::now();
+        let table = fts_table_name(*year);
+        let tmp = format!("{table}_retok");
+        let tx = conn.transaction()?;
+        tx.execute_batch(&format!("DROP TABLE IF EXISTS {tmp}"))?;
+        tx.execute_batch(&format!(
+            r#"CREATE VIRTUAL TABLE {tmp} USING fts5(
+                msgId,
+                subject, from_, to_, cc, bcc, body,
+                tokenize = "{tokenize}",
+                prefix = '{prefix}'
+            )"#,
+            tokenize = config::sqlite::FTS_TOKENIZE,
+            prefix = config::sqlite::FTS_PREFIXES,
+        ))?;
+        // rowid-preserving copy; SQLite streams rows internally (bounded memory)
+        tx.execute_batch(&format!(
+            "INSERT INTO {tmp}(rowid, msgId, subject, from_, to_, cc, bcc, body)
+             SELECT rowid, msgId, subject, from_, to_, cc, bcc, body FROM {table}"
+        ))?;
+        tx.execute_batch(&format!("DROP TABLE {table}"))?;
+        tx.execute_batch(&format!("ALTER TABLE {tmp} RENAME TO {table}"))?;
+        // Re-apply the write tuning ensure_shard sets on creation
+        tx.execute(
+            &format!("INSERT INTO {table}({table}, rank) VALUES('automerge', ?1)"),
+            params![config::sqlite::FTS_AUTOMERGE],
+        )?;
+        tx.execute(
+            &format!("INSERT INTO {table}({table}, rank) VALUES('usermerge', ?1)"),
+            params![config::sqlite::FTS_USERMERGE],
+        )?;
+        tx.commit()?;
+        converted += 1;
+        log::info!(
+            "Tokenizer migration: rebuilt {} in {:.1}s",
+            table,
+            shard_start.elapsed().as_secs_f64()
+        );
+    }
+    log::info!("Tokenizer migration complete: {} shard(s) in {:.1}s", converted, started.elapsed().as_secs_f64());
+    Ok(())
+}
+
 /// Crash-safe migration from monolithic messages_fts to year-sharded tables.
 /// The presence of the monolithic `messages_fts` table means migration is incomplete.
 /// Each step is idempotent — a crash at any point is recoverable on next boot.
@@ -322,7 +416,7 @@ pub fn open_or_create_db(profile_dir: &Path) -> anyhow::Result<(PathBuf, Connect
     log::info!("  FTS Dir: {}", fts_dir.display());
     log::info!("  DB Path: {}", db_path.display());
 
-    let conn = Connection::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
+    let mut conn = Connection::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
     ensure_fts5_available(&conn)?;
 
     let mut known_years = HashSet::new();
@@ -356,6 +450,11 @@ pub fn open_or_create_db(profile_dir: &Path) -> anyhow::Result<(PathBuf, Connect
         log::info!("Creating new year-sharded FTS database schema");
         init_database(&conn)?;
     }
+
+    // In-place tokenizer migration for shards created with an outdated
+    // tokenize= string. NO SCHEMA_VERSION bump — the addon must never see this
+    // (a version change triggers a full re-index from Thunderbird).
+    rebuild_stale_tokenizer_shards(&mut conn)?;
 
     let count = db_count(&conn)?;
     log::info!("Database initialized: {} documents indexed, {} year shards: {:?}", count, known_years.len(), known_years);
@@ -1704,6 +1803,57 @@ mod tests {
     fn test_extract_column_scope_filter_quoted() {
         let result = extract_column_scope_filter(r#"from_:"alice@example.com" hiring*"#);
         assert_eq!(result, r#"from_:"alice@example.com""#);
+    }
+
+    #[test]
+    fn test_tokenizer_shard_rebuild_in_place() {
+        // Seed a shard with the OLD tokenchars tokenizer, then verify the
+        // in-place rebuild re-tokenizes it (rowid preserved, parts matchable)
+        // WITHOUT any schema version involvement.
+        let mut conn = Connection::open_in_memory().unwrap();
+        let old_tokenize = "porter unicode61 remove_diacritics 2 tokenchars '-_.@'";
+        conn.execute_batch(&format!(
+            r#"CREATE VIRTUAL TABLE messages_fts_2001 USING fts5(
+                msgId, subject, from_, to_, cc, bcc, body,
+                tokenize = "{old_tokenize}", prefix = '2 3 4')"#
+        )).unwrap();
+        conn.execute(
+            "INSERT INTO messages_fts_2001(rowid, msgId, subject, from_, to_, cc, bcc, body)
+             VALUES (7, '<retok@test>', 'Weekly digest', 'billing-alerts@domain.com', '', '', '', 'body text')",
+            [],
+        ).unwrap();
+
+        // Old tokenizer: a part query cannot match the glued address token
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM messages_fts_2001 WHERE messages_fts_2001 MATCH 'billing'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(n, 0, "precondition: glued token must not part-match");
+
+        rebuild_stale_tokenizer_shards(&mut conn).unwrap();
+
+        // Shard now uses the current tokenizer (no tokenchars)
+        let sql: String = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE name='messages_fts_2001'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert!(!sql.contains("tokenchars"), "rebuilt shard still has tokenchars: {sql}");
+
+        // rowid preserved, parts matchable, body intact
+        let (rowid, body): (i64, String) = conn.query_row(
+            "SELECT rowid, body FROM messages_fts_2001 WHERE messages_fts_2001 MATCH 'billing'",
+            [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(rowid, 7);
+        assert_eq!(body, "body text");
+
+        // Idempotent: second run is a no-op
+        rebuild_stale_tokenizer_shards(&mut conn).unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM messages_fts_2001 WHERE messages_fts_2001 MATCH 'billing'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]
