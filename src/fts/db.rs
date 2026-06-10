@@ -1919,9 +1919,9 @@ mod tests {
 
     #[test]
     fn test_build_fts_match_special_chars_prefix_star() {
-        // tokenchars '-_.@' glue addresses into single index tokens; auto-quoted
-        // special-char tokens MUST be prefix queries or partial addresses
-        // ("dmarc-helper" vs indexed "dmarc-helper@domain.com") match nothing.
+        // Special-char tokens become quoted phrase-prefix queries (ADR-024):
+        // "dmarc-helper" → phrase [dmarc, helper*]. The trailing star keeps
+        // mid-typing partials (incomplete last fragment) matching.
         let synonyms = SynonymLookup::new();
         assert_eq!(build_fts_match(Some("dmarc-helper"), true, &synonyms), r#""dmarc-helper"*"#);
         assert_eq!(build_fts_match(Some("user@example.com"), true, &synonyms), r#""user@example.com"*"#);

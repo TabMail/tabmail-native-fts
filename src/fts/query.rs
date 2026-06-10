@@ -81,11 +81,11 @@ pub fn build_fts_match(q: Option<&str>, use_synonyms: bool, synonyms: &SynonymLo
             let needs_quote = has_special_chars_requiring_quotes(&escaped_core);
 
             let final_token = if needs_quote {
-                // Prefix star is REQUIRED here: the tokenizer (tokenchars '-_.@')
-                // glues email-ish text into single index tokens (e.g.
-                // "dmarc-helper@domain.com"), so an exact quoted partial like
-                // "dmarc-helper" can never match. `"..."*` keeps phrase semantics
-                // and prefix-matches the glued token; exact input still matches.
+                // Quoted phrase-prefix: the tokenizer splits on - _ . @ (ADR-024),
+                // so "dmarc-supp" becomes the phrase [dmarc, supp*] — adjacency-
+                // matching partial AND full addresses mid-typing. Without the
+                // trailing star, a partial's last fragment would need to be a
+                // complete token and mid-typing queries would return nothing.
                 format!("\"{}\"*", escaped_core.replace('"', "\"\""))
             } else {
                 // Auto-add wildcard for tokens >= 4 chars, but avoid if OR groups exist.
