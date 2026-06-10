@@ -693,13 +693,17 @@ fn extract_column_scope_filter(fts_query: &str) -> String {
             i += prefix.len();
 
             if i < bytes.len() && bytes[i] == b'"' {
-                // Quoted value: field:"value"
+                // Quoted value: field:"value" or prefix form field:"value"*
                 i += 1;
                 while i < bytes.len() && bytes[i] != b'"' {
                     i += 1;
                 }
                 if i < bytes.len() {
                     i += 1; // closing quote
+                }
+                if i < bytes.len() && bytes[i] == b'*' {
+                    i += 1; // prefix star — keep so the filter query preserves
+                            // the main query's prefix semantics
                 }
             } else {
                 // Unquoted value: field:value*
@@ -1700,6 +1704,24 @@ mod tests {
     fn test_extract_column_scope_filter_quoted() {
         let result = extract_column_scope_filter(r#"from_:"alice@example.com" hiring*"#);
         assert_eq!(result, r#"from_:"alice@example.com""#);
+    }
+
+    #[test]
+    fn test_extract_column_scope_filter_quoted_prefix_star() {
+        // build_fts_match emits field:"value"* for special-char values — the
+        // star must survive extraction so the filter keeps prefix semantics.
+        let result = extract_column_scope_filter(r#"from_:"alice@example.com"* hiring*"#);
+        assert_eq!(result, r#"from_:"alice@example.com"*"#);
+    }
+
+    #[test]
+    fn test_build_fts_match_special_chars_prefix_star() {
+        // tokenchars '-_.@' glue addresses into single index tokens; auto-quoted
+        // special-char tokens MUST be prefix queries or partial addresses
+        // ("dmarc-helper" vs indexed "dmarc-helper@domain.com") match nothing.
+        let synonyms = SynonymLookup::new();
+        assert_eq!(build_fts_match(Some("dmarc-helper"), true, &synonyms), r#""dmarc-helper"*"#);
+        assert_eq!(build_fts_match(Some("user@example.com"), true, &synonyms), r#""user@example.com"*"#);
     }
 
     #[test]
