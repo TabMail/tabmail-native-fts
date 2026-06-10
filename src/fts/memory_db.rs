@@ -151,6 +151,10 @@ fn rebuild_memory_fts_if_stale_tokenizer(conn: &mut Connection) -> anyhow::Resul
         "INSERT INTO memory_fts(memory_fts, rank) VALUES('automerge', 2)",
         [],
     )?;
+    tx.execute(
+        "INSERT INTO memory_fts(memory_fts, rank) VALUES('usermerge', 2)",
+        [],
+    )?;
     tx.commit()?;
     log::info!("Memory tokenizer migration complete");
     Ok(())
