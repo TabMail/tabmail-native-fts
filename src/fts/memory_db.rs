@@ -106,13 +106,63 @@ PRAGMA wal_autocheckpoint = {wal_autocheckpoint};\n\
 }
 
 /// Open or create the memory database
+/// In-place tokenizer migration for memory_fts (mirrors db.rs
+/// rebuild_stale_tokenizer_shards — see ADR-024). Stale = the stored CREATE
+/// statement still carries `tokenchars`. The FTS5 table stores its content, so
+/// a rowid-preserving copy re-tokenizes locally; memory_meta / memory_vec
+/// rowid alignment is untouched. memory.db is small (chat turns) — one
+/// transaction, no time budget needed. NO schema-version involvement.
+fn rebuild_memory_fts_if_stale_tokenizer(conn: &mut Connection) -> anyhow::Result<()> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_fts'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(create_sql) = sql else { return Ok(()) };
+    if !create_sql.contains("tokenchars") {
+        return Ok(());
+    }
+    log::info!("Memory tokenizer migration: rebuilding memory_fts in place");
+    let tx = conn.transaction()?;
+    tx.execute_batch("DROP TABLE IF EXISTS memory_fts_retok")?;
+    tx.execute_batch(&format!(
+        r#"CREATE VIRTUAL TABLE memory_fts_retok USING fts5(
+            memId,
+            role,
+            content,
+            sessionId,
+            tokenize = "{tokenize}",
+            prefix = '{prefix}'
+        )"#,
+        tokenize = config::sqlite::FTS_TOKENIZE,
+        prefix = config::sqlite::FTS_PREFIXES,
+    ))?;
+    // rowid-preserving copy; SQLite streams rows internally
+    tx.execute_batch(
+        "INSERT INTO memory_fts_retok(rowid, memId, role, content, sessionId)
+         SELECT rowid, memId, role, content, sessionId FROM memory_fts",
+    )?;
+    tx.execute_batch("DROP TABLE memory_fts")?;
+    tx.execute_batch("ALTER TABLE memory_fts_retok RENAME TO memory_fts")?;
+    // Re-apply the write tuning init_memory_database sets on creation
+    tx.execute(
+        "INSERT INTO memory_fts(memory_fts, rank) VALUES('automerge', 2)",
+        [],
+    )?;
+    tx.commit()?;
+    log::info!("Memory tokenizer migration complete");
+    Ok(())
+}
+
 pub fn open_or_create_memory_db(fts_dir: &Path) -> anyhow::Result<(PathBuf, Connection)> {
     let db_path = fts_dir.join("memory.db");
 
     log::info!("Initializing memory database");
     log::info!("  Memory DB Path: {}", db_path.display());
 
-    let conn = Connection::open(&db_path)
+    let mut conn = Connection::open(&db_path)
         .with_context(|| format!("open memory db {}", db_path.display()))?;
     
     // Verify FTS5 is available
@@ -134,6 +184,10 @@ pub fn open_or_create_memory_db(fts_dir: &Path) -> anyhow::Result<(PathBuf, Conn
         log::info!("Using existing memory database schema");
         // Migrate: add vector tables if missing (pre-v0.7.0 databases)
         ensure_memory_vector_tables(&conn)?;
+        // In-place tokenizer migration (ADR-024) — same lockstep change as the
+        // email shards; without this, memory search would tokenize differently
+        // from email search on pre-existing profiles.
+        rebuild_memory_fts_if_stale_tokenizer(&mut conn)?;
     }
 
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM memory_fts", [], |r| r.get(0))?;
@@ -929,4 +983,58 @@ fn truncate_for_log(s: &str) -> String {
         return s.to_string();
     }
     s.chars().take(max).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_memory_fts_tokenizer_rebuild_in_place() {
+        // Existing memory.db with the OLD tokenchars tokenizer must be
+        // rebuilt in place (rowid preserved, parts matchable) — NO schema
+        // version involvement (ADR-024).
+        let mut conn = Connection::open_in_memory().unwrap();
+        let old_tokenize = "porter unicode61 remove_diacritics 2 tokenchars '-_.@'";
+        conn.execute_batch(&format!(
+            r#"CREATE VIRTUAL TABLE memory_fts USING fts5(
+                memId, role, content, sessionId,
+                tokenize = "{old_tokenize}", prefix = '2 3 4')"#
+        )).unwrap();
+        conn.execute(
+            "INSERT INTO memory_fts(rowid, memId, role, content, sessionId)
+             VALUES (3, 'chat:s1:0', 'user', 'ask billing-alerts@domain.com about the invoice', 's1')",
+            [],
+        ).unwrap();
+
+        // Old tokenizer: part query cannot match the glued address token
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH 'billing'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(n, 0, "precondition: glued token must not part-match");
+
+        rebuild_memory_fts_if_stale_tokenizer(&mut conn).unwrap();
+
+        let sql: String = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE name='memory_fts'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert!(!sql.contains("tokenchars"), "rebuilt memory_fts still has tokenchars: {sql}");
+
+        let (rowid, content): (i64, String) = conn.query_row(
+            "SELECT rowid, content FROM memory_fts WHERE memory_fts MATCH 'billing'",
+            [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(rowid, 3, "rowid must be preserved");
+        assert!(content.contains("invoice"), "content must survive rebuild");
+
+        // Idempotent: second run no-ops
+        rebuild_memory_fts_if_stale_tokenizer(&mut conn).unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH 'billing'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(n, 1);
+    }
 }

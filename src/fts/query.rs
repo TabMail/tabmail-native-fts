@@ -81,8 +81,9 @@ pub fn build_fts_match(q: Option<&str>, use_synonyms: bool, synonyms: &SynonymLo
             let needs_quote = has_special_chars_requiring_quotes(&escaped_core);
 
             let final_token = if needs_quote {
-                // Quoted phrase-prefix: the tokenizer splits on - _ . @ (ADR-024),
-                // so "dmarc-supp" becomes the phrase [dmarc, supp*] — adjacency-
+                // Quoted phrase-prefix: with no tokenchars (ADR-024) the
+                // tokenizer treats - _ . @ like any other separator, so
+                // "dmarc-supp" becomes the phrase [dmarc, supp*] — adjacency-
                 // matching partial AND full addresses mid-typing. Without the
                 // trailing star, a partial's last fragment would need to be a
                 // complete token and mid-typing queries would return nothing.

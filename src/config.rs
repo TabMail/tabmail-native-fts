@@ -43,10 +43,11 @@ pub mod sqlite {
     pub const PRAGMA_WAL_AUTOCHECKPOINT_PAGES: i64 = 200_000;
 
     pub const FTS_PREFIXES: &str = "2 3 4";
-    /// No tokenchars: '-', '_', '.', '@' split tokens, so addresses index as
-    /// parts (noreply / dmarc / support / domain / com) and any part is matchable.
-    /// The old `tokenchars '-_.@'` glued addresses into single tokens that could
-    /// only be prefix-matched from the token start. Changing this string triggers
+    /// No tokenchars (ADR-024): unicode61 treats ALL non-alphanumeric characters
+    /// as separators by default; the old `tokenchars '-_.@'` option made exactly
+    /// those four token-INTERNAL, gluing addresses into single tokens that could
+    /// only be prefix-matched from the token start. Without it, addresses index
+    /// as parts and any part is matchable. Changing this string triggers
     /// the in-place shard rebuild in db.rs (NO SCHEMA_VERSION bump — see above).
     /// Keep in lockstep with tabmail-ios SearchConfig.ftsTokenize.
     pub const FTS_TOKENIZE: &str = "porter unicode61 remove_diacritics 2";
