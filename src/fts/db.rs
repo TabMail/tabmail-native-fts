@@ -160,6 +160,10 @@ pub fn rebuild_stale_tokenizer_shards(conn: &mut Connection) -> anyhow::Result<(
         let shard_start = std::time::Instant::now();
         let table = fts_table_name(*year);
         let tmp = format!("{table}_retok");
+        // Contain per-shard failures (matches the iOS side): one corrupted
+        // shard must not abort init — the addon would retry-loop forever.
+        // Skipped shards stay stale and are retried on the next init.
+        let result = (|| -> anyhow::Result<()> {
         let tx = conn.transaction()?;
         tx.execute_batch(&format!("DROP TABLE IF EXISTS {tmp}"))?;
         tx.execute_batch(&format!(
@@ -189,12 +193,21 @@ pub fn rebuild_stale_tokenizer_shards(conn: &mut Connection) -> anyhow::Result<(
             params![config::sqlite::FTS_USERMERGE],
         )?;
         tx.commit()?;
-        converted += 1;
-        log::info!(
-            "Tokenizer migration: rebuilt {} in {:.1}s",
-            table,
-            shard_start.elapsed().as_secs_f64()
-        );
+        Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                converted += 1;
+                log::info!(
+                    "Tokenizer migration: rebuilt {} in {:.1}s",
+                    table,
+                    shard_start.elapsed().as_secs_f64()
+                );
+            }
+            Err(e) => {
+                log::error!("Tokenizer migration: shard {} failed (skipping, will retry next init): {:?}", table, e);
+            }
+        }
     }
     log::info!("Tokenizer migration complete: {} shard(s) in {:.1}s", converted, started.elapsed().as_secs_f64());
     Ok(())
@@ -1854,6 +1867,46 @@ mod tests {
             [], |r| r.get(0),
         ).unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn test_stale_detection_ignores_shadow_and_retok_tables() {
+        // Stale detection must list ONLY real legacy shards — never FTS5 shadow
+        // tables (messages_fts_2004_data/_idx/_config/…) nor a leftover _retok
+        // temp table from a crashed rebuild.
+        let mut conn = Connection::open_in_memory().unwrap();
+        let old_tokenize = "porter unicode61 remove_diacritics 2 tokenchars '-_.@'";
+        conn.execute_batch(&format!(
+            r#"CREATE VIRTUAL TABLE messages_fts_2004 USING fts5(
+                msgId, subject, from_, to_, cc, bcc, body,
+                tokenize = "{old_tokenize}", prefix = '2 3 4')"#
+        )).unwrap();
+        // Row insert materializes the shadow tables in sqlite_master
+        conn.execute(
+            "INSERT INTO messages_fts_2004(rowid, msgId, subject, from_, to_, cc, bcc, body)
+             VALUES (1, '<a@test>', 'subj', 'a@domain.com', '', '', '', 'body')",
+            [],
+        ).unwrap();
+        // Leftover temp table from a crashed rebuild (already-new tokenizer)
+        conn.execute_batch(&format!(
+            r#"CREATE VIRTUAL TABLE messages_fts_2004_retok USING fts5(
+                msgId, subject, from_, to_, cc, bcc, body,
+                tokenize = "{}", prefix = '2 3 4')"#,
+            config::sqlite::FTS_TOKENIZE
+        )).unwrap();
+
+        let stale = stale_tokenizer_years(&conn).unwrap();
+        assert_eq!(stale, vec![2004], "only the real legacy shard must be stale, got {stale:?}");
+
+        // Rebuild succeeds despite the leftover _retok (dropped + recreated)
+        rebuild_stale_tokenizer_shards(&mut conn).unwrap();
+        let stale_after = stale_tokenizer_years(&conn).unwrap();
+        assert!(stale_after.is_empty(), "no stale shards after rebuild, got {stale_after:?}");
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM messages_fts_2004 WHERE messages_fts_2004 MATCH 'domain'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(n, 1, "address part must match after rebuild");
     }
 
     #[test]
