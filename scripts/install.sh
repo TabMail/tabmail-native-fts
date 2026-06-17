@@ -44,8 +44,16 @@ else
     exit 1
 fi
 
-PLATFORM_KEY="${OS}-${ARCH}"
-echo -e "Detected platform: ${GREEN}$PLATFORM_KEY${NC}"
+# macOS ships a single universal binary (arm64 + x86_64 combined) published
+# under "macos-universal"; Linux is arch-specific. This must match the CDN
+# layout produced by the release scripts (and the add-on's own platform key
+# in tabmail-thunderbird fts/nativeEngine.js getNativeFtsPlatformKey()).
+if [[ "$OS" == "macos" ]]; then
+    PLATFORM_KEY="macos-universal"
+else
+    PLATFORM_KEY="${OS}-${ARCH}"
+fi
+echo -e "Detected platform: ${GREEN}${OS}-${ARCH}${NC} (artifact: ${PLATFORM_KEY})"
 
 # Set paths based on OS
 if [[ "$OS" == "macos" ]]; then
