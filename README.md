@@ -22,11 +22,13 @@ FTS Database (per-profile)
 
 ```bash
 # macOS / Linux
-curl -fsSL https://cdn.tabmail.ai/releases/native-fts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/TabMail/tabmail-native-fts/main/scripts/install.sh | bash
 
 # Windows (PowerShell)
-irm https://cdn.tabmail.ai/releases/native-fts/install.ps1 | iex
+irm https://raw.githubusercontent.com/TabMail/tabmail-native-fts/main/scripts/install.ps1 | iex
 ```
+
+The install scripts live in this repo at [`scripts/install.sh`](scripts/install.sh) and [`scripts/install.ps1`](scripts/install.ps1) — read them before piping to a shell. Each downloads the prebuilt `fts_helper` binary for your platform from the CDN and registers it as a Thunderbird native-messaging host.
 
 ## Building from Source
 
