@@ -17,8 +17,6 @@ set -euo pipefail
 #   and the compiled-in UPDATE_PUBLIC_KEYS_BASE64 array in src/update_signature.rs).
 # - The array is an ACCUMULATING trust pool: on rotation we add the new pubkey,
 #   KEEP the old one, and ship a new binary. Removal only on compromise.
-# - See tabmail-cloudflare/MAINTENANCE.md → "Rotating TM_UPDATE_PRIVATE_KEY_PEM_BASE64"
-#   for the full operator procedure.
 #
 # IMPORTANT: This script does NOT commit anything.
 
@@ -84,6 +82,6 @@ echo "2) Ship a new host binary (cargo build --release → release + installer r
 echo "3) Switch release signing to use the NEW PEM (TM_UPDATE_PRIVATE_KEY_PEM_PATH)"
 echo "4) DO NOT remove the old public key. The array is an accumulating trust"
 echo "   pool; removal strands clients that haven't self-updated. Removal is"
-echo "   only a compromise-response action — see MAINTENANCE.md for details."
+echo "   only a compromise-response action."
 echo ""
 
