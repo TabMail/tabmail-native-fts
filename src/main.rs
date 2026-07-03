@@ -1063,3 +1063,197 @@ fn home_dir() -> anyhow::Result<PathBuf> {
     }
     bail!("Cannot determine home directory")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fts::synonyms::SynonymLookup;
+
+    // ------------------------------------------------------------------
+    // Dispatch-layer tests for the msgId key-range RPCs (ADR-021 /
+    // PLAN_FOLDER_SET_RECONCILE.md). The db-layer semantics are covered in
+    // fts::db::tests; these pin the JSON-RPC surface the addon actually
+    // talks to: method routing, param validation, envelope shape, and the
+    // unknown-method error the addon's feature-detection relies on.
+    // ------------------------------------------------------------------
+
+    fn test_conns() -> (Connection, Connection) {
+        let email = Connection::open_in_memory().unwrap();
+        email
+            .execute_batch("CREATE TABLE IF NOT EXISTS message_ids (msgId TEXT PRIMARY KEY);")
+            .unwrap();
+        let memory = Connection::open_in_memory().unwrap();
+        (email, memory)
+    }
+
+    fn insert_keys(conn: &Connection, keys: &[&str]) {
+        for key in keys {
+            conn.execute(
+                "INSERT OR IGNORE INTO message_ids (msgId) VALUES (?1)",
+                rusqlite::params![key],
+            )
+            .unwrap();
+        }
+    }
+
+    fn dispatch_read(
+        email: &Connection,
+        memory: &Connection,
+        method: &str,
+        params: Value,
+    ) -> anyhow::Result<Value> {
+        let synonyms = SynonymLookup::new();
+        handle_read_request(
+            email,
+            memory,
+            Path::new("/nonexistent/email.db"),
+            Path::new("/nonexistent/memory.db"),
+            None,
+            &synonyms,
+            method,
+            "test-1",
+            &params,
+        )
+    }
+
+    #[test]
+    fn test_classify_method_routes_range_rpcs_to_reader() {
+        assert!(matches!(classify_method("countMsgIdRange"), MethodTarget::Reader));
+        assert!(matches!(classify_method("listMsgIdRange"), MethodTarget::Reader));
+        assert!(matches!(classify_method("noSuchMethod"), MethodTarget::Unknown));
+    }
+
+    #[test]
+    fn test_dispatch_count_msg_id_range_happy_path() {
+        let (email, memory) = test_conns();
+        insert_keys(&email, &[
+            "account1:/INBOX:a@example.com",
+            "account1:/INBOX:b@example.com",
+            "account1:/Sent:c@example.com",
+        ]);
+
+        let resp = dispatch_read(&email, &memory, "countMsgIdRange", serde_json::json!({
+            "startKey": "account1:/INBOX:",
+            "endKey": "account1:/INBOX;",
+        }))
+        .unwrap();
+
+        assert_eq!(resp["id"], "test-1");
+        assert_eq!(resp["result"]["ok"], true);
+        assert_eq!(resp["result"]["count"], 2);
+    }
+
+    #[test]
+    fn test_dispatch_count_msg_id_range_param_validation() {
+        let (email, memory) = test_conns();
+
+        // Missing startKey
+        let err = dispatch_read(&email, &memory, "countMsgIdRange", serde_json::json!({
+            "endKey": "account1:/INBOX;",
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("startKey"), "got: {err}");
+
+        // Missing endKey
+        let err = dispatch_read(&email, &memory, "countMsgIdRange", serde_json::json!({
+            "startKey": "account1:/INBOX:",
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("endKey"), "got: {err}");
+
+        // Non-string startKey (as_str fails → required-param error)
+        let err = dispatch_read(&email, &memory, "countMsgIdRange", serde_json::json!({
+            "startKey": 42,
+            "endKey": "account1:/INBOX;",
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("startKey"), "got: {err}");
+    }
+
+    #[test]
+    fn test_dispatch_list_msg_id_range_pagination() {
+        let (email, memory) = test_conns();
+        insert_keys(&email, &[
+            "account1:/INBOX:a@example.com",
+            "account1:/INBOX:b@example.com",
+            "account1:/INBOX:c@example.com",
+        ]);
+
+        // Page 1 (no afterKey)
+        let resp = dispatch_read(&email, &memory, "listMsgIdRange", serde_json::json!({
+            "startKey": "account1:/INBOX:",
+            "endKey": "account1:/INBOX;",
+            "limit": 2,
+        }))
+        .unwrap();
+        assert_eq!(resp["result"]["ok"], true);
+        assert_eq!(resp["result"]["done"], false);
+        let ids: Vec<&str> = resp["result"]["msgIds"]
+            .as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["account1:/INBOX:a@example.com", "account1:/INBOX:b@example.com"]);
+
+        // Page 2 (afterKey = last of page 1, exclusive)
+        let resp = dispatch_read(&email, &memory, "listMsgIdRange", serde_json::json!({
+            "startKey": "account1:/INBOX:",
+            "endKey": "account1:/INBOX;",
+            "afterKey": "account1:/INBOX:b@example.com",
+            "limit": 2,
+        }))
+        .unwrap();
+        assert_eq!(resp["result"]["done"], true);
+        let ids: Vec<&str> = resp["result"]["msgIds"]
+            .as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["account1:/INBOX:c@example.com"]);
+    }
+
+    #[test]
+    fn test_dispatch_list_msg_id_range_param_validation_and_default_limit() {
+        let (email, memory) = test_conns();
+        insert_keys(&email, &["account1:/INBOX:a@example.com"]);
+
+        // Missing startKey
+        let err = dispatch_read(&email, &memory, "listMsgIdRange", serde_json::json!({
+            "endKey": "account1:/INBOX;",
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("startKey"), "got: {err}");
+
+        // Missing endKey
+        let err = dispatch_read(&email, &memory, "listMsgIdRange", serde_json::json!({
+            "startKey": "account1:/INBOX:",
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("endKey"), "got: {err}");
+
+        // Omitted limit → LIST_MSG_ID_RANGE_DEFAULT_LIMIT applies (returns rows)
+        let resp = dispatch_read(&email, &memory, "listMsgIdRange", serde_json::json!({
+            "startKey": "account1:/INBOX:",
+            "endKey": "account1:/INBOX;",
+        }))
+        .unwrap();
+        assert_eq!(resp["result"]["msgIds"].as_array().unwrap().len(), 1);
+        assert_eq!(resp["result"]["done"], true);
+
+        // Non-integer limit → default (as_i64 fails → unwrap_or default)
+        let resp = dispatch_read(&email, &memory, "listMsgIdRange", serde_json::json!({
+            "startKey": "account1:/INBOX:",
+            "endKey": "account1:/INBOX;",
+            "limit": "not-a-number",
+        }))
+        .unwrap();
+        assert_eq!(resp["result"]["msgIds"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_dispatch_unknown_reader_method_error_envelope() {
+        // The addon's feature-detection contract: an old helper answers an
+        // unknown method with an Ok envelope carrying an `error` field (the
+        // addon surfaces it as a rejected RPC and disables the folder
+        // reconcile for the session). Pin the shape so it stays stable.
+        let (email, memory) = test_conns();
+        let resp = dispatch_read(&email, &memory, "someFutureMethod", serde_json::json!({})).unwrap();
+        assert_eq!(resp["id"], "test-1");
+        let err = resp["error"].as_str().unwrap();
+        assert!(err.contains("Unknown reader method"), "got: {err}");
+    }
+}
