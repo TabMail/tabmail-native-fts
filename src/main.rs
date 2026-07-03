@@ -148,7 +148,8 @@ fn classify_method(method: &str) -> MethodTarget {
     match method {
         // Read-only email operations
         "search" | "stats" | "filterNewMessages" | "getMessageByMsgId"
-        | "findByHeaderMessageId" | "queryByDateRange" | "debugSample" => MethodTarget::Reader,
+        | "findByHeaderMessageId" | "queryByDateRange" | "debugSample"
+        | "countMsgIdRange" | "listMsgIdRange" => MethodTarget::Reader,
 
         // Read-only memory operations
         "memorySearch" | "memoryStats" | "memoryDebugSample" | "memoryRead" => MethodTarget::Reader,
@@ -451,6 +452,35 @@ fn handle_read_request(
                 .context("headerMessageId parameter is required")?;
             log::info!("Finding by headerMessageId: {} (account={})", header_message_id, account_id);
             let res = crate::fts::db::find_by_header_message_id(email_conn, account_id, header_message_id)?;
+            Ok(serde_json::json!({ "id": msg_id, "result": res }))
+        }
+        "countMsgIdRange" => {
+            let start_key = params
+                .get("startKey")
+                .and_then(|v| v.as_str())
+                .context("startKey parameter is required and must be a string")?;
+            let end_key = params
+                .get("endKey")
+                .and_then(|v| v.as_str())
+                .context("endKey parameter is required and must be a string")?;
+            let count = crate::fts::db::count_msg_id_range(email_conn, start_key, end_key)?;
+            Ok(serde_json::json!({ "id": msg_id, "result": { "ok": true, "count": count } }))
+        }
+        "listMsgIdRange" => {
+            let start_key = params
+                .get("startKey")
+                .and_then(|v| v.as_str())
+                .context("startKey parameter is required and must be a string")?;
+            let end_key = params
+                .get("endKey")
+                .and_then(|v| v.as_str())
+                .context("endKey parameter is required and must be a string")?;
+            let after_key = params.get("afterKey").and_then(|v| v.as_str());
+            let limit = params
+                .get("limit")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(config::sqlite::LIST_MSG_ID_RANGE_DEFAULT_LIMIT);
+            let res = crate::fts::db::list_msg_id_range(email_conn, start_key, end_key, after_key, limit)?;
             Ok(serde_json::json!({ "id": msg_id, "result": res }))
         }
         "queryByDateRange" => {

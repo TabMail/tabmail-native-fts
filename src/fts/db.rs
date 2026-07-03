@@ -1561,6 +1561,61 @@ pub fn find_by_header_message_id(conn: &Connection, account_id: &str, header_mes
     Ok(results)
 }
 
+/// Count msgIds in the half-open key range [start_key, end_key).
+/// PK index range scan on the unsharded `message_ids` table — the caller
+/// (addon) computes the bounds; this function does NO msgId parsing.
+/// Used by the per-folder count-invariant reconcile (PLAN_FOLDER_SET_RECONCILE.md):
+/// for a folder prefix `P = "<accountId>:<folderPath>:"`, the addon passes
+/// `start_key = P` and `end_key = P[..len-1] + ";"` (';' = ':'+1), which
+/// covers exactly that folder's keys — subfolder keys (".../INBOX/sub:...")
+/// sort BEFORE ".../INBOX:" ('/' < ':') and are correctly excluded.
+pub fn count_msg_id_range(conn: &Connection, start_key: &str, end_key: &str) -> anyhow::Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM message_ids WHERE msgId >= ?1 AND msgId < ?2",
+        params![start_key, end_key],
+        |r| r.get(0),
+    )?)
+}
+
+/// List msgIds in the half-open key range [start_key, end_key), ascending,
+/// paginated. `after_key` is the exclusive pagination cursor (the last msgId
+/// of the previous page); when it lies at or above `start_key` it replaces
+/// the inclusive lower bound. `done` is true when fewer than `limit` rows
+/// were returned (the range is exhausted).
+pub fn list_msg_id_range(
+    conn: &Connection,
+    start_key: &str,
+    end_key: &str,
+    after_key: Option<&str>,
+    limit: i64,
+) -> anyhow::Result<Value> {
+    let limit = if limit > 0 {
+        limit
+    } else {
+        config::sqlite::LIST_MSG_ID_RANGE_DEFAULT_LIMIT
+    };
+
+    // Effective lower bound = max(start_key inclusive, after_key exclusive).
+    // Resolved host-side so the PK index sees a plain range predicate.
+    let (lower, exclusive): (&str, bool) = match after_key {
+        Some(a) if a >= start_key => (a, true),
+        _ => (start_key, false),
+    };
+
+    let sql = if exclusive {
+        "SELECT msgId FROM message_ids WHERE msgId > ?1 AND msgId < ?2 ORDER BY msgId LIMIT ?3"
+    } else {
+        "SELECT msgId FROM message_ids WHERE msgId >= ?1 AND msgId < ?2 ORDER BY msgId LIMIT ?3"
+    };
+
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![lower, end_key, limit], |r| r.get::<_, String>(0))?;
+    let msg_ids: Vec<String> = rows.collect::<Result<_, _>>()?;
+    let done = (msg_ids.len() as i64) < limit;
+
+    Ok(serde_json::json!({ "ok": true, "msgIds": msg_ids, "done": done }))
+}
+
 pub fn query_by_date_range(conn: &Connection, from_v: &Value, to_v: &Value, limit: i64, known_years: &HashSet<i32>) -> anyhow::Result<Vec<Value>> {
     let Some(from_ts) = parse_date_param(from_v)? else { bail!("from and to parameters are required") };
     let Some(to_ts) = parse_date_param(to_v)? else { bail!("from and to parameters are required") };
@@ -2199,5 +2254,196 @@ mod tests {
         assert!(subjects.iter().any(|s| s.contains("forecast")), "Missing 2024 result");
         assert!(subjects.iter().any(|s| s.contains("review")), "Missing 2023 result");
         assert!(subjects.iter().any(|s| s.contains("analysis")), "Missing 2000 result");
+    }
+
+    // --- countMsgIdRange / listMsgIdRange (PLAN_FOLDER_SET_RECONCILE.md) ---
+
+    /// Insert bare msgId keys (the range RPCs only touch `message_ids`).
+    fn insert_msg_id_keys(conn: &Connection, keys: &[&str]) {
+        for key in keys {
+            conn.execute(
+                "INSERT OR IGNORE INTO message_ids (msgId) VALUES (?1)",
+                params![key],
+            )
+            .unwrap();
+        }
+    }
+
+    /// Folder range bounds the addon computes: start = prefix, end = prefix
+    /// with the trailing ':' replaced by ';' (':' + 1).
+    fn folder_range(account_id: &str, folder_path: &str) -> (String, String) {
+        let prefix = format!("{account_id}:{folder_path}:");
+        let end = format!("{}{}", &prefix[..prefix.len() - 1], ";");
+        (prefix, end)
+    }
+
+    #[test]
+    fn test_count_msg_id_range_inclusion_and_folder_scoping() {
+        let (conn, _known_years) = setup_test_db();
+        insert_msg_id_keys(&conn, &[
+            "account1:/INBOX:msg1@example.com",
+            "account1:/INBOX:msg2@example.com",
+            "account1:/Sent:msg3@example.com",
+            "account2:/INBOX:msg4@example.com",
+        ]);
+
+        let (start, end) = folder_range("account1", "/INBOX");
+        assert_eq!(count_msg_id_range(&conn, &start, &end).unwrap(), 2);
+
+        let (start, end) = folder_range("account1", "/Sent");
+        assert_eq!(count_msg_id_range(&conn, &start, &end).unwrap(), 1);
+
+        let (start, end) = folder_range("account2", "/INBOX");
+        assert_eq!(count_msg_id_range(&conn, &start, &end).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_count_msg_id_range_excludes_subfolder_keys() {
+        let (conn, _known_years) = setup_test_db();
+        // Subfolder keys sort BEFORE the parent's ':' boundary ('/' < ':'),
+        // so they must be excluded from the parent folder's range — and the
+        // subfolder's own range must see exactly its own keys.
+        insert_msg_id_keys(&conn, &[
+            "account1:/INBOX:a@example.com",
+            "account1:/INBOX:b@example.com",
+            "account1:/INBOX/sub:c@example.com",
+            "account1:/INBOX/sub:d@example.com",
+            "account1:/INBOX/sub/deeper:e@example.com",
+        ]);
+
+        let (start, end) = folder_range("account1", "/INBOX");
+        assert_eq!(count_msg_id_range(&conn, &start, &end).unwrap(), 2);
+
+        let (start, end) = folder_range("account1", "/INBOX/sub");
+        assert_eq!(count_msg_id_range(&conn, &start, &end).unwrap(), 2);
+
+        let (start, end) = folder_range("account1", "/INBOX/sub/deeper");
+        assert_eq!(count_msg_id_range(&conn, &start, &end).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_count_msg_id_range_empty_range() {
+        let (conn, _known_years) = setup_test_db();
+        insert_msg_id_keys(&conn, &["account1:/INBOX:a@example.com"]);
+
+        let (start, end) = folder_range("account1", "/Nowhere");
+        assert_eq!(count_msg_id_range(&conn, &start, &end).unwrap(), 0);
+
+        // Degenerate range (start == end) is empty by half-open semantics
+        assert_eq!(count_msg_id_range(&conn, "account1:", "account1:").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_count_msg_id_range_full_keyspace() {
+        let (conn, _known_years) = setup_test_db();
+        insert_msg_id_keys(&conn, &[
+            "account1:/INBOX:a@example.com",
+            "account1:/Sent:b@example.com",
+            "account2:/INBOX:c@example.com",
+        ]);
+
+        // ("", "\u{FFFF}") is the full-keyspace range the orphan sweep uses.
+        assert_eq!(count_msg_id_range(&conn, "", "\u{FFFF}").unwrap(), 3);
+    }
+
+    #[test]
+    fn test_list_msg_id_range_pagination_cursor() {
+        let (conn, _known_years) = setup_test_db();
+        insert_msg_id_keys(&conn, &[
+            "account1:/INBOX:a@example.com",
+            "account1:/INBOX:b@example.com",
+            "account1:/INBOX:c@example.com",
+            "account1:/INBOX:d@example.com",
+            "account1:/INBOX:e@example.com",
+            "account1:/Sent:z@example.com", // outside the range
+        ]);
+        let (start, end) = folder_range("account1", "/INBOX");
+
+        // Page 1: no cursor
+        let page1 = list_msg_id_range(&conn, &start, &end, None, 2).unwrap();
+        let ids1: Vec<&str> = page1["msgIds"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(ids1, vec!["account1:/INBOX:a@example.com", "account1:/INBOX:b@example.com"]);
+        assert_eq!(page1["done"], false);
+
+        // Page 2: cursor = last key of page 1 (exclusive)
+        let page2 = list_msg_id_range(&conn, &start, &end, Some(ids1[1]), 2).unwrap();
+        let ids2: Vec<&str> = page2["msgIds"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(ids2, vec!["account1:/INBOX:c@example.com", "account1:/INBOX:d@example.com"]);
+        assert_eq!(page2["done"], false);
+
+        // Page 3: final partial page → done
+        let page3 = list_msg_id_range(&conn, &start, &end, Some(ids2[1]), 2).unwrap();
+        let ids3: Vec<&str> = page3["msgIds"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(ids3, vec!["account1:/INBOX:e@example.com"]);
+        assert_eq!(page3["done"], true);
+    }
+
+    #[test]
+    fn test_list_msg_id_range_after_key_below_start_is_ignored() {
+        let (conn, _known_years) = setup_test_db();
+        insert_msg_id_keys(&conn, &[
+            "account1:/INBOX:a@example.com",
+            "account1:/INBOX:b@example.com",
+        ]);
+        let (start, end) = folder_range("account1", "/INBOX");
+
+        // A cursor below the range start must not widen the range: the
+        // effective lower bound is max(start inclusive, after exclusive).
+        let page = list_msg_id_range(&conn, &start, &end, Some(""), 10).unwrap();
+        let ids: Vec<&str> = page["msgIds"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["account1:/INBOX:a@example.com", "account1:/INBOX:b@example.com"]);
+        assert_eq!(page["done"], true);
+    }
+
+    #[test]
+    fn test_list_msg_id_range_excludes_subfolder_keys() {
+        let (conn, _known_years) = setup_test_db();
+        insert_msg_id_keys(&conn, &[
+            "account1:/INBOX:a@example.com",
+            "account1:/INBOX/sub:b@example.com",
+        ]);
+        let (start, end) = folder_range("account1", "/INBOX");
+
+        let page = list_msg_id_range(&conn, &start, &end, None, 10).unwrap();
+        let ids: Vec<&str> = page["msgIds"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["account1:/INBOX:a@example.com"]);
+        assert_eq!(page["done"], true);
+    }
+
+    #[test]
+    fn test_list_msg_id_range_empty_range_and_default_limit() {
+        let (conn, _known_years) = setup_test_db();
+        insert_msg_id_keys(&conn, &["account1:/INBOX:a@example.com"]);
+
+        // Empty range
+        let (start, end) = folder_range("account1", "/Nowhere");
+        let page = list_msg_id_range(&conn, &start, &end, None, 10).unwrap();
+        assert!(page["msgIds"].as_array().unwrap().is_empty());
+        assert_eq!(page["done"], true);
+
+        // Non-positive limit falls back to the config default (still returns rows)
+        let (start, end) = folder_range("account1", "/INBOX");
+        let page = list_msg_id_range(&conn, &start, &end, None, 0).unwrap();
+        assert_eq!(page["msgIds"].as_array().unwrap().len(), 1);
+        assert_eq!(page["done"], true);
+    }
+
+    #[test]
+    fn test_list_msg_id_range_full_keyspace_walk() {
+        let (conn, _known_years) = setup_test_db();
+        insert_msg_id_keys(&conn, &[
+            "account1:/INBOX:a@example.com",
+            "account2:/Archive:b@example.com",
+            "orphanAcct:/Gone:c@example.com",
+        ]);
+
+        // Orphan sweep walks ("", "\u{FFFF}") — must see every key, sorted.
+        let page = list_msg_id_range(&conn, "", "\u{FFFF}", None, 10).unwrap();
+        let ids: Vec<&str> = page["msgIds"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(ids.len(), 3);
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "msgIds must be ascending");
+        assert_eq!(page["done"], true);
     }
 }

@@ -54,6 +54,9 @@ Native messaging host for full-text search + semantic search. Communicates with 
 
 ## Recent Discoveries
 
+### 2026-07-03
+- Added generic msgId key-range reader RPCs `countMsgIdRange { startKey, endKey }` → `{ count }` and `listMsgIdRange { startKey, endKey, afterKey?, limit }` → `{ msgIds, done }` (PK range scans on the unsharded `message_ids` table; half-open `[startKey, endKey)`; NO schema change, NO msgId parsing host-side — the addon computes folder-prefix bounds). Consumed by the TB addon's per-folder set reconcile (tabmail-thunderbird ADR-021 / PLAN_FOLDER_SET_RECONCILE.md), which feature-detects them — older helpers reject with "Unknown reader method" and the addon degrades gracefully. Version 0.9.1 → **0.10.0** (Cargo.toml + HOST_VERSION); `SCHEMA_VERSION` unchanged (no reindex). Default list page size: `config::sqlite::LIST_MSG_ID_RANGE_DEFAULT_LIMIT`.
+
 ### 2026-02-01
 - Refactored from single-threaded to reader/writer thread split (ADR-018)
 - Added `SCHEMA_VERSION` to decouple reindex triggers from host version

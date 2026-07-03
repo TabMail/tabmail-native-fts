@@ -6,7 +6,7 @@
 // Keep ALL numeric values centralized here (repo rule: no hardcoded numeric values scattered around).
 
 // NOTE: HOST_VERSION must stay in sync with the `version` field in Cargo.toml.
-pub const HOST_VERSION: &str = "0.9.1";
+pub const HOST_VERSION: &str = "0.10.0";
 
 /// Schema version: bump ONLY for changes that genuinely require a FULL re-index
 /// from Thunderbird (the addon re-feeds every message through native messaging —
@@ -61,6 +61,9 @@ pub mod sqlite {
     pub const SEARCH_SNIPPET_TOKENS: i64 = 16;
     pub const SEARCH_DEBUG_SAMPLE_LIMIT: i64 = 10;
     pub const QUERY_BY_DATE_RANGE_DEFAULT_LIMIT: i64 = 1000;
+    /// Default page size for `listMsgIdRange` when the caller omits `limit`
+    /// (the addon normally passes its own FOLDER_RECON_KEYS_CHUNK).
+    pub const LIST_MSG_ID_RANGE_DEFAULT_LIMIT: i64 = 500;
 
     // Year-based FTS sharding
     pub const SHARD_MIN_YEAR: i32 = 2000;
