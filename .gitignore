@@ -23,7 +23,6 @@ __pycache__/
 
 # Rust
 target/
-Cargo.lock
 .cargo/config.toml.bak
 
 # Secrets (local only)
