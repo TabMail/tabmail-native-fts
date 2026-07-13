@@ -25,20 +25,6 @@ pub fn get_user_install_dir() -> anyhow::Result<PathBuf> {
     }
 }
 
-pub fn get_system_install_dir() -> anyhow::Result<PathBuf> {
-    match std::env::consts::OS {
-        "macos" => Ok(PathBuf::from("/Applications/TabMail.app/Contents/Resources")),
-        "windows" => {
-            let pf = std::env::var("PROGRAMFILES")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "C:\\Program Files".to_string());
-            Ok(PathBuf::from(pf).join("TabMail/native"))
-        }
-        _ => Ok(PathBuf::from("/opt/tabmail")),
-    }
-}
-
 /// Get all possible system install directories.
 /// On Windows, the installer may place the helper in either:
 /// - C:\Program Files\TabMail\native (dedicated TabMail dir)
@@ -139,5 +125,4 @@ pub fn can_write_dir(dir: &PathBuf) -> bool {
 pub fn ensure_dir(dir: &PathBuf) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("failed to create dir {}", dir.display()))
 }
-
 

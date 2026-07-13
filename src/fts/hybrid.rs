@@ -28,8 +28,6 @@ pub struct HybridCandidate {
 pub struct HybridResult {
     pub rowid: i64,
     pub final_score: f64,
-    pub text_score: f64,
-    pub vector_score: f64,
 }
 
 /// Convert FTS5 BM25 rank to 0..1 score.
@@ -107,8 +105,6 @@ pub fn merge_results(
             HybridResult {
                 rowid: c.rowid,
                 final_score,
-                text_score: c.text_score,
-                vector_score: c.vector_score,
             }
         })
         .filter(|r| r.final_score >= config::hybrid::MIN_SCORE)

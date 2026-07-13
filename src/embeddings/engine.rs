@@ -132,13 +132,6 @@ impl EmbeddingEngine {
 
         Ok(emb_vec)
     }
-
-    /// Batch embed multiple texts. Returns one embedding per text.
-    pub fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
-        // For simplicity, process one at a time (candle batch support is tricky with variable lengths).
-        // At ~5-15ms per embedding, this is fast enough for our batch sizes (50 messages).
-        texts.iter().map(|t| self.embed(t)).collect()
-    }
 }
 
 /// Attention-mask-aware mean pooling.

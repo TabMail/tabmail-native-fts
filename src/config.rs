@@ -73,7 +73,6 @@ pub mod sqlite {
 
 pub mod embedding {
     pub const EMBEDDING_DIMS: usize = 384;
-    pub const EMBEDDING_MODEL_NAME: &str = "all-MiniLM-L6-v2";
 
     // Max word-piece tokens for all-MiniLM-L6-v2 (model context limit is 256).
     // We pre-truncate to control what gets embedded.
@@ -115,5 +114,4 @@ pub mod hybrid {
     // Prevents weak semantic associations from inflating final scores.
     pub const VECTOR_SCORE_THRESHOLD: f64 = 0.45;
 }
-
 
