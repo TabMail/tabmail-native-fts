@@ -54,6 +54,9 @@ Native messaging host for full-text search + semantic search. Communicates with 
 
 ## Recent Discoveries
 
+### 2026-07-13
+- `tb-native-fts/maintenance.sh --audit` can print a failed `cargo audit` (for example, when the sandbox cannot lock `~/.cargo/advisory-db`) yet still exit 0 because the script does not propagate that subcommand failure. Treat the script status as non-authoritative: inspect the audit output and rerun `cargo audit`/the maintenance audit with the required host access before recording a clean result.
+
 ### 2026-07-12
 - `cargo fmt --all -- --check` has repo-wide pre-existing rustfmt drift (over 3,700 reported diff lines as of this date). Keep targeted maintenance diffs minimal unless a dedicated formatter-normalization change is requested.
 
