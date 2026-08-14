@@ -11,7 +11,7 @@
 | Setting | Value |
 |---------|-------|
 | Language | Rust |
-| Version | 0.8.x |
+| Version | 0.11.x |
 | DB | SQLite (WAL mode) |
 | Embeddings | Candle (local inference) |
 | Semantic search | sqlite-vec |

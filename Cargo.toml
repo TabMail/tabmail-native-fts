@@ -1,7 +1,7 @@
 [package]
 name = "tabmail-native-fts"
 # NOTE: Keep in sync with HOST_VERSION in src/config.rs
-version = "0.10.1"
+version = "0.11.0"
 edition = "2021"
 license = "MPL-2.0"
 
@@ -44,5 +44,4 @@ predicates = "3.1.2"
 # Keep the historical executable name expected by manifests/installers.
 name = "fts_helper"
 path = "src/main.rs"
-
 

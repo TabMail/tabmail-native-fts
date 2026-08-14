@@ -49,10 +49,14 @@ Native messaging host for full-text search + semantic search. Communicates with 
 | Main entry | `src/main.rs` |
 | Method dispatch | `classify_method()` in main.rs |
 | Reader/writer threads | Spawned after `init` in main.rs |
+| Folder-key digest RPC | `fingerprint_msg_id_range()` in `src/fts/db.rs` |
 
 ---
 
 ## Recent Discoveries
+
+### 2026-08-13
+- Added reader RPC `fingerprintMsgIdRange { startKey, endKey }` → `{ count, sha256 }` for Thunderbird ADR-022 startup membership proofs. It scans `message_ids` in SQLite BINARY order and hashes `u64be(UTF-8 byte length) || UTF-8 bytes`, matching the add-on's msgDB fingerprint. Host 0.10.1 → **0.11.0**; `SCHEMA_VERSION` remains 1 (no reindex). Existing `sha2`/`hex` dependencies only.
 
 ### 2026-07-13
 - `tb-native-fts/maintenance.sh --audit` can print a failed `cargo audit` (for example, when the sandbox cannot lock `~/.cargo/advisory-db`) yet still exit 0 because the script does not propagate that subcommand failure. Treat the script status as non-authoritative: inspect the audit output and rerun `cargo audit`/the maintenance audit with the required host access before recording a clean result.

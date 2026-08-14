@@ -9,6 +9,7 @@ use anyhow::{Context, bail};
 use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::{config, embeddings::engine::EmbeddingEngine, fts::query::build_fts_match, fts::synonyms::SynonymLookup};
 
@@ -1577,6 +1578,38 @@ pub fn count_msg_id_range(conn: &Connection, start_key: &str, end_key: &str) -> 
     )?)
 }
 
+/// Return a deterministic SHA-256 fingerprint of all msgIds in the half-open
+/// key range [start_key, end_key). Keys are read in SQLite BINARY order and
+/// framed as an unsigned 64-bit big-endian byte length followed by their UTF-8
+/// bytes. The framing prevents concatenation ambiguity and is mirrored by the
+/// Thunderbird add-on when it fingerprints the folder msgDB.
+pub fn fingerprint_msg_id_range(
+    conn: &Connection,
+    start_key: &str,
+    end_key: &str,
+) -> anyhow::Result<Value> {
+    let mut stmt = conn.prepare(
+        "SELECT msgId FROM message_ids WHERE msgId >= ?1 AND msgId < ?2 ORDER BY msgId"
+    )?;
+    let rows = stmt.query_map(params![start_key, end_key], |r| r.get::<_, String>(0))?;
+
+    let mut hasher = Sha256::new();
+    let mut count: i64 = 0;
+    for row in rows {
+        let msg_id = row?;
+        let bytes = msg_id.as_bytes();
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+        count += 1;
+    }
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "count": count,
+        "sha256": hex::encode(hasher.finalize()),
+    }))
+}
+
 /// List msgIds in the half-open key range [start_key, end_key), ascending,
 /// paginated. `after_key` is the exclusive pagination cursor (the last msgId
 /// of the previous page); when it lies at or above `start_key` it replaces
@@ -2256,7 +2289,7 @@ mod tests {
         assert!(subjects.iter().any(|s| s.contains("analysis")), "Missing 2000 result");
     }
 
-    // --- countMsgIdRange / listMsgIdRange (PLAN_FOLDER_SET_RECONCILE.md) ---
+    // --- countMsgIdRange / fingerprintMsgIdRange / listMsgIdRange ---
 
     /// Insert bare msgId keys (the range RPCs only touch `message_ids`).
     fn insert_msg_id_keys(conn: &Connection, keys: &[&str]) {
@@ -2344,6 +2377,36 @@ mod tests {
 
         // ("", "\u{FFFF}") is the full-keyspace range the orphan sweep uses.
         assert_eq!(count_msg_id_range(&conn, "", "\u{FFFF}").unwrap(), 3);
+    }
+
+    #[test]
+    fn test_fingerprint_msg_id_range_is_deterministic_and_membership_sensitive() {
+        let (conn, _known_years) = setup_test_db();
+        let (start, end) = folder_range("account1", "/INBOX");
+
+        let empty = fingerprint_msg_id_range(&conn, &start, &end).unwrap();
+        assert_eq!(empty["count"], 0);
+        assert_eq!(
+            empty["sha256"],
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+
+        // Insert out of order: ORDER BY msgId makes the digest deterministic.
+        insert_msg_id_keys(&conn, &[
+            "account1:/INBOX:b@example.com",
+            "account1:/Sent:outside@example.com",
+            "account1:/INBOX:a@example.com",
+        ]);
+        let first = fingerprint_msg_id_range(&conn, &start, &end).unwrap();
+        let second = fingerprint_msg_id_range(&conn, &start, &end).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first["count"], 2);
+        assert_eq!(first["sha256"].as_str().unwrap().len(), 64);
+
+        insert_msg_id_keys(&conn, &["account1:/INBOX:c@example.com"]);
+        let changed = fingerprint_msg_id_range(&conn, &start, &end).unwrap();
+        assert_eq!(changed["count"], 3);
+        assert_ne!(changed["sha256"], first["sha256"]);
     }
 
     #[test]

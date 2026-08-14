@@ -6,7 +6,7 @@
 // Keep ALL numeric values centralized here (repo rule: no hardcoded numeric values scattered around).
 
 // NOTE: HOST_VERSION must stay in sync with the `version` field in Cargo.toml.
-pub const HOST_VERSION: &str = "0.10.1";
+pub const HOST_VERSION: &str = "0.11.0";
 
 /// Schema version: bump ONLY for changes that genuinely require a FULL re-index
 /// from Thunderbird (the addon re-feeds every message through native messaging —
@@ -114,4 +114,3 @@ pub mod hybrid {
     // Prevents weak semantic associations from inflating final scores.
     pub const VECTOR_SCORE_THRESHOLD: f64 = 0.45;
 }
-

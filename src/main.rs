@@ -149,7 +149,7 @@ fn classify_method(method: &str) -> MethodTarget {
         // Read-only email operations
         "search" | "stats" | "filterNewMessages" | "getMessageByMsgId"
         | "findByHeaderMessageId" | "queryByDateRange" | "debugSample"
-        | "countMsgIdRange" | "listMsgIdRange" => MethodTarget::Reader,
+        | "countMsgIdRange" | "fingerprintMsgIdRange" | "listMsgIdRange" => MethodTarget::Reader,
 
         // Read-only memory operations
         "memorySearch" | "memoryStats" | "memoryDebugSample" | "memoryRead" => MethodTarget::Reader,
@@ -465,6 +465,18 @@ fn handle_read_request(
                 .context("endKey parameter is required and must be a string")?;
             let count = crate::fts::db::count_msg_id_range(email_conn, start_key, end_key)?;
             Ok(serde_json::json!({ "id": msg_id, "result": { "ok": true, "count": count } }))
+        }
+        "fingerprintMsgIdRange" => {
+            let start_key = params
+                .get("startKey")
+                .and_then(|v| v.as_str())
+                .context("startKey parameter is required and must be a string")?;
+            let end_key = params
+                .get("endKey")
+                .and_then(|v| v.as_str())
+                .context("endKey parameter is required and must be a string")?;
+            let res = crate::fts::db::fingerprint_msg_id_range(email_conn, start_key, end_key)?;
+            Ok(serde_json::json!({ "id": msg_id, "result": res }))
         }
         "listMsgIdRange" => {
             let start_key = params
@@ -1119,8 +1131,34 @@ mod tests {
     #[test]
     fn test_classify_method_routes_range_rpcs_to_reader() {
         assert!(matches!(classify_method("countMsgIdRange"), MethodTarget::Reader));
+        assert!(matches!(classify_method("fingerprintMsgIdRange"), MethodTarget::Reader));
         assert!(matches!(classify_method("listMsgIdRange"), MethodTarget::Reader));
         assert!(matches!(classify_method("noSuchMethod"), MethodTarget::Unknown));
+    }
+
+    #[test]
+    fn test_dispatch_fingerprint_msg_id_range_happy_path_and_validation() {
+        let (email, memory) = test_conns();
+        insert_keys(&email, &[
+            "account1:/INBOX:a@example.com",
+            "account1:/INBOX:b@example.com",
+            "account1:/Sent:c@example.com",
+        ]);
+
+        let resp = dispatch_read(&email, &memory, "fingerprintMsgIdRange", serde_json::json!({
+            "startKey": "account1:/INBOX:",
+            "endKey": "account1:/INBOX;",
+        }))
+        .unwrap();
+        assert_eq!(resp["result"]["ok"], true);
+        assert_eq!(resp["result"]["count"], 2);
+        assert_eq!(resp["result"]["sha256"].as_str().unwrap().len(), 64);
+
+        let err = dispatch_read(&email, &memory, "fingerprintMsgIdRange", serde_json::json!({
+            "endKey": "account1:/INBOX;",
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("startKey"), "got: {err}");
     }
 
     #[test]

@@ -36,8 +36,8 @@ echo "  $KEY_PEM"
 openssl genpkey -algorithm ED25519 -out "$KEY_PEM" >/dev/null 2>&1
 
 KEYTXT="$(openssl pkey -in "$KEY_PEM" -text -noout)"
-PUB_HEX="$(echo "$KEYTXT" | awk 'BEGIN{inpub=0} /^pub:/{inpub=1; next} /^priv:/{inpub=0} {if(inpub){gsub(/[^0-9a-f:]/,\"\",$0); if($0!=\"\"){print $0}}}' | tr -d ':' | tr -d '\n')"
-PRIV_HEX="$(echo "$KEYTXT" | awk 'BEGIN{inpriv=0} /^priv:/{inpriv=1; next} /^pub:/{inpriv=0} {if(inpriv){gsub(/[^0-9a-f:]/,\"\",$0); if($0!=\"\"){print $0}}}' | tr -d ':' | tr -d '\n')"
+PUB_HEX="$(echo "$KEYTXT" | awk 'BEGIN{inpub=0} /^pub:/{inpub=1; next} /^priv:/{inpub=0} {if(inpub){gsub(/[^0-9a-f:]/,"",$0); if($0!=""){print $0}}}' | tr -d ':' | tr -d '\n')"
+PRIV_HEX="$(echo "$KEYTXT" | awk 'BEGIN{inpriv=0} /^priv:/{inpriv=1; next} /^pub:/{inpriv=0} {if(inpriv){gsub(/[^0-9a-f:]/,"",$0); if($0!=""){print $0}}}' | tr -d ':' | tr -d '\n')"
 
 PUB_B64="$(python3 - <<PY
 import base64
@@ -84,4 +84,3 @@ echo "4) DO NOT remove the old public key. The array is an accumulating trust"
 echo "   pool; removal strands clients that haven't self-updated. Removal is"
 echo "   only a compromise-response action."
 echo ""
-
