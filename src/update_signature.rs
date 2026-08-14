@@ -11,10 +11,13 @@ use crate::config;
 // Public keys used to verify update signatures (rotation-safe).
 //
 // Rotation model:
-// - During rotation, append the new public key here (or via env var) so manifests signed with
-//   either key are accepted.
-// - Keep every previous key. Removal is reserved for compromise response; routine removal can
-//   strand clients that have not yet updated into the expanded trust pool.
+// - During rotation, append the new public key here (or via env var), but keep the OLD private
+//   key as the active manifest signer for the bridge release. Older binaries know only that old
+//   public key, and the current manifest format carries one signature.
+// - After an explicit overlap/adoption window, promote the pending private key for a LATER
+//   manifest. Never make a new key sign the same release that first introduces its public key.
+// - Keep every previous public key. Routine rotation NEVER removes/revokes one; removal is
+//   reserved for compromise response only.
 //
 // Env override (comma-separated):
 //   TM_UPDATE_PUBLIC_KEYS_BASE64="base64key1,base64key2"
@@ -93,4 +96,3 @@ pub fn verify_update_signature(
 
     bail!("update signature verification failed");
 }
-

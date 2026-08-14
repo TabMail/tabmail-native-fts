@@ -10,13 +10,17 @@ set -euo pipefail
 # This script:
 # - Generates a new Ed25519 keypair PEM under tabmail-native-fts/.secrets/
 # - Prints the raw public key as base64 and the private PEM path
-# - Updates tabmail-native-fts/.dev.vars to point to the new PEM
+# - Records the new PEM as PENDING in tabmail-native-fts/.dev.vars
+# - Leaves the active manifest signer unchanged for the bridge release
 #
 # Rotation support requirements:
 # - The Rust host supports accepting multiple public keys (see TM_UPDATE_PUBLIC_KEYS_BASE64
 #   and the compiled-in UPDATE_PUBLIC_KEYS_BASE64 array in src/update_signature.rs).
 # - The array is an ACCUMULATING trust pool: on rotation we add the new pubkey,
-#   KEEP the old one, and ship a new binary. Removal only on compromise.
+#   KEEP the old one, and ship a bridge binary signed by the OLD key.
+# - Only after the overlap/adoption window may the pending key be promoted to
+#   active manifest signer. Changing the signer in the bridge release strands
+#   every older client, because update manifests currently carry one signature.
 #
 # IMPORTANT: This script does NOT commit anything.
 
@@ -76,28 +80,41 @@ echo "PEM path: $KEY_PEM"
 
 if [ -f "$DEV_VARS" ]; then
   echo ""
-  echo "Updating $DEV_VARS (backup + set TM_UPDATE_PRIVATE_KEY_PEM_PATH)..."
+  echo "Updating $DEV_VARS (backup + set TM_UPDATE_NEXT_PRIVATE_KEY_PEM_PATH)..."
   cp "$DEV_VARS" "$DEV_VARS.backup.$TS"
-  if command -v perl >/dev/null 2>&1; then
-    perl -i -pe "s|^TM_UPDATE_PRIVATE_KEY_PEM_PATH=.*|TM_UPDATE_PRIVATE_KEY_PEM_PATH=\"$KEY_PEM\"|g" "$DEV_VARS" || true
-  else
-    # macOS sed -i requires extension
-    sed -i.bak "s|^TM_UPDATE_PRIVATE_KEY_PEM_PATH=.*|TM_UPDATE_PRIVATE_KEY_PEM_PATH=\"$KEY_PEM\"|g" "$DEV_VARS" || true
-    rm -f "$DEV_VARS.bak"
-  fi
-  echo "✓ Updated TM_UPDATE_PRIVATE_KEY_PEM_PATH"
+  DEV_VARS_TMP="$(mktemp)"
+  awk -v next_key_pem="$KEY_PEM" '
+    BEGIN { found = 0 }
+    /^TM_UPDATE_NEXT_PRIVATE_KEY_PEM_PATH=/ {
+      print "TM_UPDATE_NEXT_PRIVATE_KEY_PEM_PATH=\"" next_key_pem "\""
+      found = 1
+      next
+    }
+    { print }
+    END {
+      if (!found) print "TM_UPDATE_NEXT_PRIVATE_KEY_PEM_PATH=\"" next_key_pem "\""
+    }
+  ' "$DEV_VARS" > "$DEV_VARS_TMP"
+  chmod 600 "$DEV_VARS_TMP"
+  mv "$DEV_VARS_TMP" "$DEV_VARS"
+  echo "✓ Updated TM_UPDATE_NEXT_PRIVATE_KEY_PEM_PATH"
+  echo "✓ Left TM_UPDATE_PRIVATE_KEY_PEM_PATH unchanged (bridge signer)"
 else
   echo ""
-  echo "NOTE: $DEV_VARS not found; set TM_UPDATE_PRIVATE_KEY_PEM_PATH manually."
+  echo "NOTE: $DEV_VARS not found; set TM_UPDATE_NEXT_PRIVATE_KEY_PEM_PATH manually."
 fi
 
 echo ""
 echo "Next steps (manual):"
 echo "1) Add the NEW public key to the ACCUMULATING array (keep the old one):"
 echo "   src/update_signature.rs → UPDATE_PUBLIC_KEYS_BASE64"
-echo "2) Ship a new host binary (cargo build --release → release + installer rebuild)"
-echo "3) Switch release signing to use the NEW PEM (TM_UPDATE_PRIVATE_KEY_PEM_PATH)"
-echo "4) DO NOT remove the old public key. The array is an accumulating trust"
+echo "2) Record it as pending in release/update-signing-policy.json."
+echo "3) Ship a bridge host + installers while manifests remain signed by the"
+echo "   OLD active TM_UPDATE_PRIVATE_KEY_PEM_PATH. Old clients can then update"
+echo "   into the binary that trusts both keys."
+echo "4) After the overlap/adoption window, explicitly promote the pending PEM"
+echo "   for a LATER manifest. Never switch the signer in the bridge release."
+echo "5) DO NOT remove the old public key. The array is an accumulating trust"
 echo "   pool; removal strands clients that haven't self-updated. Removal is"
 echo "   only a compromise-response action."
 echo ""
