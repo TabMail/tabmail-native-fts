@@ -8,23 +8,19 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 use crate::config;
 
-// Public keys used to verify update signatures (rotation-safe).
+// Public keys currently trusted to verify update signatures.
 //
 // Rotation model:
-// - During rotation, append the new public key here (or via env var), but keep the OLD private
-//   key as the active manifest signer for the bridge release. Older binaries know only that old
-//   public key, and the current manifest format carries one signature.
-// - After an explicit overlap/adoption window, promote the pending private key for a LATER
-//   manifest. Never make a new key sign the same release that first introduces its public key.
-// - Keep every previous public key. Routine rotation NEVER removes/revokes one; removal is
-//   reserved for compromise response only.
+// - A bridge release temporarily contains both the active and pending public keys, while its
+//   manifest remains signed by the old active key. Older binaries can therefore install it.
+// - After the pending signer is promoted, the NEXT helper release removes the previous public
+//   key. A client that missed the bridge must reinstall through Thunderbird's unsupported-helper
+//   prompt; retaining retired verification keys indefinitely would retain their compromise risk.
+// - Never make a new key sign the same release that first introduces its public key.
 //
 // Env override (comma-separated):
 //   TM_UPDATE_PUBLIC_KEYS_BASE64="base64key1,base64key2"
-pub const UPDATE_PUBLIC_KEYS_BASE64: &[&str] = &[
-    "Uirza74DhxMIoj54D/XkTymObvX/SpZiG1l1g+6BADE=",
-    "/OXegyjt64MgpTdxla2NvQvUWHf8F8IJoyPyiax5A7k=",
-];
+pub const UPDATE_PUBLIC_KEYS_BASE64: &[&str] = &["/OXegyjt64MgpTdxla2NvQvUWHf8F8IJoyPyiax5A7k="];
 
 pub fn make_signed_message(version: &str, platform: &str, sha256_hex: &str, url: &str) -> String {
     // Deterministic signing payload.
@@ -95,4 +91,22 @@ pub fn verify_update_signature(
     }
 
     bail!("update signature verification failed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UPDATE_PUBLIC_KEYS_BASE64;
+
+    const RETIRED_BRIDGE_SIGNER_PUBLIC_KEY_BASE64: &str =
+        "Uirza74DhxMIoj54D/XkTymObvX/SpZiG1l1g+6BADE=";
+    const CURRENT_SIGNER_PUBLIC_KEY_BASE64: &str = "/OXegyjt64MgpTdxla2NvQvUWHf8F8IJoyPyiax5A7k=";
+
+    #[test]
+    fn production_trust_pool_excludes_the_retired_bridge_signer() {
+        assert_eq!(
+            UPDATE_PUBLIC_KEYS_BASE64,
+            &[CURRENT_SIGNER_PUBLIC_KEY_BASE64]
+        );
+        assert!(!UPDATE_PUBLIC_KEYS_BASE64.contains(&RETIRED_BRIDGE_SIGNER_PUBLIC_KEY_BASE64));
+    }
 }

@@ -16,11 +16,13 @@ set -euo pipefail
 # Rotation support requirements:
 # - The Rust host supports accepting multiple public keys (see TM_UPDATE_PUBLIC_KEYS_BASE64
 #   and the compiled-in UPDATE_PUBLIC_KEYS_BASE64 array in src/update_signature.rs).
-# - The array is an ACCUMULATING trust pool: on rotation we add the new pubkey,
-#   KEEP the old one, and ship a bridge binary signed by the OLD key.
+# - The bridge release temporarily trusts both keys: on rotation we add the new
+#   pubkey, keep the old one for that release, and sign it with the OLD key.
 # - Only after the overlap/adoption window may the pending key be promoted to
 #   active manifest signer. Changing the signer in the bridge release strands
 #   every older client, because update manifests currently carry one signature.
+# - The first release after promotion removes the old public key. Clients that
+#   missed the bridge recover through Thunderbird's helper-reinstall prompt.
 #
 # IMPORTANT: This script does NOT commit anything.
 
@@ -106,15 +108,16 @@ fi
 
 echo ""
 echo "Next steps (manual):"
-echo "1) Add the NEW public key to the ACCUMULATING array (keep the old one):"
+echo "1) Add the NEW public key beside the active key for the BRIDGE release:"
 echo "   src/update_signature.rs → UPDATE_PUBLIC_KEYS_BASE64"
-echo "2) Record it as pending in release/update-signing-policy.json."
+echo "2) Record it as pending in release/update-signing-policy.json and set"
+echo "   bridgeReleaseVersion to the version that will carry both keys."
 echo "3) Ship a bridge host + installers while manifests remain signed by the"
 echo "   OLD active TM_UPDATE_PRIVATE_KEY_PEM_PATH. Old clients can then update"
 echo "   into the binary that trusts both keys."
 echo "4) After the overlap/adoption window, explicitly promote the pending PEM"
 echo "   for a LATER manifest. Never switch the signer in the bridge release."
-echo "5) DO NOT remove the old public key. The array is an accumulating trust"
-echo "   pool; removal strands clients that haven't self-updated. Removal is"
-echo "   only a compromise-response action."
+echo "5) In the NEXT helper release, remove the retired public key and record"
+echo "   firstUntrustedVersion in release/update-signing-policy.json. Clients"
+echo "   that missed the bridge must reinstall through the Thunderbird prompt."
 echo ""

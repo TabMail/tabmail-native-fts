@@ -56,6 +56,7 @@ Native messaging host for full-text search + semantic search. Communicates with 
 ## Recent Discoveries
 
 ### 2026-08-13
+- Native FTS 0.11.2 retires the pre-rotation update-signing public key from the compiled verifier. v0.11.1 remains the one-release dual-key bridge; clients that missed it recover through Thunderbird 1.7.2+'s unsupported-helper reinstall prompt. `scripts/check-update-signing-policy.py` makes the release fail if the compiled trust set differs from the active + explicitly transitional keys in `release/update-signing-policy.json`, or if a key remains trusted at/after its `firstUntrustedVersion`.
 - Added reader RPC `fingerprintMsgIdRange { startKey, endKey }` → `{ count, sha256 }` for Thunderbird ADR-022 startup membership proofs. It scans `message_ids` in SQLite BINARY order and hashes `u64be(UTF-8 byte length) || UTF-8 bytes`, matching the add-on's msgDB fingerprint. Host 0.10.1 → **0.11.0**; `SCHEMA_VERSION` remains 1 (no reindex). Existing `sha2`/`hex` dependencies only.
 
 ### 2026-07-13

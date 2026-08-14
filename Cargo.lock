@@ -2094,7 +2094,7 @@ dependencies = [
 
 [[package]]
 name = "tabmail-native-fts"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "anyhow",
  "assert_cmd",
