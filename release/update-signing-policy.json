@@ -1,6 +1,10 @@
 {
-  "activeManifestSigningPublicKeyBase64": "Uirza74DhxMIoj54D/XkTymObvX/SpZiG1l1g+6BADE=",
-  "pendingManifestSigningPublicKeyBase64": "/OXegyjt64MgpTdxla2NvQvUWHf8F8IJoyPyiax5A7k=",
+  "activeManifestSigningPublicKeyBase64": "/OXegyjt64MgpTdxla2NvQvUWHf8F8IJoyPyiax5A7k=",
   "bridgeReleaseVersion": "0.11.1",
-  "state": "active-signer-required-until-explicit-promotion"
+  "previousPublicKeyRetention": "indefinite-unless-compromised",
+  "state": "promoted-previous-public-key-retained",
+  "previousTrustedManifestSigningPublicKeysBase64": [
+    "Uirza74DhxMIoj54D/XkTymObvX/SpZiG1l1g+6BADE="
+  ],
+  "signerPromotedAt": "2026-08-14T05:02:15.000Z"
 }
