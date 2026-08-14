@@ -9,7 +9,7 @@ set -euo pipefail
 #
 # This script:
 # - Generates a new Ed25519 keypair PEM under tabmail-native-fts/.secrets/
-# - Prints raw public/private keys as base64 (for CI secret stores)
+# - Prints the raw public key as base64 and the private PEM path
 # - Updates tabmail-native-fts/.dev.vars to point to the new PEM
 #
 # Rotation support requirements:
@@ -62,7 +62,6 @@ echo "  $KEY_PEM"
 
 KEYTXT="$("$OPENSSL_BIN" pkey -in "$KEY_PEM" -text -noout)"
 PUB_HEX="$(echo "$KEYTXT" | awk 'BEGIN{inpub=0} /^pub:/{inpub=1; next} /^priv:/{inpub=0} {if(inpub){gsub(/[^0-9a-f:]/,"",$0); if($0!=""){print $0}}}' | tr -d ':' | tr -d '\n')"
-PRIV_HEX="$(echo "$KEYTXT" | awk 'BEGIN{inpriv=0} /^priv:/{inpriv=1; next} /^pub:/{inpriv=0} {if(inpriv){gsub(/[^0-9a-f:]/,"",$0); if($0!=""){print $0}}}' | tr -d ':' | tr -d '\n')"
 
 PUB_B64="$(python3 - <<PY
 import base64
@@ -70,15 +69,8 @@ print(base64.b64encode(bytes.fromhex("$PUB_HEX")).decode())
 PY
 )"
 
-PRIV_B64="$(python3 - <<PY
-import base64
-print(base64.b64encode(bytes.fromhex("$PRIV_HEX")).decode())
-PY
-)"
-
 echo ""
 echo "New public key (base64)  : $PUB_B64"
-echo "New private key (base64) : $PRIV_B64"
 echo ""
 echo "PEM path: $KEY_PEM"
 
