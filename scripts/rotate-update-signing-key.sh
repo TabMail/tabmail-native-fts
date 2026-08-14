@@ -24,6 +24,31 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SECRETS_DIR="${ROOT_DIR}/.secrets"
 DEV_VARS="${ROOT_DIR}/.dev.vars"
 
+# macOS ships LibreSSL as /usr/bin/openssl, which does not support Ed25519.
+# Prefer an explicitly configured binary, then Homebrew OpenSSL 3.
+OPENSSL_BIN="${OPENSSL_BIN:-}"
+if [[ -z "$OPENSSL_BIN" ]]; then
+  for candidate in \
+    /opt/homebrew/opt/openssl@3/bin/openssl \
+    /usr/local/opt/openssl@3/bin/openssl \
+    /opt/homebrew/bin/openssl \
+    openssl; do
+    if [[ "$candidate" == */* ]]; then
+      [[ -x "$candidate" ]] || continue
+    elif ! command -v "$candidate" >/dev/null 2>&1; then
+      continue
+    fi
+    if "$candidate" list -public-key-algorithms 2>/dev/null | grep -q ED25519; then
+      OPENSSL_BIN="$candidate"
+      break
+    fi
+  done
+fi
+if [[ -z "$OPENSSL_BIN" ]]; then
+  echo "ERROR: OpenSSL with Ed25519 support is required (install openssl@3)." >&2
+  exit 1
+fi
+
 mkdir -p "$SECRETS_DIR"
 
 TS="$(date +%Y%m%d-%H%M%S)"
@@ -33,9 +58,9 @@ echo "=== TabMail native-fts update signing key rotation ==="
 echo ""
 echo "Generating new Ed25519 private key PEM:"
 echo "  $KEY_PEM"
-openssl genpkey -algorithm ED25519 -out "$KEY_PEM" >/dev/null 2>&1
+"$OPENSSL_BIN" genpkey -algorithm ED25519 -out "$KEY_PEM" >/dev/null 2>&1
 
-KEYTXT="$(openssl pkey -in "$KEY_PEM" -text -noout)"
+KEYTXT="$("$OPENSSL_BIN" pkey -in "$KEY_PEM" -text -noout)"
 PUB_HEX="$(echo "$KEYTXT" | awk 'BEGIN{inpub=0} /^pub:/{inpub=1; next} /^priv:/{inpub=0} {if(inpub){gsub(/[^0-9a-f:]/,"",$0); if($0!=""){print $0}}}' | tr -d ':' | tr -d '\n')"
 PRIV_HEX="$(echo "$KEYTXT" | awk 'BEGIN{inpriv=0} /^priv:/{inpriv=1; next} /^pub:/{inpriv=0} {if(inpriv){gsub(/[^0-9a-f:]/,"",$0); if($0!=""){print $0}}}' | tr -d ':' | tr -d '\n')"
 
