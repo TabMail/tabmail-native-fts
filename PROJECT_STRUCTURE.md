@@ -2,7 +2,7 @@
 
 > **Directory tree, entry points, and sub-component map.** Update when the structure changes.
 
-**Last updated:** 2026-02-16
+**Last updated:** 2026-08-22
 
 ---
 
@@ -38,7 +38,7 @@ tabmail-native-fts/
 │   │
 │   ├── fts/                     # Full-text search
 │   │   ├── mod.rs               # Module exports
-│   │   ├── db.rs                # SQLite FTS5 operations
+│   │   ├── db.rs                # SQLite FTS5 + exact folder-membership operations
 │   │   ├── memory_db.rs         # In-memory index
 │   │   ├── query.rs             # Query parsing & expansion
 │   │   ├── hybrid.rs            # Hybrid search (lexical + semantic)
@@ -64,7 +64,7 @@ main thread (stdin reader + dispatcher)
     ├── reader thread (read-only: search, stats, filter)
     │   └── owns rusqlite::Connection (Connection is !Send)
     │
-    └── writer thread (write: indexBatch, removeBatch, clear)
+    └── writer thread (write: indexBatch, membership adoption, removeBatch, clear)
         └── owns rusqlite::Connection
         └── signals reader via AtomicBool on clear/memoryClear
 
@@ -73,3 +73,10 @@ Shared: EmbeddingEngine (Arc), SynonymLookup (Arc), Stdout (Arc<Mutex>)
 
 **Pre-init (single-threaded):** hello, init, updateCheck, updateRequest
 **Post-init (multi-threaded):** all other methods dispatched by `classify_method()`
+
+`message_ids` remains unchanged. The additive
+`message_folder_membership(msgId, folderId)` table carries a covering
+`(folderId, msgId)` index. Reader RPCs use exact folder equality; legacy rows
+missing a relation are paged separately for bounded, resumable adoption. The
+empty table/index are constant-size startup DDL, so existing archives are not
+scanned or synchronously reindexed on init.

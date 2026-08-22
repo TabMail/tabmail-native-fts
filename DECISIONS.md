@@ -74,6 +74,53 @@
 
 ---
 
+## ADR-NF-004: Exact Opaque Folder Membership Alongside Stable msgId Keys
+
+**Context:** Thunderbird's historical native key joins account, folder path,
+and Message-ID with `:`. IMAP folder names may themselves contain `:`, so
+prefix ranges and delimiter parsing cannot prove folder membership. Replacing
+the primary key would force a broad cache migration, while the iOS search
+implementation avoids this class by keeping folder identity as a structured
+relation beside message identity.
+
+**Decision:**
+1. Preserve `message_ids.msgId` and every existing RPC unchanged. Add an empty
+   `message_folder_membership(msgId PRIMARY KEY, folderId NOT NULL)` relation
+   with a covering `(folderId, msgId)` index.
+2. Advertise `capabilities.folderMembershipV1`. Let `indexBatch` accept optional
+   opaque `folderId` for fresh writes.
+3. A duplicate msgId may adopt an absent relation or repeat the same relation.
+   A different non-empty relation is a conflict and rolls back the request.
+4. Provide an exact-equality bounded folder list from which clients compute
+   digests incrementally, plus a bounded global `message_ids` state page whose
+   limit is applied before joining the optional relation. Bounded transactional
+   backfill counts live messages outside the FTS policy window as missing
+   no-ops, while ownership conflicts still roll back the whole request. Pages
+   can continue without a total-row cap or server-side session cache.
+5. Keep `SCHEMA_VERSION` at 1: the additive relation migrates locally and does
+   not require Thunderbird to re-feed message content.
+
+**Rationale:** Exact equality makes colon-bearing and prefix-related folders
+independent without changing externally visible message keys. A separate,
+initially empty relation avoids a synchronous index build over every historical
+msgId at startup. Missing legacy membership is explicit rather than guessed,
+and bounded requests keep migration interruptible while eventually covering
+archives of any size.
+
+**Consequences:**
+- A capable Thunderbird client must complete a stable live membership scan
+  before treating relation-absent state entries as stale; this helper only
+  exposes and assigns the relation.
+- A conflicting non-empty relation fails closed because it may represent a
+  historical composite-key collision.
+- Older clients continue to index and use the original range RPCs; their new
+  rows remain unassigned until a capable client adopts them.
+- The source version remains unchanged in this implementation PR. The release
+  train must bump `Cargo.toml` and `HOST_VERSION` together before publishing a
+  helper binary carrying the new capability.
+
+---
+
 ## Template for New Decisions
 
 ```markdown

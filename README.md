@@ -122,6 +122,27 @@ The memory database enables:
 
 Each Thunderbird profile gets its own isolated FTS and memory databases.
 
+`fts.db` keeps the historical `msgId` primary key for compatibility and stores
+opaque folder identities in the additive `message_folder_membership` relation.
+Helpers advertising
+`capabilities.folderMembershipV1` support exact folder equality operations:
+
+- `listFolderMembership { folderId, afterMsgId?, limit? }`
+- `listFolderMembershipState { afterMsgId?, limit? }`
+- `assignFolderMembershipBatch { assignments: [{ msgId, folderId }] }` returns
+  `{ ok, assigned, alreadyAssigned, missing }`
+
+`indexBatch` accepts `folderId` on each row. Existing rows with no relation can
+adopt one; attempts to reassign a row from one non-empty folder identity to a
+different one fail closed. Paging and assignment batches are bounded per call,
+but callers may continue until `done`, so archive reconciliation is unbounded
+overall without requiring a single long-running native request. Clients compute
+folder digests incrementally from `listFolderMembership` pages. The global
+state page applies its limit to `message_ids` before joining folder membership,
+so even a terminal migration page cannot scan the whole archive in one call.
+Assignments for live messages outside the native FTS policy window are counted
+in `missing` and otherwise ignored.
+
 *Note: The helper automatically migrates databases from the old location (`<profile>/tabmail_fts/`) to the new location on first run.*
 
 ## Logs

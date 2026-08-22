@@ -210,9 +210,11 @@ class TestRustHelperProcess(unittest.TestCase):
 
             # 2. Index some emails
             unique_suffix = str(int(time.time() * 1000))
+            rebuild_folder_id = f"folder:embedding-rebuild:{unique_suffix}"
             rows = [
                 {
                     "msgId": f"rebuild-test-{i}-{unique_suffix}",
+                    "folderId": rebuild_folder_id,
                     "subject": f"Test Email {i} About Quarterly Reports",
                     "from_": f"user{i}@example.com",
                     "to_": "team@example.com",
@@ -226,6 +228,24 @@ class TestRustHelperProcess(unittest.TestCase):
             response = _read_message(proc)
             self.assert_success(response, "indexBatch")
             self.assertEqual(response["result"]["count"], 5)
+
+            expected_membership = sorted(row["msgId"] for row in rows)
+
+            def assert_folder_membership(request_id, checkpoint):
+                _send_message(proc, {
+                    "id": request_id,
+                    "method": "listFolderMembership",
+                    "params": {"folderId": rebuild_folder_id, "limit": 10},
+                })
+                membership_response = _read_message(proc)
+                self.assert_success(membership_response, checkpoint)
+                self.assertEqual(
+                    membership_response["result"]["msgIds"],
+                    expected_membership,
+                    f"folder membership changed {checkpoint}",
+                )
+
+            assert_folder_membership("3-membership", "before embedding rebuild")
 
             # 3. Index some memory entries
             mem_rows = [
@@ -261,6 +281,7 @@ class TestRustHelperProcess(unittest.TestCase):
             self.assertTrue(response["result"]["ok"])
             self.assertEqual(response["result"]["emailTotal"], 5)
             self.assertEqual(response["result"]["memoryTotal"], 3)
+            assert_folder_membership("10-membership", "after rebuildEmbeddingsStart")
 
             # 6. Verify vec tables are now empty (start clears them)
             _send_message(proc, {"id": "11", "method": "stats", "params": {}})
@@ -304,6 +325,7 @@ class TestRustHelperProcess(unittest.TestCase):
             self.assertEqual(total_processed, 5, "Should process all 5 emails")
             self.assertEqual(total_embedded, 5, "Should embed all 5 emails")
             self.assertGreaterEqual(batch_count, 3, "With batchSize=2, need at least 3 batches for 5 docs")
+            assert_folder_membership("email-batches-membership", "after email rebuildEmbeddingsBatch")
 
             # 9. Process memory embeddings in batches
             last_rowid = 0
@@ -329,6 +351,7 @@ class TestRustHelperProcess(unittest.TestCase):
 
             self.assertEqual(mem_processed, 3, "Should process all 3 memory entries")
             self.assertEqual(mem_embedded, 3, "Should embed all 3 memory entries")
+            assert_folder_membership("memory-batches-membership", "after memory rebuildEmbeddingsBatch")
 
             # 10. Verify final stats
             _send_message(proc, {"id": str(msg_counter), "method": "stats", "params": {}})
