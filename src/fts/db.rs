@@ -363,8 +363,14 @@ PRAGMA wal_autocheckpoint = {wal_autocheckpoint};\n\
         CREATE TABLE IF NOT EXISTS message_ids (
             msgId TEXT PRIMARY KEY
         );
+
+        CREATE TABLE IF NOT EXISTS message_folder_membership (
+            msgId TEXT PRIMARY KEY,
+            folderId TEXT NOT NULL
+        ) WITHOUT ROWID;
         "#,
     )?;
+    ensure_folder_membership_schema(conn)?;
 
     // Vector tables for semantic search (sqlite-vec).
     // messages_vec rowids match FTS shard rowids (globally unique via message_ids.rowid).
@@ -384,7 +390,26 @@ PRAGMA wal_autocheckpoint = {wal_autocheckpoint};\n\
         dims = config::embedding::EMBEDDING_DIMS,
     ))?;
 
-    log::info!("Database schema initialized (4 tables: message_meta, message_ids, messages_vec, embed_cache; FTS shards created lazily)");
+    log::info!("Database schema initialized (message_meta, message_ids, message_folder_membership, messages_vec, embed_cache; FTS shards created lazily)");
+    Ok(())
+}
+
+/// Add the exact, opaque folder identity relation without changing or scanning
+/// existing msgId rows. The empty relation table and index are constant-size
+/// startup DDL; bounded fresh/backfill writes grow them incrementally. A legacy
+/// msgId remains unassigned until it has a corresponding relation row.
+pub fn ensure_folder_membership_schema(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS message_folder_membership (
+            msgId TEXT PRIMARY KEY,
+            folderId TEXT NOT NULL
+        ) WITHOUT ROWID;
+
+        CREATE INDEX IF NOT EXISTS idx_message_folder_membership_folder_msg
+            ON message_folder_membership(folderId, msgId);
+        "#,
+    )?;
     Ok(())
 }
 
@@ -464,6 +489,10 @@ pub fn open_or_create_db(profile_dir: &Path) -> anyhow::Result<(PathBuf, Connect
         log::info!("Creating new year-sharded FTS database schema");
         init_database(&conn)?;
     }
+
+    // Existing sharded and monolithic databases take migration paths that do
+    // not call init_database(), so apply the additive relation on every open.
+    ensure_folder_membership_schema(&conn)?;
 
     // In-place tokenizer migration for shards created with an outdated
     // tokenize= string. NO SCHEMA_VERSION bump — the addon must never see this
@@ -590,6 +619,13 @@ pub fn vec_count(conn: &Connection) -> i64 {
 pub fn index_batch(conn: &mut Connection, rows: &[Value], engine: Option<&EmbeddingEngine>, known_years: &mut HashSet<i32>) -> anyhow::Result<(i64, i64)> {
     log::info!("Indexing batch of {} messages (embeddings={})", rows.len(), engine.is_some());
 
+    // Validate every supplied relation before any shard DDL or row write. The
+    // field is optional for older addons, but malformed/empty identities must
+    // fail the whole request rather than create rows invisible to exact scans.
+    for row in rows {
+        validate_optional_folder_id(row)?;
+    }
+
     // Pre-create any new shards needed outside the transaction (DDL in FTS5 is auto-commit).
     // Collect the years we'll need so we can ensure shards exist.
     for row in rows {
@@ -610,14 +646,48 @@ pub fn index_batch(conn: &mut Connection, rows: &[Value], engine: Option<&Embedd
             continue;
         }
 
+        let incoming_folder_id = validate_optional_folder_id(row)?;
         let changed = tx.execute(
             "INSERT OR IGNORE INTO message_ids (msgId) VALUES (?1)",
             params![msg_id_val],
         )?;
         if changed == 0 {
+            if let Some(incoming_folder_id) = incoming_folder_id {
+                let stored_folder_id: Option<String> = tx
+                    .query_row(
+                        "SELECT folderId FROM message_folder_membership WHERE msgId = ?1",
+                        params![msg_id_val],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match stored_folder_id.as_deref() {
+                    None => {
+                        tx.execute(
+                            "INSERT INTO message_folder_membership (msgId, folderId) VALUES (?1, ?2)",
+                            params![msg_id_val, incoming_folder_id],
+                        )?;
+                    }
+                    Some(stored) if stored == incoming_folder_id => {}
+                    Some(stored) => {
+                        bail!(
+                            "conflicting folderId for msgId {}: stored {}, incoming {}",
+                            truncate_for_log(msg_id_val),
+                            truncate_for_log(stored),
+                            truncate_for_log(incoming_folder_id)
+                        );
+                    }
+                }
+            }
             skipped_duplicates += 1;
             log::debug!("Skipping duplicate msgId: {}...", truncate_for_log(msg_id_val));
             continue;
+        }
+
+        if let Some(folder_id) = incoming_folder_id {
+            tx.execute(
+                "INSERT INTO message_folder_membership (msgId, folderId) VALUES (?1, ?2)",
+                params![msg_id_val, folder_id],
+            )?;
         }
 
         let row_id: i64 = tx.query_row(
@@ -709,6 +779,14 @@ pub fn index_batch(conn: &mut Connection, rows: &[Value], engine: Option<&Embedd
     }
 
     Ok((inserted, skipped_duplicates))
+}
+
+fn validate_optional_folder_id(row: &Value) -> anyhow::Result<Option<&str>> {
+    match row.get("folderId") {
+        None => Ok(None),
+        Some(Value::String(folder_id)) if !folder_id.is_empty() => Ok(Some(folder_id.as_str())),
+        Some(_) => bail!("folderId must be a non-empty string when present"),
+    }
 }
 
 /// Convert a Vec<f32> to a little-endian byte blob for sqlite-vec.
@@ -1478,6 +1556,10 @@ pub fn remove_batch(conn: &mut Connection, ids: &[Value]) -> anyhow::Result<i64>
             tx.execute(&format!("DELETE FROM {table} WHERE rowid = ?1"), params![row_id])?;
             tx.execute("DELETE FROM message_meta WHERE rowid = ?1", params![row_id])?;
             tx.execute("DELETE FROM messages_vec WHERE rowid = ?1", params![row_id])?;
+            tx.execute(
+                "DELETE FROM message_folder_membership WHERE msgId = ?1",
+                params![msg_id_val],
+            )?;
             tx.execute("DELETE FROM message_ids WHERE msgId = ?1", params![msg_id_val])?;
             removed += 1;
         }
@@ -1649,6 +1731,181 @@ pub fn list_msg_id_range(
     Ok(serde_json::json!({ "ok": true, "msgIds": msg_ids, "done": done }))
 }
 
+fn validate_folder_id(folder_id: &str) -> anyhow::Result<()> {
+    if folder_id.is_empty() {
+        bail!("folderId parameter must be a non-empty string");
+    }
+    Ok(())
+}
+
+fn validate_folder_membership_page_limit(limit: i64) -> anyhow::Result<()> {
+    if !(1..=config::sqlite::FOLDER_MEMBERSHIP_PAGE_MAX_LIMIT).contains(&limit) {
+        bail!(
+            "limit must be between 1 and {}",
+            config::sqlite::FOLDER_MEMBERSHIP_PAGE_MAX_LIMIT
+        );
+    }
+    Ok(())
+}
+
+/// Page exact folder membership in msgId BINARY order. Repeated bounded calls
+/// allow an unbounded reconciliation without monopolizing the reader thread.
+pub fn list_folder_membership(
+    conn: &Connection,
+    folder_id: &str,
+    after_msg_id: Option<&str>,
+    limit: i64,
+) -> anyhow::Result<Value> {
+    validate_folder_id(folder_id)?;
+    validate_folder_membership_page_limit(limit)?;
+
+    let (sql, cursor) = match after_msg_id {
+        Some(after) => (
+            "SELECT msgId FROM message_folder_membership WHERE folderId = ?1 COLLATE BINARY AND msgId > ?2 COLLATE BINARY ORDER BY msgId COLLATE BINARY LIMIT ?3",
+            after,
+        ),
+        None => (
+            "SELECT msgId FROM message_folder_membership WHERE folderId = ?1 COLLATE BINARY ORDER BY msgId COLLATE BINARY LIMIT ?2",
+            "",
+        ),
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let msg_ids: Vec<String> = if after_msg_id.is_some() {
+        stmt.query_map(params![folder_id, cursor, limit], |row| row.get(0))?
+            .collect::<Result<_, _>>()?
+    } else {
+        stmt.query_map(params![folder_id, limit], |row| row.get(0))?
+            .collect::<Result<_, _>>()?
+    };
+    let done = (msg_ids.len() as i64) < limit;
+    Ok(serde_json::json!({ "ok": true, "msgIds": msg_ids, "done": done }))
+}
+
+/// Page the global msgId keyspace together with its optional exact folder
+/// relation. The MATERIALIZED key page applies LIMIT before the LEFT JOIN, so
+/// every request inspects at most `limit` archive keys even when almost every
+/// key is already assigned. The exclusive BINARY msgId cursor is stateless and
+/// resumable; callers use their live-scan epoch to detect insertions at/below a
+/// cursor and restart before treating absent live keys as stale.
+pub fn list_folder_membership_state(
+    conn: &Connection,
+    after_msg_id: Option<&str>,
+    limit: i64,
+) -> anyhow::Result<Value> {
+    validate_folder_membership_page_limit(limit)?;
+
+    let (sql, cursor) = match after_msg_id {
+        Some(after) => (
+            "WITH page AS MATERIALIZED (SELECT msgId FROM message_ids WHERE msgId > ?1 COLLATE BINARY ORDER BY msgId COLLATE BINARY LIMIT ?2) SELECT page.msgId, fm.folderId FROM page LEFT JOIN message_folder_membership fm ON fm.msgId = page.msgId ORDER BY page.msgId COLLATE BINARY",
+            after,
+        ),
+        None => (
+            "WITH page AS MATERIALIZED (SELECT msgId FROM message_ids ORDER BY msgId COLLATE BINARY LIMIT ?1) SELECT page.msgId, fm.folderId FROM page LEFT JOIN message_folder_membership fm ON fm.msgId = page.msgId ORDER BY page.msgId COLLATE BINARY",
+            "",
+        ),
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let entries: Vec<Value> = if after_msg_id.is_some() {
+        stmt.query_map(params![cursor, limit], |row| {
+            let msg_id: String = row.get(0)?;
+            let folder_id: Option<String> = row.get(1)?;
+            Ok(serde_json::json!({ "msgId": msg_id, "folderId": folder_id }))
+        })?
+            .collect::<Result<_, _>>()?
+    } else {
+        stmt.query_map(params![limit], |row| {
+            let msg_id: String = row.get(0)?;
+            let folder_id: Option<String> = row.get(1)?;
+            Ok(serde_json::json!({ "msgId": msg_id, "folderId": folder_id }))
+        })?
+            .collect::<Result<_, _>>()?
+    };
+    let done = (entries.len() as i64) < limit;
+    Ok(serde_json::json!({ "ok": true, "entries": entries, "done": done }))
+}
+
+/// Adopt exact folder membership for already-indexed rows. The batch is
+/// transactional: NULL adopts, equal non-NULL is idempotent, missing msgIds are
+/// counted no-ops, and a conflicting non-NULL relation fails closed and rolls
+/// back every adoption.
+pub fn assign_folder_membership_batch(
+    conn: &mut Connection,
+    assignments: &Value,
+) -> anyhow::Result<(i64, i64, i64)> {
+    let assignments = assignments
+        .as_array()
+        .context("assignments parameter is required and must be an array")?;
+    if assignments.is_empty() {
+        bail!("assignments must contain at least one item");
+    }
+    if assignments.len() > config::sqlite::ASSIGN_FOLDER_MEMBERSHIP_BATCH_MAX {
+        bail!(
+            "assignments exceeds maximum batch size {}",
+            config::sqlite::ASSIGN_FOLDER_MEMBERSHIP_BATCH_MAX
+        );
+    }
+
+    let mut validated = Vec::with_capacity(assignments.len());
+    for assignment in assignments {
+        let msg_id = assignment
+            .get("msgId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .context("assignment msgId is required and must be a non-empty string")?;
+        let folder_id = assignment
+            .get("folderId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .context("assignment folderId is required and must be a non-empty string")?;
+        validated.push((msg_id, folder_id));
+    }
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut assigned: i64 = 0;
+    let mut already_assigned: i64 = 0;
+    let mut missing: i64 = 0;
+    for (msg_id, incoming_folder_id) in validated {
+        let indexed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM message_ids WHERE msgId = ?1)",
+            params![msg_id],
+            |row| row.get(0),
+        )?;
+        if !indexed {
+            missing += 1;
+            continue;
+        }
+        let stored_folder_id: Option<String> = tx
+            .query_row(
+                "SELECT folderId FROM message_folder_membership WHERE msgId = ?1",
+                params![msg_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match stored_folder_id {
+            None => {
+                tx.execute(
+                    "INSERT INTO message_folder_membership (msgId, folderId) VALUES (?1, ?2)",
+                    params![msg_id, incoming_folder_id],
+                )?;
+                assigned += 1;
+            }
+            Some(stored) if stored == incoming_folder_id => {
+                already_assigned += 1;
+            }
+            Some(stored) => {
+                bail!(
+                    "conflicting folderId for msgId {}: stored {}, incoming {}",
+                    truncate_for_log(msg_id),
+                    truncate_for_log(&stored),
+                    truncate_for_log(incoming_folder_id)
+                );
+            }
+        }
+    }
+    tx.commit()?;
+    Ok((assigned, already_assigned, missing))
+}
+
 pub fn query_by_date_range(conn: &Connection, from_v: &Value, to_v: &Value, limit: i64, known_years: &HashSet<i32>) -> anyhow::Result<Vec<Value>> {
     let Some(from_ts) = parse_date_param(from_v)? else { bail!("from and to parameters are required") };
     let Some(to_ts) = parse_date_param(to_v)? else { bail!("from and to parameters are required") };
@@ -1784,7 +2041,34 @@ fn truncate_for_log(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
+    use rusqlite::{ffi, Connection};
+    use std::ffi::CStr;
+    use std::os::raw::{c_char, c_int, c_void};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    unsafe extern "C" fn count_message_ids_reads(
+        context: *mut c_void,
+        action: c_int,
+        table_name: *const c_char,
+        _column_name: *const c_char,
+        _database_name: *const c_char,
+        _trigger_name: *const c_char,
+    ) -> c_int {
+        if action == ffi::SQLITE_READ && !table_name.is_null() {
+            let table_name = unsafe { CStr::from_ptr(table_name) };
+            if table_name.to_bytes() == b"message_ids" {
+                let reads = unsafe { &*(context as *const AtomicUsize) };
+                reads.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }
+        ffi::SQLITE_OK
+    }
+
+    unsafe extern "C" fn count_vm_steps(context: *mut c_void) -> c_int {
+        let steps = unsafe { &*(context as *const AtomicUsize) };
+        steps.fetch_add(1, AtomicOrdering::SeqCst);
+        0
+    }
 
     /// Create an in-memory database with year-sharded FTS schema for testing.
     /// Returns (connection, known_years set).
@@ -1805,6 +2089,14 @@ mod tests {
             CREATE TABLE IF NOT EXISTS message_ids (
                 msgId TEXT PRIMARY KEY
             );
+
+            CREATE TABLE IF NOT EXISTS message_folder_membership (
+                msgId TEXT PRIMARY KEY,
+                folderId TEXT NOT NULL
+            ) WITHOUT ROWID;
+
+            CREATE INDEX IF NOT EXISTS idx_message_folder_membership_folder_msg
+                ON message_folder_membership(folderId, msgId);
         "#).unwrap();
 
         // Create shard for year 2000 (SHARD_MIN_YEAR — where dateMs=0/small values are clamped)
@@ -1923,6 +2215,21 @@ mod tests {
              VALUES (7, '<retok@test>', 'Weekly digest', 'billing-alerts@domain.com', '', '', '', 'body text')",
             [],
         ).unwrap();
+        conn.execute_batch("CREATE TABLE message_ids (msgId TEXT PRIMARY KEY);")
+            .unwrap();
+        ensure_folder_membership_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO message_ids(rowid, msgId) VALUES (7, '<retok@test>')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message_folder_membership(msgId, folderId) VALUES ('<retok@test>', 'folder:retokenize')",
+            [],
+        )
+        .unwrap();
+        let membership_before =
+            list_folder_membership(&conn, "folder:retokenize", None, 1).unwrap();
 
         // Old tokenizer: a part query cannot match the glued address token
         let n: i64 = conn.query_row(
@@ -1947,6 +2254,15 @@ mod tests {
         ).unwrap();
         assert_eq!(rowid, 7);
         assert_eq!(body, "body text");
+        assert_eq!(
+            list_folder_membership(&conn, "folder:retokenize", None, 1).unwrap(),
+            membership_before,
+            "tokenizer-shard rebuild must not modify exact folder membership"
+        );
+        assert_eq!(
+            list_folder_membership(&conn, "folder:retokenize", None, 1).unwrap()["msgIds"],
+            serde_json::json!(["<retok@test>"])
+        );
 
         // Idempotent: second run is a no-op
         rebuild_stale_tokenizer_shards(&mut conn).unwrap();
@@ -1955,6 +2271,11 @@ mod tests {
             [], |r| r.get(0),
         ).unwrap();
         assert_eq!(n, 1);
+        assert_eq!(
+            list_folder_membership(&conn, "folder:retokenize", None, 1).unwrap(),
+            membership_before,
+            "idempotent tokenizer-shard rebuild must preserve membership"
+        );
     }
 
     #[test]
@@ -2300,6 +2621,584 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    fn index_row(msg_id: &str, folder_id: Option<&str>) -> Value {
+        let mut row = serde_json::json!({
+            "msgId": msg_id,
+            "dateMs": 0,
+            "subject": "subject",
+            "from": "sender@example.com",
+            "to": "recipient@example.com",
+            "body": "body",
+        });
+        if let Some(folder_id) = folder_id {
+            row["folderId"] = Value::String(folder_id.to_string());
+        }
+        row
+    }
+
+    fn folder_id(conn: &Connection, msg_id: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT folderId FROM message_folder_membership WHERE msgId = ?1",
+            params![msg_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    #[test]
+    fn test_folder_membership_schema_adds_empty_relation_and_exact_index_in_place() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE message_ids (msgId TEXT PRIMARY KEY);")
+            .unwrap();
+        for index in 0..64 {
+            conn.execute(
+                "INSERT INTO message_ids(msgId) VALUES (?1)",
+                params![format!("legacy:{index:04}")],
+            )
+            .unwrap();
+        }
+
+        // SQLite's authorizer fires when a prepared statement reads a table.
+        // A positive control proves the hook observes message_ids, then the
+        // schema initializer must complete without a single such read. This
+        // deterministically rejects startup backfills/index builds regardless
+        // of archive size, rather than using row counts or elapsed time.
+        let message_ids_reads = AtomicUsize::new(0);
+        let install_result = unsafe {
+            ffi::sqlite3_set_authorizer(
+                conn.handle(),
+                Some(count_message_ids_reads),
+                &message_ids_reads as *const AtomicUsize as *mut c_void,
+            )
+        };
+        assert_eq!(install_result, ffi::SQLITE_OK);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM message_ids", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            64
+        );
+        assert!(message_ids_reads.load(AtomicOrdering::SeqCst) > 0);
+        message_ids_reads.store(0, AtomicOrdering::SeqCst);
+
+        let schema_result = ensure_folder_membership_schema(&conn);
+        let uninstall_result = unsafe {
+            ffi::sqlite3_set_authorizer(conn.handle(), None, std::ptr::null_mut())
+        };
+        assert_eq!(uninstall_result, ffi::SQLITE_OK);
+        schema_result.unwrap();
+        assert_eq!(
+            message_ids_reads.load(AtomicOrdering::SeqCst),
+            0,
+            "startup relation DDL must not read or scan populated message_ids"
+        );
+
+        assert_eq!(folder_id(&conn, "legacy:0000"), None);
+        let message_id_columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(message_ids)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(message_id_columns, vec!["msgId"]);
+        let relation_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'message_folder_membership'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(relation_sql.contains("WITHOUT ROWID"));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM message_folder_membership",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        let index_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_message_folder_membership_folder_msg'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index_sql.contains("folderId, msgId"));
+
+        // Idempotent on every init.
+        ensure_folder_membership_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn test_index_batch_writes_adopts_and_rejects_conflicting_folder_membership() {
+        let (mut conn, mut known_years) = setup_test_db();
+
+        let fresh = index_row("account:/Client:Acme:fresh@example.com", Some("folder:opaque:one"));
+        assert_eq!(index_batch(&mut conn, &[fresh], None, &mut known_years).unwrap(), (1, 0));
+        assert_eq!(
+            folder_id(&conn, "account:/Client:Acme:fresh@example.com").as_deref(),
+            Some("folder:opaque:one")
+        );
+
+        let legacy = index_row("account:/legacy@example.com", None);
+        assert_eq!(index_batch(&mut conn, &[legacy], None, &mut known_years).unwrap(), (1, 0));
+        let adopt = index_row("account:/legacy@example.com", Some("folder:opaque:two"));
+        assert_eq!(index_batch(&mut conn, &[adopt], None, &mut known_years).unwrap(), (0, 1));
+        assert_eq!(
+            folder_id(&conn, "account:/legacy@example.com").as_deref(),
+            Some("folder:opaque:two")
+        );
+
+        let idempotent = index_row("account:/legacy@example.com", Some("folder:opaque:two"));
+        assert_eq!(index_batch(&mut conn, &[idempotent], None, &mut known_years).unwrap(), (0, 1));
+
+        let conflict = index_row("account:/legacy@example.com", Some("folder:opaque:other"));
+        let error = index_batch(&mut conn, &[conflict], None, &mut known_years).unwrap_err();
+        assert!(error.to_string().contains("conflicting folderId"), "got: {error}");
+        assert_eq!(
+            folder_id(&conn, "account:/legacy@example.com").as_deref(),
+            Some("folder:opaque:two")
+        );
+    }
+
+    #[test]
+    fn test_index_batch_rejects_empty_or_non_string_folder_id_atomically() {
+        let (mut conn, mut known_years) = setup_test_db();
+        let valid = index_row("valid@example.com", Some("folder-valid"));
+        let empty = index_row("empty@example.com", Some(""));
+
+        let error = index_batch(&mut conn, &[valid, empty], None, &mut known_years).unwrap_err();
+        assert!(error.to_string().contains("folderId"), "got: {error}");
+        assert_eq!(db_count(&conn).unwrap(), 0, "validation must happen before writes");
+
+        let mut non_string = index_row("number@example.com", None);
+        non_string["folderId"] = serde_json::json!(42);
+        let error = index_batch(&mut conn, &[non_string], None, &mut known_years).unwrap_err();
+        assert!(error.to_string().contains("folderId"), "got: {error}");
+    }
+
+    #[test]
+    fn test_exact_folder_membership_uses_binary_equality_order_and_fingerprint() {
+        let (conn, _known_years) = setup_test_db();
+        let folder_id = "Folder:%_É😀";
+        let binary_order = [
+            "Msg:A",
+            "msg:%",
+            "msg:A",
+            "msg:_",
+            "msg:a",
+            "msg:e\u{301}",
+            "msg:é",
+            "msg:😀",
+        ];
+        for msg_id in binary_order {
+            conn.execute(
+                "INSERT INTO message_ids (msgId) VALUES (?1)",
+                params![msg_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO message_folder_membership (msgId, folderId) VALUES (?1, ?2)",
+                params![msg_id, folder_id],
+            )
+            .unwrap();
+        }
+        for (msg_id, decoy_folder_id) in [
+            ("decoy:ascii-case", "folder:anyZÉ😀"),
+            ("decoy:wildcard-literal", "folder:%_É😀"),
+            ("decoy:decomposed", "Folder:%_E\u{301}😀"),
+        ] {
+            conn.execute(
+                "INSERT INTO message_ids (msgId) VALUES (?1)",
+                params![msg_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO message_folder_membership (msgId, folderId) VALUES (?1, ?2)",
+                params![msg_id, decoy_folder_id],
+            )
+            .unwrap();
+        }
+
+        let first = list_folder_membership(&conn, folder_id, None, 3).unwrap();
+        assert_eq!(first["msgIds"], serde_json::json!(["Msg:A", "msg:%", "msg:A"]));
+        assert_eq!(first["done"], false);
+        let second = list_folder_membership(&conn, folder_id, Some("msg:A"), 3).unwrap();
+        assert_eq!(
+            second["msgIds"],
+            serde_json::json!(["msg:_", "msg:a", "msg:e\u{301}"])
+        );
+        assert_eq!(second["done"], false);
+        let third = list_folder_membership(&conn, folder_id, Some("msg:e\u{301}"), 3).unwrap();
+        assert_eq!(third["msgIds"], serde_json::json!(["msg:é", "msg:😀"]));
+        assert_eq!(third["done"], true);
+
+        // Thunderbird computes this same u64-length-framed digest while it
+        // consumes bounded pages; native never performs an unbounded hash.
+        let mut incremental_digest = Sha256::new();
+        for page in [&first, &second, &third] {
+            for msg_id in page["msgIds"].as_array().unwrap() {
+                let bytes = msg_id.as_str().unwrap().as_bytes();
+                incremental_digest.update((bytes.len() as u64).to_be_bytes());
+                incremental_digest.update(bytes);
+            }
+        }
+        assert_eq!(
+            hex::encode(incremental_digest.finalize()),
+            "ffe830a2a4f235bcbd4330cfeb6d321d7680930e615d2fbcecd527c691bf6ec1"
+        );
+
+        // Explicit mutant witnesses: LIKE would treat the opaque '%' and '_'
+        // as wildcards (and fold ASCII case), while NOCASE changes page order.
+        let like_mutant: Vec<String> = conn
+            .prepare(
+                "SELECT msgId FROM message_folder_membership WHERE folderId LIKE ?1 ORDER BY msgId COLLATE BINARY",
+            )
+            .unwrap()
+            .query_map(params![folder_id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(like_mutant.contains(&"decoy:ascii-case".to_string()));
+        assert!(like_mutant.contains(&"decoy:wildcard-literal".to_string()));
+        assert_ne!(like_mutant, binary_order);
+
+        let nocase_mutant: Vec<String> = conn
+            .prepare(
+                "SELECT msgId FROM message_folder_membership WHERE folderId = ?1 ORDER BY msgId COLLATE NOCASE",
+            )
+            .unwrap()
+            .query_map(params![folder_id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_ne!(nocase_mutant, binary_order);
+    }
+
+    #[test]
+    fn test_folder_membership_page_limit_boundaries() {
+        let (conn, _known_years) = setup_test_db();
+        insert_msg_id_keys(&conn, &["assigned", "unassigned"]);
+        conn.execute(
+            "INSERT INTO message_folder_membership(msgId, folderId) VALUES ('assigned', 'folder')",
+            [],
+        )
+        .unwrap();
+
+        for limit in [1, config::sqlite::FOLDER_MEMBERSHIP_PAGE_MAX_LIMIT] {
+            assert!(list_folder_membership(&conn, "folder", None, limit).is_ok());
+            assert!(list_folder_membership_state(&conn, None, limit).is_ok());
+        }
+        let over_max = config::sqlite::FOLDER_MEMBERSHIP_PAGE_MAX_LIMIT + 1;
+        assert!(list_folder_membership(&conn, "folder", None, over_max).is_err());
+        assert!(list_folder_membership_state(&conn, None, over_max).is_err());
+    }
+
+    #[test]
+    fn test_folder_membership_state_pages_assigned_and_unassigned_rows() {
+        let (conn, _known_years) = setup_test_db();
+        conn.execute(
+            "INSERT INTO message_ids (msgId) VALUES ('assigned')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message_folder_membership (msgId, folderId) VALUES ('assigned', 'folder')",
+            [],
+        )
+        .unwrap();
+        insert_msg_id_keys(&conn, &["legacy-b", "legacy-a"]);
+
+        let first = list_folder_membership_state(&conn, None, 2).unwrap();
+        assert_eq!(
+            first["entries"],
+            serde_json::json!([
+                {"msgId": "assigned", "folderId": "folder"},
+                {"msgId": "legacy-a", "folderId": null}
+            ])
+        );
+        assert_eq!(first["done"], false);
+        let second = list_folder_membership_state(&conn, Some("legacy-a"), 2).unwrap();
+        assert_eq!(
+            second["entries"],
+            serde_json::json!([{"msgId": "legacy-b", "folderId": null}])
+        );
+        assert_eq!(second["done"], true);
+    }
+
+    #[test]
+    fn test_membership_state_cursor_survives_assignment_and_deletion_between_pages() {
+        let (mut conn, _known_years) = setup_test_db();
+        insert_msg_id_keys(&conn, &["a", "b", "c", "d"]);
+
+        let first = list_folder_membership_state(&conn, None, 2).unwrap();
+        assert_eq!(
+            first["entries"],
+            serde_json::json!([
+                {"msgId": "a", "folderId": null},
+                {"msgId": "b", "folderId": null}
+            ])
+        );
+        assert_eq!(first["done"], false);
+
+        // Mutate both sides of the cursor. The cursor is the returned msgId,
+        // not a relation-table rowid, so deleting it remains resumable; an
+        // assignment ahead of it remains visible as state rather than shifting
+        // later base rows out of the page.
+        conn.execute("DELETE FROM message_ids WHERE msgId = 'b'", [])
+            .unwrap();
+        assign_folder_membership_batch(
+            &mut conn,
+            &serde_json::json!([{"msgId": "c", "folderId": "folder"}]),
+        )
+        .unwrap();
+
+        let second = list_folder_membership_state(&conn, Some("b"), 2).unwrap();
+        assert_eq!(
+            second["entries"],
+            serde_json::json!([
+                {"msgId": "c", "folderId": "folder"},
+                {"msgId": "d", "folderId": null}
+            ])
+        );
+        assert_eq!(second["done"], false);
+        let terminal = list_folder_membership_state(&conn, Some("d"), 2).unwrap();
+        assert_eq!(terminal["entries"], serde_json::json!([]));
+        assert_eq!(terminal["done"], true);
+    }
+
+    #[test]
+    fn test_membership_state_page_bounds_archive_inspection() {
+        let (conn, _known_years) = setup_test_db();
+        const ARCHIVE_ROWS: usize = 4_096;
+        for index in 0..ARCHIVE_ROWS {
+            let msg_id = format!("archive:{index:05}");
+            conn.execute(
+                "INSERT INTO message_ids(msgId) VALUES (?1)",
+                params![msg_id],
+            )
+            .unwrap();
+            if index + 1 < ARCHIVE_ROWS {
+                conn.execute(
+                    "INSERT INTO message_folder_membership(msgId, folderId) VALUES (?1, 'assigned')",
+                    params![msg_id],
+                )
+                .unwrap();
+            }
+        }
+
+        let bounded_steps = AtomicUsize::new(0);
+        unsafe {
+            ffi::sqlite3_progress_handler(
+                conn.handle(),
+                1,
+                Some(count_vm_steps),
+                &bounded_steps as *const AtomicUsize as *mut c_void,
+            );
+        }
+        let page = list_folder_membership_state(&conn, None, 1).unwrap();
+        unsafe { ffi::sqlite3_progress_handler(conn.handle(), 0, None, std::ptr::null_mut()) };
+        assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+        let bounded_steps = bounded_steps.load(AtomicOrdering::SeqCst);
+        assert!(bounded_steps < 1_000, "bounded page used {bounded_steps} VM steps");
+
+        // Positive mutant: the removed NULL-filtering anti-join must inspect
+        // nearly the entire assigned archive to find the final unassigned row.
+        let mutant_steps = AtomicUsize::new(0);
+        unsafe {
+            ffi::sqlite3_progress_handler(
+                conn.handle(),
+                1,
+                Some(count_vm_steps),
+                &mutant_steps as *const AtomicUsize as *mut c_void,
+            );
+        }
+        let mutant_result: String = conn
+            .query_row(
+                "SELECT mi.msgId FROM message_ids mi LEFT JOIN message_folder_membership fm ON fm.msgId = mi.msgId WHERE fm.msgId IS NULL ORDER BY mi.msgId COLLATE BINARY LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        unsafe { ffi::sqlite3_progress_handler(conn.handle(), 0, None, std::ptr::null_mut()) };
+        assert_eq!(mutant_result, "archive:04095");
+        let mutant_steps = mutant_steps.load(AtomicOrdering::SeqCst);
+        assert!(
+            mutant_steps > bounded_steps * 100,
+            "anti-join mutant used {mutant_steps} steps vs bounded page {bounded_steps}"
+        );
+    }
+
+    #[test]
+    fn test_list_then_remove_batch_clears_exact_folder_relation() {
+        let (mut conn, mut known_years) = setup_test_db();
+        conn.execute_batch("CREATE TABLE messages_vec (rowid INTEGER PRIMARY KEY);")
+            .unwrap();
+        let rows = [
+            index_row("remove:a", Some("folder:opaque")),
+            index_row("remove:b", Some("folder:opaque")),
+        ];
+        assert_eq!(index_batch(&mut conn, &rows, None, &mut known_years).unwrap(), (2, 0));
+
+        let listed = list_folder_membership(&conn, "folder:opaque", None, 10).unwrap();
+        let ids = listed["msgIds"].as_array().unwrap().clone();
+        assert_eq!(remove_batch(&mut conn, &ids).unwrap(), 2);
+        assert_eq!(db_count(&conn).unwrap(), 0);
+        assert_eq!(
+            list_folder_membership(&conn, "folder:opaque", None, 10).unwrap()["msgIds"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            list_folder_membership_state(&conn, None, 10).unwrap()["entries"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn test_assign_folder_membership_batch_is_idempotent_and_conflict_atomic() {
+        let (mut conn, _known_years) = setup_test_db();
+        insert_msg_id_keys(&conn, &["a", "b", "c", "d"]);
+
+        let assigned = assign_folder_membership_batch(
+            &mut conn,
+            &serde_json::json!([
+                {"msgId": "a", "folderId": "folder:one"},
+                {"msgId": "b", "folderId": "folder:one"},
+            ]),
+        )
+        .unwrap();
+        assert_eq!(assigned, (2, 0, 0));
+
+        let idempotent = assign_folder_membership_batch(
+            &mut conn,
+            &serde_json::json!([{"msgId": "a", "folderId": "folder:one"}]),
+        )
+        .unwrap();
+        assert_eq!(idempotent, (0, 1, 0));
+
+        let mixed = assign_folder_membership_batch(
+            &mut conn,
+            &serde_json::json!([
+                {"msgId": "c", "folderId": "folder:two"},
+                {"msgId": "outside-policy-window", "folderId": "folder:two"},
+            ]),
+        )
+        .unwrap();
+        assert_eq!(mixed, (1, 0, 1));
+        assert_eq!(mixed.0 + mixed.1 + mixed.2, 2);
+
+        let conflict = assign_folder_membership_batch(
+            &mut conn,
+            &serde_json::json!([
+                {"msgId": "d", "folderId": "folder:two"},
+                {"msgId": "another-missing", "folderId": "folder:two"},
+                {"msgId": "a", "folderId": "folder:other"},
+            ]),
+        )
+        .unwrap_err();
+        assert!(conflict.to_string().contains("conflicting folderId"), "got: {conflict}");
+        assert_eq!(folder_id(&conn, "d"), None, "whole assignment batch must roll back");
+
+        let missing = assign_folder_membership_batch(
+            &mut conn,
+            &serde_json::json!([{"msgId": "missing", "folderId": "folder"}]),
+        )
+        .unwrap();
+        assert_eq!(missing, (0, 0, 1));
+
+        for invalid in [
+            serde_json::json!("not-an-array"),
+            serde_json::json!([{"folderId": "folder"}]),
+            serde_json::json!([{"msgId": "a", "folderId": ""}]),
+        ] {
+            let error = assign_folder_membership_batch(&mut conn, &invalid).unwrap_err();
+            assert!(
+                error.to_string().contains("array")
+                    || error.to_string().contains("msgId")
+                    || error.to_string().contains("folderId"),
+                "got: {error}"
+            );
+        }
+
+        let oversized = Value::Array(
+            (0..=config::sqlite::ASSIGN_FOLDER_MEMBERSHIP_BATCH_MAX)
+                .map(|index| {
+                    serde_json::json!({
+                        "msgId": format!("message-{index}"),
+                        "folderId": "folder"
+                    })
+                })
+                .collect(),
+        );
+        let error = assign_folder_membership_batch(&mut conn, &oversized).unwrap_err();
+        assert!(error.to_string().contains("maximum batch size"), "got: {error}");
+    }
+
+    #[test]
+    fn test_assign_folder_membership_batch_size_boundaries() {
+        let (mut conn, _known_years) = setup_test_db();
+
+        let empty_error = assign_folder_membership_batch(&mut conn, &serde_json::json!([]))
+            .unwrap_err();
+        assert!(
+            empty_error.to_string().contains("at least one"),
+            "got: {empty_error}"
+        );
+
+        let max = config::sqlite::ASSIGN_FOLDER_MEMBERSHIP_BATCH_MAX;
+        let msg_ids: Vec<String> = (0..max).map(|index| format!("boundary:{index:04}")).collect();
+        for msg_id in &msg_ids {
+            conn.execute(
+                "INSERT INTO message_ids(msgId) VALUES (?1)",
+                params![msg_id],
+            )
+            .unwrap();
+        }
+
+        let one = serde_json::json!([{"msgId": msg_ids[0], "folderId": "folder:one"}]);
+        assert_eq!(assign_folder_membership_batch(&mut conn, &one).unwrap(), (1, 0, 0));
+
+        let exact_max = Value::Array(
+            msg_ids
+                .iter()
+                .map(|msg_id| serde_json::json!({"msgId": msg_id, "folderId": "folder:max"}))
+                .collect(),
+        );
+        let conflict = assign_folder_membership_batch(&mut conn, &exact_max).unwrap_err();
+        assert!(conflict.to_string().contains("conflicting folderId"));
+
+        // Use a fresh database so exactly max assignments can all adopt.
+        let (mut exact_conn, _known_years) = setup_test_db();
+        for msg_id in &msg_ids {
+            exact_conn
+                .execute(
+                    "INSERT INTO message_ids(msgId) VALUES (?1)",
+                    params![msg_id],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            assign_folder_membership_batch(&mut exact_conn, &exact_max).unwrap(),
+            (max as i64, 0, 0)
+        );
+
+        let over_max = Value::Array(
+            (0..=max)
+                .map(|index| {
+                    serde_json::json!({"msgId": format!("over:{index}"), "folderId": "folder"})
+                })
+                .collect(),
+        );
+        let over_max_error = assign_folder_membership_batch(&mut exact_conn, &over_max).unwrap_err();
+        assert!(
+            over_max_error.to_string().contains("maximum batch size"),
+            "got: {over_max_error}"
+        );
     }
 
     /// Folder range bounds the addon computes: start = prefix, end = prefix

@@ -7,7 +7,7 @@
 Integration tests for the multi-threaded reader/writer dispatch (0.8.0).
 
 Tests verify:
-  1. schemaVersion is present in hello response
+  1. schemaVersion and additive capabilities are present in hello response
   2. Reader thread handles search/stats/filterNewMessages correctly after init
   3. Writer thread handles indexBatch/removeBatch correctly after init
   4. Concurrent dispatch: interleaved read/write calls all return correct responses
@@ -25,6 +25,7 @@ Run:
 import json
 import os
 import shutil
+import sqlite3
 import struct
 import subprocess
 import tempfile
@@ -122,6 +123,12 @@ class TestMultiThreadedDispatch(unittest.TestCase):
             proc.wait(timeout=10)
         except Exception:
             proc.kill()
+            proc.wait(timeout=10)
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Test 1: schemaVersion in hello response
@@ -137,8 +144,8 @@ class TestMultiThreadedDispatch(unittest.TestCase):
             self.assertIsInstance(result["schemaVersion"], int)
             self.assertGreaterEqual(result["schemaVersion"], 1)
 
-            # Also verify hostVersion is 0.8.0
-            self.assertEqual(result["hostVersion"], "0.8.0")
+            self.assertRegex(result["hostVersion"], r"^\d+\.\d+\.\d+$")
+            self.assertTrue(result["capabilities"]["folderMembershipV1"])
         finally:
             self._stop_process(proc)
 
@@ -294,6 +301,7 @@ class TestMultiThreadedDispatch(unittest.TestCase):
             rows = [
                 {
                     "msgId": f"mt-clear-{i}-{ts}",
+                    "folderId": "account:/ClearTest",
                     "subject": f"Test email {i}",
                     "from_": f"user{i}@test.com",
                     "to_": "team@test.com",
@@ -323,6 +331,22 @@ class TestMultiThreadedDispatch(unittest.TestCase):
             resp = _read_message(proc)
             self.assertIn("result", resp, f"stats after clear failed: {resp}")
             self.assertEqual(resp["result"]["docs"], 0, "Reader should see 0 docs after clear")
+
+            _send_message(proc, {
+                "id": "c4-membership",
+                "method": "listFolderMembership",
+                "params": {"folderId": "account:/ClearTest", "limit": 10},
+            })
+            resp = _read_message(proc)
+            self.assertEqual(resp["result"]["msgIds"], [])
+
+            _send_message(proc, {
+                "id": "c4-membership-state",
+                "method": "listFolderMembershipState",
+                "params": {"limit": 10},
+            })
+            resp = _read_message(proc)
+            self.assertEqual(resp["result"]["entries"], [])
 
             # Search after clear
             _send_message(proc, {"id": "c5", "method": "search", "params": {"q": "test", "limit": 10}})
@@ -472,6 +496,136 @@ class TestMultiThreadedDispatch(unittest.TestCase):
                 self.assertTrue("result" in resp or "error" not in resp,
                                 f"Response {rid} has error: {resp.get('error')}")
 
+        finally:
+            self._stop_process(proc)
+
+    def test_exact_folder_membership_workflow(self):
+        """Fresh writes, legacy adoption, exact reads, and conflicts share one protocol contract."""
+        proc = self._start_process()
+        try:
+            self._hello_and_init(proc)
+            timestamp = str(int(time.time() * 1000))
+            fresh_id = f"membership-fresh-{timestamp}"
+            legacy_id = f"membership-legacy-{timestamp}"
+
+            rows = [
+                {
+                    "msgId": fresh_id,
+                    "folderId": "account:/Client:Acme",
+                    "subject": "fresh membership",
+                    "from_": "sender@test.com",
+                    "to_": "recipient@test.com",
+                    "body": "body",
+                    "dateMs": 1700000000000,
+                    "hasAttachments": False,
+                },
+                {
+                    "msgId": legacy_id,
+                    "subject": "legacy membership",
+                    "from_": "sender@test.com",
+                    "to_": "recipient@test.com",
+                    "body": "body",
+                    "dateMs": 1700000000000,
+                    "hasAttachments": False,
+                },
+            ]
+            _send_message(proc, {"id": "fm-index", "method": "indexBatch", "params": {"rows": rows}})
+            response = _read_message(proc)
+            self.assertEqual(response["result"]["count"], 2)
+
+            _send_message(proc, {
+                "id": "fm-fresh-list",
+                "method": "listFolderMembership",
+                "params": {"folderId": "account:/Client:Acme", "limit": 10},
+            })
+            response = _read_message(proc)
+            self.assertEqual(response["result"]["msgIds"], [fresh_id])
+
+            _send_message(proc, {
+                "id": "fm-state",
+                "method": "listFolderMembershipState",
+                "params": {"limit": 10},
+            })
+            response = _read_message(proc)
+            self.assertEqual(response["result"]["entries"], [
+                {"msgId": fresh_id, "folderId": "account:/Client:Acme"},
+                {"msgId": legacy_id, "folderId": None},
+            ])
+
+            _send_message(proc, {
+                "id": "fm-assign",
+                "method": "assignFolderMembershipBatch",
+                "params": {"assignments": [{"msgId": legacy_id, "folderId": "account:/Archive"}]},
+            })
+            response = _read_message(proc)
+            self.assertEqual(response["result"]["assigned"], 1)
+            self.assertEqual(response["result"]["alreadyAssigned"], 0)
+            self.assertEqual(response["result"]["missing"], 0)
+
+            _send_message(proc, {
+                "id": "fm-list",
+                "method": "listFolderMembership",
+                "params": {"folderId": "account:/Archive", "limit": 10},
+            })
+            response = _read_message(proc)
+            self.assertEqual(response["result"]["msgIds"], [legacy_id])
+            self.assertTrue(response["result"]["done"])
+
+            _send_message(proc, {
+                "id": "fm-conflict",
+                "method": "indexBatch",
+                "params": {"rows": [{"msgId": legacy_id, "folderId": "account:/Other"}]},
+            })
+            response = _read_message(proc)
+            self.assertIn("error", response)
+            self.assertIn("conflicting folderId", response["error"])
+        finally:
+            self._stop_process(proc)
+
+    def test_existing_sharded_database_adds_empty_membership_relation(self):
+        """An old nonempty database gets constant-size relation DDL without a content refeed."""
+        legacy_id = f"membership-upgrade-{int(time.time() * 1000)}"
+        proc = self._start_process()
+        try:
+            self._hello_and_init(proc)
+            _send_message(proc, {
+                "id": "upgrade-index",
+                "method": "indexBatch",
+                "params": {"rows": [{
+                    "msgId": legacy_id,
+                    "subject": "legacy row",
+                    "from_": "sender@test.com",
+                    "to_": "recipient@test.com",
+                    "body": "body",
+                    "dateMs": 1700000000000,
+                    "hasAttachments": False,
+                }]},
+            })
+            response = _read_message(proc)
+            self.assertEqual(response["result"]["count"], 1)
+        finally:
+            self._stop_process(proc)
+
+        db_path = Path(self.temp_dir) / "tabmail_fts" / "fts.db"
+        with sqlite3.connect(db_path) as connection:
+            connection.execute("DROP TABLE message_folder_membership")
+
+        proc = self._start_process()
+        try:
+            self._hello_and_init(proc)
+            _send_message(proc, {
+                "id": "upgrade-state",
+                "method": "listFolderMembershipState",
+                "params": {"limit": 10},
+            })
+            response = _read_message(proc)
+            self.assertEqual(response["result"]["entries"], [
+                {"msgId": legacy_id, "folderId": None},
+            ])
+
+            _send_message(proc, {"id": "upgrade-stats", "method": "stats", "params": {}})
+            response = _read_message(proc)
+            self.assertEqual(response["result"]["docs"], 1)
         finally:
             self._stop_process(proc)
 

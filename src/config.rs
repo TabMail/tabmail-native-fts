@@ -64,6 +64,11 @@ pub mod sqlite {
     /// Default page size for `listMsgIdRange` when the caller omits `limit`
     /// (the addon normally passes its own FOLDER_RECON_KEYS_CHUNK).
     pub const LIST_MSG_ID_RANGE_DEFAULT_LIMIT: i64 = 500;
+    /// Folder-membership reconciliation is unbounded overall and advances through
+    /// bounded pages so each reader request remains responsive.
+    pub const FOLDER_MEMBERSHIP_PAGE_DEFAULT_LIMIT: i64 = 500;
+    pub const FOLDER_MEMBERSHIP_PAGE_MAX_LIMIT: i64 = 2_000;
+    pub const ASSIGN_FOLDER_MEMBERSHIP_BATCH_MAX: usize = 1_000;
 
     // Year-based FTS sharding
     pub const SHARD_MIN_YEAR: i32 = 2000;

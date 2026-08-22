@@ -2,7 +2,7 @@
 
 > **Native FTS specific knowledge.** Claude reads this before every task and updates it when discovering something new. For cross-cutting knowledge, see `../PROJECT_MEMORY.md`.
 
-**Last updated:** 2026-02-23
+**Last updated:** 2026-08-22
 
 ---
 
@@ -50,10 +50,14 @@ Native messaging host for full-text search + semantic search. Communicates with 
 | Method dispatch | `classify_method()` in main.rs |
 | Reader/writer threads | Spawned after `init` in main.rs |
 | Folder-key digest RPC | `fingerprint_msg_id_range()` in `src/fts/db.rs` |
+| Exact folder relation RPCs | `list_folder_membership()`, `list_folder_membership_state()`, `assign_folder_membership_batch()` in `src/fts/db.rs` |
 
 ---
 
 ## Recent Discoveries
+
+### 2026-08-22
+- Added capability `folderMembershipV1` and an additive `message_folder_membership(msgId, folderId)` relation with covering `(folderId, msgId)` index. Creating the initially empty relation is constant-size startup DDL; existing archives are not scanned. `indexBatch` accepts optional opaque `folderId`; duplicate rows adopt an absent relation, accept the same value idempotently, and reject a different value transactionally. `listFolderMembership` provides exact BINARY pages for incremental client-side digests. `listFolderMembershipState` pages the global `message_ids` keyspace before joining optional membership, bounding inspected archive rows as well as returned rows. `assignFolderMembershipBatch` reports assigned/alreadyAssigned/missing (outside-policy live messages are missing no-ops) while ownership conflicts remain atomic. Reconciliation is stateless and unbounded overall across bounded calls. Existing msgId keys and range RPCs remain unchanged. `SCHEMA_VERSION` stays 1 because the relation migrates in place and no Thunderbird re-feed is needed (ADR-NF-004).
 
 ### 2026-08-13
 - Native FTS 0.11.2 retires the pre-rotation update-signing public key from the compiled verifier. v0.11.1 remains the one-release dual-key bridge; clients that missed it recover through Thunderbird 1.7.2+'s unsupported-helper reinstall prompt. `scripts/check-update-signing-policy.py` makes the release fail if the compiled trust set differs from the active + explicitly transitional keys in `release/update-signing-policy.json`, or if a key remains trusted at/after its `firstUntrustedVersion`.

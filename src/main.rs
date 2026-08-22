@@ -149,14 +149,16 @@ fn classify_method(method: &str) -> MethodTarget {
         // Read-only email operations
         "search" | "stats" | "filterNewMessages" | "getMessageByMsgId"
         | "findByHeaderMessageId" | "queryByDateRange" | "debugSample"
-        | "countMsgIdRange" | "fingerprintMsgIdRange" | "listMsgIdRange" => MethodTarget::Reader,
+        | "countMsgIdRange" | "fingerprintMsgIdRange" | "listMsgIdRange"
+        | "listFolderMembership" | "listFolderMembershipState" => MethodTarget::Reader,
 
         // Read-only memory operations
         "memorySearch" | "memoryStats" | "memoryDebugSample" | "memoryRead" => MethodTarget::Reader,
 
         // Write email operations
         "indexBatch" | "removeBatch" | "optimize" | "clear"
-        | "rebuildEmbeddingsStart" | "rebuildEmbeddingsBatch" => MethodTarget::Writer,
+        | "rebuildEmbeddingsStart" | "rebuildEmbeddingsBatch"
+        | "assignFolderMembershipBatch" => MethodTarget::Writer,
 
         // Write memory operations
         "memoryIndexBatch" | "memoryRemoveBatch" | "memoryClear" => MethodTarget::Writer,
@@ -495,6 +497,28 @@ fn handle_read_request(
             let res = crate::fts::db::list_msg_id_range(email_conn, start_key, end_key, after_key, limit)?;
             Ok(serde_json::json!({ "id": msg_id, "result": res }))
         }
+        "listFolderMembership" => {
+            let folder_id = required_nonempty_string(params, "folderId")?;
+            let after_msg_id = optional_string(params, "afterMsgId")?;
+            let limit = folder_membership_page_limit(params)?;
+            let res = crate::fts::db::list_folder_membership(
+                email_conn,
+                folder_id,
+                after_msg_id,
+                limit,
+            )?;
+            Ok(serde_json::json!({ "id": msg_id, "result": res }))
+        }
+        "listFolderMembershipState" => {
+            let after_msg_id = optional_string(params, "afterMsgId")?;
+            let limit = folder_membership_page_limit(params)?;
+            let res = crate::fts::db::list_folder_membership_state(
+                email_conn,
+                after_msg_id,
+                limit,
+            )?;
+            Ok(serde_json::json!({ "id": msg_id, "result": res }))
+        }
         "queryByDateRange" => {
             let from_v = params.get("from").context("from and to parameters are required")?;
             let to_v = params.get("to").context("from and to parameters are required")?;
@@ -629,6 +653,22 @@ fn handle_write_request(
                 .unwrap_or_default();
             let removed = crate::fts::db::remove_batch(email_conn, &ids)?;
             Ok(serde_json::json!({ "id": msg_id, "result": { "ok": true, "count": removed } }))
+        }
+        "assignFolderMembershipBatch" => {
+            let assignments = params
+                .get("assignments")
+                .context("assignments parameter is required and must be an array")?;
+            let (assigned, already_assigned, missing) =
+                crate::fts::db::assign_folder_membership_batch(email_conn, assignments)?;
+            Ok(serde_json::json!({
+                "id": msg_id,
+                "result": {
+                    "ok": true,
+                    "assigned": assigned,
+                    "alreadyAssigned": already_assigned,
+                    "missing": missing
+                }
+            }))
         }
         "optimize" => {
             crate::fts::db::optimize(email_conn, known_years)?;
@@ -766,6 +806,7 @@ fn handle_hello(msg_id: &str, params: &Value) -> anyhow::Result<Value> {
             "hostImpl": "rust",
             "hostVersion": config::HOST_VERSION,
             "schemaVersion": config::SCHEMA_VERSION,
+            "capabilities": hello_capabilities(),
             "installPath": current_path.to_string_lossy(),
             "isUserInstall": is_user_install,
             "isSystemInstall": is_system_install,
@@ -774,6 +815,37 @@ fn handle_hello(msg_id: &str, params: &Value) -> anyhow::Result<Value> {
             "addonVersion": addon_version
         }
     }))
+}
+
+fn hello_capabilities() -> Value {
+    serde_json::json!({
+        "folderMembershipV1": true
+    })
+}
+
+fn required_nonempty_string<'a>(params: &'a Value, name: &str) -> anyhow::Result<&'a str> {
+    params
+        .get(name)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("{name} parameter is required and must be a non-empty string"))
+}
+
+fn optional_string<'a>(params: &'a Value, name: &str) -> anyhow::Result<Option<&'a str>> {
+    match params.get(name) {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.as_str())),
+        Some(_) => anyhow::bail!("{name} parameter must be a string when present"),
+    }
+}
+
+fn folder_membership_page_limit(params: &Value) -> anyhow::Result<i64> {
+    match params.get("limit") {
+        None => Ok(config::sqlite::FOLDER_MEMBERSHIP_PAGE_DEFAULT_LIMIT),
+        Some(value) => value
+            .as_i64()
+            .context("limit parameter must be an integer"),
+    }
 }
 
 fn handle_update_check(msg_id: &str, params: &Value) -> anyhow::Result<Value> {
@@ -1092,7 +1164,14 @@ mod tests {
     fn test_conns() -> (Connection, Connection) {
         let email = Connection::open_in_memory().unwrap();
         email
-            .execute_batch("CREATE TABLE IF NOT EXISTS message_ids (msgId TEXT PRIMARY KEY);")
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS message_ids (msgId TEXT PRIMARY KEY);\
+                 CREATE TABLE IF NOT EXISTS message_folder_membership (\
+                     msgId TEXT PRIMARY KEY, folderId TEXT NOT NULL\
+                 ) WITHOUT ROWID;\
+                 CREATE INDEX idx_message_folder_membership_folder_msg \
+                     ON message_folder_membership(folderId, msgId);",
+            )
             .unwrap();
         let memory = Connection::open_in_memory().unwrap();
         (email, memory)
@@ -1105,6 +1184,23 @@ mod tests {
                 rusqlite::params![key],
             )
             .unwrap();
+        }
+    }
+
+    fn insert_memberships(conn: &Connection, rows: &[(&str, Option<&str>)]) {
+        for (msg_id, folder_id) in rows {
+            conn.execute(
+                "INSERT INTO message_ids (msgId) VALUES (?1)",
+                rusqlite::params![msg_id],
+            )
+            .unwrap();
+            if let Some(folder_id) = folder_id {
+                conn.execute(
+                    "INSERT INTO message_folder_membership (msgId, folderId) VALUES (?1, ?2)",
+                    rusqlite::params![msg_id, folder_id],
+                )
+                .unwrap();
+            }
         }
     }
 
@@ -1128,12 +1224,188 @@ mod tests {
         )
     }
 
+    fn dispatch_write(
+        email: &mut Connection,
+        memory: &mut Connection,
+        method: &str,
+        params: Value,
+    ) -> anyhow::Result<Value> {
+        let mut known_years = HashSet::new();
+        let email_reopen = AtomicBool::new(false);
+        let memory_reopen = AtomicBool::new(false);
+        handle_write_request(
+            email,
+            memory,
+            &mut known_years,
+            Path::new("/nonexistent/email.db"),
+            Path::new("/nonexistent/memory.db"),
+            None,
+            &email_reopen,
+            &memory_reopen,
+            method,
+            "test-write-1",
+            &params,
+        )
+    }
+
     #[test]
     fn test_classify_method_routes_range_rpcs_to_reader() {
         assert!(matches!(classify_method("countMsgIdRange"), MethodTarget::Reader));
         assert!(matches!(classify_method("fingerprintMsgIdRange"), MethodTarget::Reader));
         assert!(matches!(classify_method("listMsgIdRange"), MethodTarget::Reader));
+        assert!(matches!(classify_method("listFolderMembership"), MethodTarget::Reader));
+        assert!(matches!(classify_method("listFolderMembershipState"), MethodTarget::Reader));
+        assert!(matches!(classify_method("assignFolderMembershipBatch"), MethodTarget::Writer));
+        assert!(matches!(classify_method("fingerprintFolderMembership"), MethodTarget::Unknown));
+        assert!(matches!(classify_method("listUnassignedFolderMembership"), MethodTarget::Unknown));
         assert!(matches!(classify_method("noSuchMethod"), MethodTarget::Unknown));
+    }
+
+    #[test]
+    fn test_hello_advertises_folder_membership_v1() {
+        assert_eq!(hello_capabilities()["folderMembershipV1"], true);
+    }
+
+    #[test]
+    fn test_dispatch_exact_folder_membership_rpcs_and_validation() {
+        let (email, memory) = test_conns();
+        insert_memberships(
+            &email,
+            &[
+                ("b", Some("folder:parent")),
+                ("a", Some("folder:parent")),
+                ("child", Some("folder:parent:child")),
+                ("legacy", None),
+            ],
+        );
+
+        let listed = dispatch_read(
+            &email,
+            &memory,
+            "listFolderMembership",
+            serde_json::json!({"folderId": "folder:parent", "limit": 10}),
+        )
+        .unwrap();
+        assert_eq!(listed["result"]["msgIds"], serde_json::json!(["a", "b"]));
+
+        let state = dispatch_read(
+            &email,
+            &memory,
+            "listFolderMembershipState",
+            serde_json::json!({}),
+        )
+        .unwrap();
+        assert_eq!(
+            state["result"]["entries"],
+            serde_json::json!([
+                {"msgId": "a", "folderId": "folder:parent"},
+                {"msgId": "b", "folderId": "folder:parent"},
+                {"msgId": "child", "folderId": "folder:parent:child"},
+                {"msgId": "legacy", "folderId": null}
+            ])
+        );
+
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"folderId": ""}),
+            serde_json::json!({"folderId": 42}),
+        ] {
+            let error = dispatch_read(
+                &email,
+                &memory,
+                "listFolderMembership",
+                invalid,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("folderId"), "got: {error}");
+        }
+
+        for invalid_limit in [
+            serde_json::json!(0),
+            serde_json::json!(config::sqlite::FOLDER_MEMBERSHIP_PAGE_MAX_LIMIT + 1),
+            serde_json::json!("invalid"),
+        ] {
+            let error = dispatch_read(
+                &email,
+                &memory,
+                "listFolderMembershipState",
+                serde_json::json!({"limit": invalid_limit}),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("limit"), "got: {error}");
+        }
+
+        let error = dispatch_read(
+            &email,
+            &memory,
+            "listFolderMembershipState",
+            serde_json::json!({"afterMsgId": 42}),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("afterMsgId"), "got: {error}");
+    }
+
+    #[test]
+    fn test_dispatch_assign_folder_membership_batch_contract() {
+        let (mut email, mut memory) = test_conns();
+        insert_keys(&email, &["legacy"]);
+
+        let response = dispatch_write(
+            &mut email,
+            &mut memory,
+            "assignFolderMembershipBatch",
+            serde_json::json!({
+                "assignments": [{"msgId": "legacy", "folderId": "folder:opaque"}]
+            }),
+        )
+        .unwrap();
+        assert_eq!(response["result"]["assigned"], 1);
+        assert_eq!(response["result"]["alreadyAssigned"], 0);
+        assert_eq!(response["result"]["missing"], 0);
+
+        let response = dispatch_write(
+            &mut email,
+            &mut memory,
+            "assignFolderMembershipBatch",
+            serde_json::json!({
+                "assignments": [{"msgId": "legacy", "folderId": "folder:opaque"}]
+            }),
+        )
+        .unwrap();
+        assert_eq!(response["result"]["assigned"], 0);
+        assert_eq!(response["result"]["alreadyAssigned"], 1);
+        assert_eq!(response["result"]["missing"], 0);
+
+        let response = dispatch_write(
+            &mut email,
+            &mut memory,
+            "assignFolderMembershipBatch",
+            serde_json::json!({
+                "assignments": [{"msgId": "outside-policy", "folderId": "folder:opaque"}]
+            }),
+        )
+        .unwrap();
+        assert_eq!(response["result"]["assigned"], 0);
+        assert_eq!(response["result"]["alreadyAssigned"], 0);
+        assert_eq!(response["result"]["missing"], 1);
+
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"assignments": "invalid"}),
+            serde_json::json!({"assignments": [{"msgId": "legacy", "folderId": ""}]}),
+        ] {
+            let error = dispatch_write(
+                &mut email,
+                &mut memory,
+                "assignFolderMembershipBatch",
+                invalid,
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("assignments") || error.to_string().contains("folderId"),
+                "got: {error}"
+            );
+        }
     }
 
     #[test]
