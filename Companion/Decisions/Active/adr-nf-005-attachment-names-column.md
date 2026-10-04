@@ -19,12 +19,26 @@ unreachable by that name. The owner weighed putting the names in an existing col
 2. `indexBatch` reads an optional string field `attachmentNames` (newline-separated text
    the add-on builds from the downloaded MIME tree). It is not capability-gated: an older
    helper ignores the unknown field, and an older add-on leaves the column empty.
-3. Existing shards migrate **in place** under ADR-024's pattern. `rebuild_stale_shards`
-   (renamed from `rebuild_stale_tokenizer_shards`) treats a shard as stale when its CREATE
-   statement still carries `tokenchars` **or** `PRAGMA table_info` lacks `attachmentNames`.
-   It rebuilds with a rowid-preserving `INSERT .. SELECT`, one transaction per shard, newest
-   year first, inside the existing 45 s init budget. Leftover shards convert on the next
-   init. `SCHEMA_VERSION` stays at 1, so Thunderbird does not re-feed any mail.
+3. Existing shards migrate **in place** with ADR-024's copy, but **on the writer thread, not
+   in `init`** (amends ADR-024's "inside init under a 45 s budget"). A shard is stale when
+   its CREATE statement still carries `tokenchars` **or** `PRAGMA table_info` lacks
+   `attachmentNames`. Whenever the writer has no request waiting, `rebuild_next_stale_shard`
+   rebuilds the newest stale shard with a rowid-preserving `INSERT .. SELECT` in one
+   transaction, then the writer checks for requests again. `SCHEMA_VERSION` stays at 1, so
+   Thunderbird does not re-feed any mail.
+   - Why not in `init`: the budget was checked only between shards, so one large shard
+     (85k rows measured at 64 s on an M1 Pro) ran past the add-on's 60 s init RPC timeout.
+     A timed-out init disconnects, Thunderbird kills the helper 3 s later, the shard rolls
+     back, and the next start repeats it — search permanently down (review round 1,
+     2026-10-04). On the writer, init answers at once; a timeout on an ordinary RPC does
+     not disconnect.
+   - A write that arrives mid-shard waits for that shard (it may time out in the add-on
+     once and be retried; `indexBatch` is idempotent). Reads keep working throughout (WAL
+     snapshot of the old table until the swap commits).
+   - Each shard is attempted at most once per process; a failure is logged and retried on
+     the next start, so a broken shard cannot keep the writer busy. Every start makes
+     progress, so the migration converges unless a single shard takes longer than a whole
+     Thunderbird session.
 4. Until a shard converts, writes to it omit the column and drop that row's names, and
    reads return `""`. Search keeps working across mixed shards: `bm25()` ignores the extra
    weight on a seven-column shard, and no query names the column.
@@ -45,8 +59,9 @@ unreachable by that name. The owner weighed putting the names in an existing col
 
 ## Consequences
 
-- First start after upgrade rebuilds every shard once (CPU and a temporary second copy of
-  one shard on disk). This is the same one-time cost the 2026-06 tokenizer migration had.
-- A row written to a not-yet-converted shard loses its names for good. This only affects
-  older-year shards on archives too large to convert within one init.
+- After upgrade the writer rebuilds every shard once in the background (CPU, and a temporary
+  second copy of one shard on disk), the same one-time cost as the 2026-06 tokenizer
+  migration, but no longer on the startup path.
+- A row written to a not-yet-converted shard loses its names for good. Newest shard first
+  keeps this window short for new mail.
 - iOS has its own index and is unchanged.

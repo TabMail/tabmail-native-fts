@@ -12,7 +12,7 @@ pub const HOST_VERSION: &str = "0.11.4";
 /// from Thunderbird (the addon re-feeds every message through native messaging —
 /// hours on big archives; see nativeEngine.js checkSchemaVersionChange). DB schema
 /// and FTS tokenizer changes must instead migrate IN PLACE host-side whenever the
-/// FTS tables still hold the content (see db.rs rebuild_stale_shards —
+/// FTS tables still hold the content (see db.rs rebuild_next_stale_shard —
 /// the 2026-06 tokenchars drop migrated this way with NO version bump).
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -51,11 +51,6 @@ pub mod sqlite {
     /// the in-place shard rebuild in db.rs (NO SCHEMA_VERSION bump — see above).
     /// Keep in lockstep with tabmail-ios SearchConfig.ftsTokenize.
     pub const FTS_TOKENIZE: &str = "porter unicode61 remove_diacritics 2";
-
-    /// Per-init time budget for the in-place tokenizer shard rebuild. Must stay
-    /// comfortably under the addon's 60s native RPC timeout (nativeEngine.js
-    /// RPC_TIMEOUT_MS); shards left over convert on the next init.
-    pub const RETOKENIZE_TIME_BUDGET_SECS: u64 = 45;
 
     pub const SEARCH_DEFAULT_LIMIT: i64 = 50;
     pub const SEARCH_SNIPPET_TOKENS: i64 = 16;

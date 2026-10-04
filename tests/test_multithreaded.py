@@ -629,6 +629,84 @@ class TestMultiThreadedDispatch(unittest.TestCase):
         finally:
             self._stop_process(proc)
 
+    def test_writer_converts_a_shard_without_attachment_names_after_init(self):
+        """Init answers at once; the idle writer then adds the attachmentNames column in place."""
+        legacy_id = f"names-upgrade-{int(time.time() * 1000)}"
+        proc = self._start_process()
+        try:
+            self._hello_and_init(proc)
+            _send_message(proc, {
+                "id": "names-index-old",
+                "method": "indexBatch",
+                "params": {"rows": [{
+                    "msgId": legacy_id,
+                    "subject": "legacy statement",
+                    "from_": "sender@test.com",
+                    "body": "body",
+                    "dateMs": 1700000000000,
+                }]},
+            })
+            self.assertEqual(_read_message(proc)["result"]["count"], 1)
+        finally:
+            self._stop_process(proc)
+
+        # Recreate the shard in the schema every install had before the column.
+        db_path = Path(self.temp_dir) / "tabmail_fts" / "fts.db"
+        columns = "msgId, subject, from_, to_, cc, bcc, body"
+        with sqlite3.connect(db_path) as connection:
+            create_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'messages_fts_2023'"
+            ).fetchone()[0]
+            tokenize = create_sql.split('tokenize = "')[1].split('"')[0]
+            connection.execute(
+                f"CREATE VIRTUAL TABLE legacy USING fts5({columns}, tokenize = \"{tokenize}\", prefix = '2 3 4')"
+            )
+            connection.execute(f"INSERT INTO legacy(rowid, {columns}) SELECT rowid, {columns} FROM messages_fts_2023")
+            connection.execute("DROP TABLE messages_fts_2023")
+            connection.execute("ALTER TABLE legacy RENAME TO messages_fts_2023")
+
+        def shard_columns():
+            with sqlite3.connect(db_path) as connection:
+                return [row[1] for row in connection.execute("PRAGMA table_info(messages_fts_2023)")]
+
+        self.assertNotIn("attachmentNames", shard_columns())
+
+        proc = self._start_process()
+        try:
+            self._hello_and_init(proc)
+            deadline = time.time() + 30
+            while "attachmentNames" not in shard_columns():
+                self.assertLess(time.time(), deadline, "idle writer never converted the shard")
+                time.sleep(0.1)
+
+            _send_message(proc, {
+                "id": "names-index-new",
+                "method": "indexBatch",
+                "params": {"rows": [{
+                    "msgId": f"{legacy_id}-new",
+                    "subject": "new mail",
+                    "from_": "sender@test.com",
+                    "body": "body",
+                    "dateMs": 1700000000000,
+                    "attachmentNames": "Quarterly-Statement.pdf",
+                }] + [{
+                    # Unrelated mail, so the search term is rare enough to score.
+                    "msgId": f"{legacy_id}-other{i}",
+                    "subject": "lunch plans",
+                    "from_": "friend@test.com",
+                    "body": "see you at noon",
+                    "dateMs": 1700000000000,
+                } for i in range(8)]},
+            })
+            self.assertEqual(_read_message(proc)["result"]["count"], 9)
+
+            _send_message(proc, {"id": "names-search", "method": "search", "params": {"q": "statement", "ignoreDate": True}})
+            response = _read_message(proc)
+            hits = sorted(hit["uniqueId"] for hit in response["result"])
+            self.assertEqual(hits, [legacy_id, f"{legacy_id}-new"])
+        finally:
+            self._stop_process(proc)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

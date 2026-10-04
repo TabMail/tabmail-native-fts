@@ -597,7 +597,30 @@ fn writer_thread_main(
 ) {
     log::info!("[writer] Thread started");
 
-    while let Ok(msg) = rx.recv() {
+    let mut attempted_shards: HashSet<i32> = HashSet::new();
+    let mut shards_left = true;
+    loop {
+        let msg = match rx.try_recv() {
+            Ok(msg) => msg,
+            Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {
+                // Idle: convert one stale shard, then look for requests again.
+                if shards_left {
+                    match crate::fts::db::rebuild_next_stale_shard(&mut email_conn, &mut attempted_shards) {
+                        Ok(true) => continue,
+                        Ok(false) => shards_left = false,
+                        Err(e) => {
+                            log::error!("[writer] Shard migration stopped until next start: {:?}", e);
+                            shards_left = false;
+                        }
+                    }
+                }
+                match rx.recv() {
+                    Ok(msg) => msg,
+                    Err(_) => break,
+                }
+            }
+        };
         let engine_ref = engine.as_deref();
         let resp = handle_write_request(
             &mut email_conn,
