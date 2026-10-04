@@ -67,6 +67,7 @@ main thread (stdin reader + dispatcher)
     └── writer thread (write: indexBatch, membership adoption, removeBatch, clear)
         └── owns rusqlite::Connection
         └── signals reader via AtomicBool on clear/memoryClear
+        └── while idle, converts stale year shards one at a time (ADR-NF-005)
 
 Shared: EmbeddingEngine (Arc), SynonymLookup (Arc), Stdout (Arc<Mutex>)
 ```

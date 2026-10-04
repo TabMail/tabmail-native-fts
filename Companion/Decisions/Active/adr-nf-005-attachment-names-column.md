@@ -32,9 +32,13 @@ unreachable by that name. The owner weighed putting the names in an existing col
      back, and the next start repeats it — search permanently down (review round 1,
      2026-10-04). On the writer, init answers at once; a timeout on an ordinary RPC does
      not disconnect.
-   - A write that arrives mid-shard waits for that shard (it may time out in the add-on
-     once and be retried; `indexBatch` is idempotent). Reads keep working throughout (WAL
-     snapshot of the old table until the swap commits).
+   - A write that arrives mid-shard waits for that shard, never longer (`next_write_request`
+     in `main.rs` checks the queue between shards). On a very large shard the add-on's call
+     may time out while the helper still runs the write later, in order. `indexBatch` is
+     idempotent; a remove-then-re-add pair must send the re-add even when the remove call
+     failed (the add-on's `readdStaleAttachmentRows` does), or a late remove leaves the rows
+     deleted. Reads keep working throughout (WAL snapshot of the old table until the swap
+     commits).
    - Each shard is attempted at most once per process; a failure is logged and retried on
      the next start, so a broken shard cannot keep the writer busy. Every start makes
      progress, so the migration converges unless a single shard takes longer than a whole
