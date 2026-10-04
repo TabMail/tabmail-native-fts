@@ -12,7 +12,7 @@ pub const HOST_VERSION: &str = "0.11.4";
 /// from Thunderbird (the addon re-feeds every message through native messaging —
 /// hours on big archives; see nativeEngine.js checkSchemaVersionChange). DB schema
 /// and FTS tokenizer changes must instead migrate IN PLACE host-side whenever the
-/// FTS tables still hold the content (see db.rs rebuild_stale_tokenizer_shards —
+/// FTS tables still hold the content (see db.rs rebuild_stale_shards —
 /// the 2026-06 tokenchars drop migrated this way with NO version bump).
 pub const SCHEMA_VERSION: u32 = 1;
 

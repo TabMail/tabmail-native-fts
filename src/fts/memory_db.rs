@@ -107,7 +107,7 @@ PRAGMA wal_autocheckpoint = {wal_autocheckpoint};\n\
 
 /// Open or create the memory database
 /// In-place tokenizer migration for memory_fts (mirrors db.rs
-/// rebuild_stale_tokenizer_shards — see ADR-024). Stale = the stored CREATE
+/// rebuild_stale_shards — see ADR-024). Stale = the stored CREATE
 /// statement still carries `tokenchars`. The FTS5 table stores its content, so
 /// a rowid-preserving copy re-tokenizes locally; memory_meta / memory_vec
 /// rowid alignment is untouched. memory.db is small (chat turns) — one
