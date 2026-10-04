@@ -643,7 +643,7 @@ class TestMultiThreadedDispatch(unittest.TestCase):
                     "subject": "legacy statement",
                     "from_": "sender@test.com",
                     "body": "body",
-                    "dateMs": 1700000000000,
+                    "dateMs": 1550000000000,
                 }]},
             })
             self.assertEqual(_read_message(proc)["result"]["count"], 1)
@@ -655,19 +655,19 @@ class TestMultiThreadedDispatch(unittest.TestCase):
         columns = "msgId, subject, from_, to_, cc, bcc, body"
         with sqlite3.connect(db_path) as connection:
             create_sql = connection.execute(
-                "SELECT sql FROM sqlite_master WHERE name = 'messages_fts_2023'"
+                "SELECT sql FROM sqlite_master WHERE name = 'messages_fts_2019'"
             ).fetchone()[0]
             tokenize = create_sql.split('tokenize = "')[1].split('"')[0]
             connection.execute(
                 f"CREATE VIRTUAL TABLE legacy USING fts5({columns}, tokenize = \"{tokenize}\", prefix = '2 3 4')"
             )
-            connection.execute(f"INSERT INTO legacy(rowid, {columns}) SELECT rowid, {columns} FROM messages_fts_2023")
-            connection.execute("DROP TABLE messages_fts_2023")
-            connection.execute("ALTER TABLE legacy RENAME TO messages_fts_2023")
+            connection.execute(f"INSERT INTO legacy(rowid, {columns}) SELECT rowid, {columns} FROM messages_fts_2019")
+            connection.execute("DROP TABLE messages_fts_2019")
+            connection.execute("ALTER TABLE legacy RENAME TO messages_fts_2019")
 
         def shard_columns():
             with sqlite3.connect(db_path) as connection:
-                return [row[1] for row in connection.execute("PRAGMA table_info(messages_fts_2023)")]
+                return [row[1] for row in connection.execute("PRAGMA table_info(messages_fts_2019)")]
 
         self.assertNotIn("attachmentNames", shard_columns())
 
@@ -687,7 +687,7 @@ class TestMultiThreadedDispatch(unittest.TestCase):
                     "subject": "new mail",
                     "from_": "sender@test.com",
                     "body": "body",
-                    "dateMs": 1700000000000,
+                    "dateMs": 1550000000000,
                     "attachmentNames": "Quarterly-Statement.pdf",
                 }] + [{
                     # Unrelated mail, so the search term is rare enough to score.
@@ -695,7 +695,7 @@ class TestMultiThreadedDispatch(unittest.TestCase):
                     "subject": "lunch plans",
                     "from_": "friend@test.com",
                     "body": "see you at noon",
-                    "dateMs": 1700000000000,
+                    "dateMs": 1550000000000,
                 } for i in range(8)]},
             })
             self.assertEqual(_read_message(proc)["result"]["count"], 9)

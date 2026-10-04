@@ -29,8 +29,8 @@ unreachable by that name. The owner weighed putting the names in an existing col
    - Why not in `init`: the budget was checked only between shards, so one large shard
      (85k rows measured at 64 s on an M1 Pro) ran past the add-on's 60 s init RPC timeout.
      A timed-out init disconnects, Thunderbird kills the helper 3 s later, the shard rolls
-     back, and the next start repeats it — search permanently down (review round 1,
-     2026-10-04). On the writer, init answers at once; a timeout on an ordinary RPC does
+     back, and the next start repeats it — search permanently down
+     (found before release, 2026-10-04). On the writer, init answers at once; a timeout on an ordinary RPC does
      not disconnect.
    - A write that arrives mid-shard waits for that shard, never longer (`next_write_request`
      in `main.rs` checks the queue between shards). On a very large shard the add-on's call

@@ -2796,6 +2796,47 @@ mod tests {
         );
     }
 
+    /// Subject outranks sender outranks body, on the shard's current columns.
+    fn assert_column_weights(conn: &mut Connection, known_years: &mut HashSet<i32>, date_ms: i64) {
+        let mut rows: Vec<Value> = (0..8).map(|i| {
+            let mut r = row_with_names(&format!("acc:/:filler{date_ms}-{i}"), date_ms, "lunch", None);
+            r["from"] = Value::String("friend@example.com".to_string());
+            r
+        }).collect();
+        let mut in_subject = row_with_names(&format!("acc:/:subject{date_ms}"), date_ms, "zephyr plans", None);
+        in_subject["from"] = Value::String("friend@example.com".to_string());
+        let mut in_from = row_with_names(&format!("acc:/:from{date_ms}"), date_ms, "plans", None);
+        in_from["from"] = Value::String("zephyr@example.com".to_string());
+        let mut in_body = row_with_names(&format!("acc:/:body{date_ms}"), date_ms, "plans", None);
+        in_body["from"] = Value::String("friend@example.com".to_string());
+        in_body["body"] = Value::String("zephyr".to_string());
+        rows.extend([in_subject, in_from, in_body]);
+        index_batch(conn, &rows, None, known_years).unwrap();
+
+        let params = serde_json::json!({"ignoreDate": true});
+        let results = search(conn, "zephyr", &params, &SynonymLookup::new(), None, known_years).unwrap();
+        let rank_of = |id: String| results.iter().find(|r| r["uniqueId"] == id.as_str()).unwrap()["rank"].as_f64().unwrap();
+        let (subject, from, body) = (
+            rank_of(format!("acc:/:subject{date_ms}")),
+            rank_of(format!("acc:/:from{date_ms}")),
+            rank_of(format!("acc:/:body{date_ms}")),
+        );
+        assert!(subject < from && from < body, "subject {subject} < from {from} < body {body}");
+    }
+
+    #[test]
+    fn test_attachment_names_column_keeps_existing_column_weights() {
+        // bm25 weights are positional: attachmentNames must stay the last column.
+        let (mut conn, mut known_years) = setup_test_db();
+        assert_column_weights(&mut conn, &mut known_years, 0);
+
+        let year_2005_ms = 1104537600000;
+        create_shard_without_attachment_names(&conn, 2005);
+        known_years.insert(2005);
+        convert_all_stale_shards(&mut conn);
+        assert_column_weights(&mut conn, &mut known_years, year_2005_ms);
+    }
+
     #[test]
     fn test_writer_idle_step_converts_newest_shard_first_one_at_a_time() {
         let (mut conn, mut known_years) = setup_test_db();
