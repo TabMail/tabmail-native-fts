@@ -7,13 +7,22 @@ cleanup and its removal attribution (Thunderbird ADR-024).
 
 To complete its global membership cleanup, a capable Thunderbird client walks every
 `message_ids` row through `listFolderMembershipState` pages, even when nothing changed.
-That is one full bounded walk per session (and per reconnect). The walk's verdict depends
-only on three numbers: rows with no folder relation, and relation rows whose folder the
-client no longer knows, split by whether the row's account is loaded.
+That is one full bounded walk per session (and per reconnect). On an index no writer has
+corrupted, the walk's verdict reduces to three numbers: rows with no folder relation, and
+relation rows whose folder the client no longer knows, split by whether the row's account
+is loaded. Two differences remain, both stated so the client can rely on them knowingly:
+- The walk also refuses cleanup when a folder-owned row's msgId does not start with that
+  folder's `account:path:` prefix; the summary counts such a row as owned. No writer
+  produces one (`indexBatch` callers and the add-on's `getUniqueMessageKey` derive msgId
+  and folderId from the same folder).
+- The walk ignores ownerless rows of accounts not yet loaded; the summary counts every
+  ownerless row. That is stricter and only costs a fallback walk.
 
 Separately, `removeBatch` reported only a count, so the add-on attributed a removal to
 every folder whose key range could contain the removed key. A removal in `/Cold:Hot`
-therefore restarted `/Cold`'s proof.
+therefore restarted `/Cold`'s proof. (The add-on's removal handoff also revokes the
+colon-overlap folders' retry authorization before it removes; owner reporting narrows
+which proofs a committed removal restarts, not that handoff.)
 
 ## Decision
 
@@ -35,7 +44,8 @@ therefore restarted `/Cold`'s proof.
    transaction) and `removedOwnerless` (deleted rows with no relation). The change is
    wire-compatible: older clients ignore the fields, and a client detects owner reporting
    by the presence of `removedFolderIds`. A transaction that rolls back reports nothing
-   (the call fails).
+   (the call fails). A lost or timed-out reply means the owners are unknown, not that the
+   list is empty, and ids counted in `removedOwnerless` have no owner to report.
 
 ## Rationale
 

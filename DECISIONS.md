@@ -100,6 +100,9 @@ relation beside message identity.
 5. Keep `SCHEMA_VERSION` at 1: the additive relation migrates locally and does
    not require Thunderbird to re-feed message content.
 
+Amended by ADR-NF-006: `folderMembershipSummary` is one unbounded O(rows) read
+per call, an exception to the bounded-call property above.
+
 **Rationale:** Exact equality makes colon-bearing and prefix-related folders
 independent without changing externally visible message keys. A separate,
 initially empty relation avoids a synchronous index build over every historical
