@@ -150,7 +150,8 @@ fn classify_method(method: &str) -> MethodTarget {
         "search" | "stats" | "filterNewMessages" | "getMessageByMsgId" | "getAttachmentFlags"
         | "findByHeaderMessageId" | "queryByDateRange" | "debugSample"
         | "countMsgIdRange" | "fingerprintMsgIdRange" | "listMsgIdRange"
-        | "listFolderMembership" | "listFolderMembershipState" => MethodTarget::Reader,
+        | "listFolderMembership" | "listFolderMembershipState"
+        | "folderMembershipSummary" => MethodTarget::Reader,
 
         // Read-only memory operations
         "memorySearch" | "memoryStats" | "memoryDebugSample" | "memoryRead" => MethodTarget::Reader,
@@ -538,6 +539,16 @@ fn handle_read_request(
             )?;
             Ok(serde_json::json!({ "id": msg_id, "result": res }))
         }
+        "folderMembershipSummary" => {
+            let folder_ids = string_array(params, "folderIds")?;
+            let trusted_account_ids = string_array(params, "trustedAccountIds")?;
+            let res = crate::fts::db::folder_membership_summary(
+                email_conn,
+                &folder_ids,
+                &trusted_account_ids,
+            )?;
+            Ok(serde_json::json!({ "id": msg_id, "result": res }))
+        }
         "queryByDateRange" => {
             let from_v = params.get("from").context("from and to parameters are required")?;
             let to_v = params.get("to").context("from and to parameters are required")?;
@@ -717,7 +728,15 @@ fn handle_write_request(
                 .cloned()
                 .unwrap_or_default();
             let removed = crate::fts::db::remove_batch(email_conn, &ids)?;
-            Ok(serde_json::json!({ "id": msg_id, "result": { "ok": true, "count": removed } }))
+            Ok(serde_json::json!({
+                "id": msg_id,
+                "result": {
+                    "ok": true,
+                    "count": removed.count,
+                    "removedFolderIds": removed.removed_folder_ids,
+                    "removedOwnerless": removed.removed_ownerless
+                }
+            }))
         }
         "assignFolderMembershipBatch" => {
             let assignments = params
@@ -884,7 +903,8 @@ fn handle_hello(msg_id: &str, params: &Value) -> anyhow::Result<Value> {
 
 fn hello_capabilities() -> Value {
     serde_json::json!({
-        "folderMembershipV1": true
+        "folderMembershipV1": true,
+        "folderMembershipSummaryV1": true
     })
 }
 
@@ -902,6 +922,20 @@ fn optional_string<'a>(params: &'a Value, name: &str) -> anyhow::Result<Option<&
         Some(Value::String(value)) => Ok(Some(value.as_str())),
         Some(_) => anyhow::bail!("{name} parameter must be a string when present"),
     }
+}
+
+fn string_array<'a>(params: &'a Value, name: &str) -> anyhow::Result<Vec<&'a str>> {
+    params
+        .get(name)
+        .and_then(Value::as_array)
+        .with_context(|| format!("{name} parameter is required and must be an array"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .with_context(|| format!("every {name} entry must be a string"))
+        })
+        .collect()
 }
 
 fn folder_membership_page_limit(params: &Value) -> anyhow::Result<i64> {
@@ -1394,6 +1428,7 @@ mod tests {
         assert!(matches!(classify_method("listMsgIdRange"), MethodTarget::Reader));
         assert!(matches!(classify_method("listFolderMembership"), MethodTarget::Reader));
         assert!(matches!(classify_method("listFolderMembershipState"), MethodTarget::Reader));
+        assert!(matches!(classify_method("folderMembershipSummary"), MethodTarget::Reader));
         assert!(matches!(classify_method("assignFolderMembershipBatch"), MethodTarget::Writer));
         assert!(matches!(classify_method("fingerprintFolderMembership"), MethodTarget::Unknown));
         assert!(matches!(classify_method("listUnassignedFolderMembership"), MethodTarget::Unknown));
@@ -1401,8 +1436,76 @@ mod tests {
     }
 
     #[test]
+    fn test_dispatch_folder_membership_summary_contract() {
+        let (email, memory) = test_conns();
+        insert_memberships(
+            &email,
+            &[("acct1:/A:a", Some("f-a")), ("acct1:/Gone:b", Some("f-gone")), ("acct2:/Gone:c", Some("f-gone")), ("acct1:/A:legacy", None)],
+        );
+        let res = dispatch_read(
+            &email,
+            &memory,
+            "folderMembershipSummary",
+            serde_json::json!({"folderIds": ["f-a"], "trustedAccountIds": ["acct1"]}),
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            serde_json::json!({
+                "id": "test-1",
+                "result": {"ok": true, "ownerlessRows": 1, "strayTrustedRows": 1, "strayUntrustedRows": 1}
+            })
+        );
+        for params in [
+            serde_json::json!({"trustedAccountIds": []}),
+            serde_json::json!({"folderIds": [], }),
+            serde_json::json!({"folderIds": "f-a", "trustedAccountIds": []}),
+            serde_json::json!({"folderIds": [1], "trustedAccountIds": []}),
+            serde_json::json!({"folderIds": [], "trustedAccountIds": [null]}),
+            serde_json::json!({"folderIds": [""], "trustedAccountIds": []}),
+            serde_json::json!({"folderIds": [], "trustedAccountIds": [""]}),
+        ] {
+            assert!(
+                dispatch_read(&email, &memory, "folderMembershipSummary", params.clone()).is_err(),
+                "{params} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dispatch_remove_batch_reports_removed_owners() {
+        let (mut email, mut memory) = test_conns();
+        email
+            .execute_batch(
+                "CREATE TABLE message_meta (rowid INTEGER PRIMARY KEY, shardYear INTEGER NOT NULL);\
+                 CREATE TABLE messages_fts_2000 (rowid INTEGER PRIMARY KEY);\
+                 CREATE TABLE messages_vec (rowid INTEGER PRIMARY KEY);",
+            )
+            .unwrap();
+        insert_memberships(&email, &[("acct1:/A:a", Some("f-a")), ("acct1:/A:legacy", None)]);
+        email
+            .execute("INSERT INTO message_meta (rowid, shardYear) SELECT rowid, 2000 FROM message_ids", [])
+            .unwrap();
+        let res = dispatch_write(
+            &mut email,
+            &mut memory,
+            "removeBatch",
+            serde_json::json!({"ids": ["acct1:/A:a", "acct1:/A:legacy", "acct1:/A:absent"]}),
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            serde_json::json!({
+                "id": "test-write-1",
+                "result": {"ok": true, "count": 2, "removedFolderIds": ["f-a"], "removedOwnerless": 1}
+            })
+        );
+    }
+
+    #[test]
     fn test_hello_advertises_folder_membership_v1() {
         assert_eq!(hello_capabilities()["folderMembershipV1"], true);
+        assert_eq!(hello_capabilities()["folderMembershipSummaryV1"], true);
     }
 
     #[test]

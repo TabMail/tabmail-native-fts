@@ -127,6 +127,12 @@ archives of any size.
 
 ---
 
+## ADR-NF-006: Folder Membership Summary and Removal Owners
+
+- **[Full ADR](Companion/Decisions/Active/adr-nf-006-folder-membership-summary-and-removal-owners.md)** — reader RPC `folderMembershipSummary { folderIds, trustedAccountIds }` → `{ ownerlessRows, strayTrustedRows, strayUntrustedRows }` in ONE statement (one WAL snapshot), capability `folderMembershipSummaryV1`, stray split by msgId account prefix (first `:` at index > 0, else untrusted), fixed-size reply, one O(rows) read on the reader thread (amends ADR-NF-004 bounded-calls for this RPC); `removeBatch` adds `removedFolderIds` (`DELETE … RETURNING folderId`) + `removedOwnerless`, wire-compatible.
+
+---
+
 ## Template for New Decisions
 
 ```markdown

@@ -377,6 +377,17 @@ class TestMultiThreadedDispatch(unittest.TestCase):
             resp = _read_message(proc)
             self.assertEqual(resp["result"]["entries"], [])
 
+            _send_message(proc, {
+                "id": "c4-membership-summary",
+                "method": "folderMembershipSummary",
+                "params": {"folderIds": [], "trustedAccountIds": []},
+            })
+            resp = _read_message(proc)
+            self.assertEqual(
+                resp["result"],
+                {"ok": True, "ownerlessRows": 0, "strayTrustedRows": 0, "strayUntrustedRows": 0},
+            )
+
             # Search after clear
             _send_message(proc, {"id": "c5", "method": "search", "params": {"q": "test", "limit": 10}})
             resp = _read_message(proc)

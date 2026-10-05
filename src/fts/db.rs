@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -1548,9 +1548,18 @@ pub fn filter_new_messages(conn: &Connection, rows: &[Value]) -> anyhow::Result<
     }))
 }
 
-pub fn remove_batch(conn: &mut Connection, ids: &[Value]) -> anyhow::Result<i64> {
+/// What one `removeBatch` deleted: the row count, the distinct folders whose
+/// exact membership rows were deleted, and how many deleted rows had none.
+#[derive(Debug, Default, PartialEq)]
+pub struct RemoveBatchOutcome {
+    pub count: i64,
+    pub removed_folder_ids: Vec<String>,
+    pub removed_ownerless: i64,
+}
+
+pub fn remove_batch(conn: &mut Connection, ids: &[Value]) -> anyhow::Result<RemoveBatchOutcome> {
     if ids.is_empty() {
-        return Ok(0);
+        return Ok(RemoveBatchOutcome::default());
     }
 
     let ids: Vec<String> = ids
@@ -1562,6 +1571,8 @@ pub fn remove_batch(conn: &mut Connection, ids: &[Value]) -> anyhow::Result<i64>
 
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut removed: i64 = 0;
+    let mut removed_folder_ids: BTreeSet<String> = BTreeSet::new();
+    let mut removed_ownerless: i64 = 0;
 
     for msg_id_val in ids {
         if msg_id_val.is_empty() {
@@ -1580,10 +1591,19 @@ pub fn remove_batch(conn: &mut Connection, ids: &[Value]) -> anyhow::Result<i64>
             tx.execute(&format!("DELETE FROM {table} WHERE rowid = ?1"), params![row_id])?;
             tx.execute("DELETE FROM message_meta WHERE rowid = ?1", params![row_id])?;
             tx.execute("DELETE FROM messages_vec WHERE rowid = ?1", params![row_id])?;
-            tx.execute(
-                "DELETE FROM message_folder_membership WHERE msgId = ?1",
-                params![msg_id_val],
-            )?;
+            let owner: Option<String> = tx
+                .query_row(
+                    "DELETE FROM message_folder_membership WHERE msgId = ?1 RETURNING folderId",
+                    params![msg_id_val],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match owner {
+                Some(folder_id) => {
+                    removed_folder_ids.insert(folder_id);
+                }
+                None => removed_ownerless += 1,
+            }
             tx.execute("DELETE FROM message_ids WHERE msgId = ?1", params![msg_id_val])?;
             removed += 1;
         }
@@ -1591,7 +1611,11 @@ pub fn remove_batch(conn: &mut Connection, ids: &[Value]) -> anyhow::Result<i64>
 
     tx.commit()?;
     log::info!("Removed {} messages", removed);
-    Ok(removed)
+    Ok(RemoveBatchOutcome {
+        count: removed,
+        removed_folder_ids: removed_folder_ids.into_iter().collect(),
+        removed_ownerless,
+    })
 }
 
 pub fn get_message_by_msgid(conn: &Connection, msg_id: &str) -> anyhow::Result<Option<Value>> {
@@ -1863,6 +1887,48 @@ pub fn list_folder_membership_state(
     };
     let done = (entries.len() as i64) < limit;
     Ok(serde_json::json!({ "ok": true, "entries": entries, "done": done }))
+}
+
+/// Count, in one statement (so one read snapshot), what a client's global
+/// membership walk would have to repair: `message_ids` rows with no folder
+/// relation, and relation rows whose folder is not in `folder_ids`, split by
+/// whether the row's msgId account prefix is in `trusted_account_ids`. The
+/// prefix is the text before the first `:` when that colon is not the first
+/// character; otherwise the account is empty and never trusted. Folder ids are
+/// compared, never decoded. The reply is three counts whatever the archive size.
+pub fn folder_membership_summary(
+    conn: &Connection,
+    folder_ids: &[&str],
+    trusted_account_ids: &[&str],
+) -> anyhow::Result<Value> {
+    for folder_id in folder_ids {
+        validate_folder_id(folder_id)?;
+    }
+    if trusted_account_ids.iter().any(|account_id| account_id.is_empty()) {
+        bail!("trustedAccountIds entries must be non-empty strings");
+    }
+    let folder_ids_json = serde_json::to_string(folder_ids)?;
+    let trusted_json = serde_json::to_string(trusted_account_ids)?;
+    let (ownerless, stray_trusted, stray_untrusted): (i64, i64, i64) = conn.query_row(
+        "SELECT \
+            (SELECT COUNT(*) FROM message_ids mi WHERE NOT EXISTS (SELECT 1 FROM message_folder_membership fm WHERE fm.msgId = mi.msgId)), \
+            COALESCE(SUM(trusted), 0), \
+            COALESCE(SUM(1 - trusted), 0) \
+         FROM ( \
+            SELECT (CASE WHEN instr(fm.msgId, ':') > 1 THEN substr(fm.msgId, 1, instr(fm.msgId, ':') - 1) ELSE '' END) \
+                IN (SELECT value FROM json_each(?2)) AS trusted \
+            FROM message_folder_membership fm JOIN message_ids mi ON mi.msgId = fm.msgId \
+            WHERE fm.folderId NOT IN (SELECT value FROM json_each(?1)) \
+         )",
+        params![folder_ids_json, trusted_json],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "ownerlessRows": ownerless,
+        "strayTrustedRows": stray_trusted,
+        "strayUntrustedRows": stray_untrusted,
+    }))
 }
 
 /// Adopt exact folder membership for already-indexed rows. The batch is
@@ -3476,7 +3542,7 @@ mod tests {
 
         let listed = list_folder_membership(&conn, "folder:opaque", None, 10).unwrap();
         let ids = listed["msgIds"].as_array().unwrap().clone();
-        assert_eq!(remove_batch(&mut conn, &ids).unwrap(), 2);
+        assert_eq!(remove_batch(&mut conn, &ids).unwrap().count, 2);
         assert_eq!(db_count(&conn).unwrap(), 0);
         assert_eq!(
             list_folder_membership(&conn, "folder:opaque", None, 10).unwrap()["msgIds"],
@@ -3486,6 +3552,232 @@ mod tests {
             list_folder_membership_state(&conn, None, 10).unwrap()["entries"],
             serde_json::json!([])
         );
+    }
+
+    fn summary_counts(conn: &Connection, folder_ids: &[&str], trusted: &[&str]) -> (i64, i64, i64) {
+        let res = folder_membership_summary(conn, folder_ids, trusted).unwrap();
+        assert_eq!(res["ok"], true);
+        (
+            res["ownerlessRows"].as_i64().unwrap(),
+            res["strayTrustedRows"].as_i64().unwrap(),
+            res["strayUntrustedRows"].as_i64().unwrap(),
+        )
+    }
+
+    fn insert_owned(conn: &Connection, rows: &[(&str, &str)]) {
+        for (msg_id, folder) in rows {
+            conn.execute("INSERT INTO message_ids (msgId) VALUES (?1)", params![msg_id]).unwrap();
+            conn.execute(
+                "INSERT INTO message_folder_membership (msgId, folderId) VALUES (?1, ?2)",
+                params![msg_id, folder],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_folder_membership_summary_empty_and_fully_owned() {
+        let (conn, _known_years) = setup_test_db();
+        assert_eq!(summary_counts(&conn, &[], &[]), (0, 0, 0));
+        insert_owned(&conn, &[("acct1:/Inbox:a", "f-inbox"), ("acct1:/Inbox:b", "f-inbox"), ("acct2:/Sent:c", "f-sent")]);
+        assert_eq!(summary_counts(&conn, &["f-inbox", "f-sent"], &["acct1", "acct2"]), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_folder_membership_summary_counts_ownerless_rows() {
+        let (conn, _known_years) = setup_test_db();
+        insert_owned(&conn, &[("acct1:/Inbox:a", "f-inbox")]);
+        insert_msg_id_keys(&conn, &["acct1:/Inbox:legacy1", "acct9:/Old:legacy2"]);
+        assert_eq!(summary_counts(&conn, &["f-inbox"], &["acct1"]), (2, 0, 0));
+    }
+
+    #[test]
+    fn test_folder_membership_summary_splits_stray_rows_by_msg_id_account() {
+        let (conn, _known_years) = setup_test_db();
+        insert_owned(&conn, &[
+            ("acct1:/Inbox:live", "f-inbox"),
+            // Stray (folder not in the request) rows of a trusted account.
+            ("acct1:/Gone:a", "f-gone"),
+            ("acct1:/Gone:b", "f-gone"),
+            // An account id that extends a trusted one is a different account.
+            ("acct10:/Gone:c", "f-gone10"),
+            // No colon, or a colon first: the empty account, never trusted.
+            ("nocolon", "f-gone"),
+            (":leading", "f-gone"),
+            // A row in a request folder whose msgId names another account
+            // counts as owned: the summary compares folders, never decodes.
+            ("acct2:/Elsewhere:d", "f-inbox"),
+        ]);
+        assert_eq!(summary_counts(&conn, &["f-inbox"], &["acct1"]), (0, 2, 3));
+        assert_eq!(summary_counts(&conn, &["f-inbox"], &["acct1", "acct10"]), (0, 3, 2));
+    }
+
+    #[test]
+    fn test_folder_membership_summary_with_no_folders_or_no_trusted_accounts() {
+        let (conn, _known_years) = setup_test_db();
+        insert_owned(&conn, &[("acct1:/Inbox:a", "f-inbox"), ("acct2:/Inbox:b", "f-inbox2")]);
+        assert_eq!(summary_counts(&conn, &[], &["acct1", "acct2"]), (0, 2, 0));
+        assert_eq!(summary_counts(&conn, &["f-inbox"], &[]), (0, 0, 1));
+        assert_eq!(summary_counts(&conn, &[], &[]), (0, 0, 2));
+    }
+
+    #[test]
+    fn test_folder_membership_summary_ignores_relation_rows_without_a_message() {
+        let (conn, _known_years) = setup_test_db();
+        conn.execute(
+            "INSERT INTO message_folder_membership (msgId, folderId) VALUES ('acct1:/Gone:x', 'f-gone')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(summary_counts(&conn, &[], &["acct1"]), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_folder_membership_summary_compares_folder_ids_exactly() {
+        let (conn, _known_years) = setup_test_db();
+        insert_owned(&conn, &[("acct1:/A:a", "Folder"), ("acct1:/A:b", "folder"), ("acct1:/A:c", "Folder ")]);
+        assert_eq!(summary_counts(&conn, &["Folder"], &["acct1"]), (0, 2, 0));
+    }
+
+    #[test]
+    fn test_folder_membership_summary_rejects_empty_ids() {
+        let (conn, _known_years) = setup_test_db();
+        assert!(folder_membership_summary(&conn, &[""], &[]).is_err());
+        assert!(folder_membership_summary(&conn, &["f"], &[""]).is_err());
+    }
+
+    #[test]
+    fn test_folder_membership_summary_reads_one_snapshot_under_a_concurrent_writer() {
+        // A WAL file database (`:memory:` has no concurrent readers). The writer
+        // moves one row between ownerless and stray in single transactions, so
+        // every snapshot has exactly one of the two; a summary that read the
+        // two counts from different snapshots could see none or both.
+        let dir = std::env::temp_dir().join(format!("tabmail-fts-summary-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("summary.sqlite");
+        let _ = std::fs::remove_file(&path);
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;\
+                 CREATE TABLE message_ids (msgId TEXT PRIMARY KEY);\
+                 CREATE TABLE message_folder_membership (msgId TEXT PRIMARY KEY, folderId TEXT NOT NULL) WITHOUT ROWID;\
+                 INSERT INTO message_ids (msgId) VALUES ('acct1:/Gone:x');",
+            )
+            .unwrap();
+        let reader = open_read_only_connection(&path).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_stop = stop.clone();
+        let handle = std::thread::spawn(move || {
+            let mut writes = 0usize;
+            while !writer_stop.load(AtomicOrdering::SeqCst) {
+                writer
+                    .execute("INSERT INTO message_folder_membership (msgId, folderId) VALUES ('acct1:/Gone:x', 'f-gone')", [])
+                    .unwrap();
+                writer
+                    .execute("DELETE FROM message_folder_membership WHERE msgId = 'acct1:/Gone:x'", [])
+                    .unwrap();
+                writes += 2;
+            }
+            writes
+        });
+        let mut seen = HashSet::new();
+        for _ in 0..3000 {
+            let (ownerless, trusted, untrusted) = summary_counts(&reader, &[], &[]);
+            assert_eq!(trusted, 0);
+            assert_eq!(ownerless + untrusted, 1, "a torn read saw ({ownerless}, {untrusted})");
+            seen.insert(ownerless);
+        }
+        stop.store(true, AtomicOrdering::SeqCst);
+        assert!(handle.join().unwrap() > 0);
+        drop(reader);
+        std::fs::remove_dir_all(&dir).unwrap();
+        // Both states were observed, so the reader really ran against the writer.
+        assert_eq!(seen.len(), 2);
+    }
+
+    fn remove_ids(conn: &mut Connection, ids: &[&str]) -> anyhow::Result<RemoveBatchOutcome> {
+        let ids: Vec<Value> = ids.iter().map(|id| Value::String(id.to_string())).collect();
+        remove_batch(conn, &ids)
+    }
+
+    fn removal_db() -> (Connection, HashSet<i32>) {
+        let (mut conn, mut known_years) = setup_test_db();
+        conn.execute_batch("CREATE TABLE messages_vec (rowid INTEGER PRIMARY KEY);").unwrap();
+        let rows = [
+            index_row("acct1:/A:a1", Some("f-a")),
+            index_row("acct1:/A:a2", Some("f-a")),
+            index_row("acct1:/B:b1", Some("f-b")),
+            index_row("acct1:/C:legacy", None),
+        ];
+        assert_eq!(index_batch(&mut conn, &rows, None, &mut known_years).unwrap(), (4, 0));
+        (conn, known_years)
+    }
+
+    #[test]
+    fn test_remove_batch_reports_owners_of_deleted_rows() {
+        let (mut conn, _known_years) = removal_db();
+        let outcome = remove_ids(&mut conn, &["acct1:/A:a1"]).unwrap();
+        assert_eq!(outcome, RemoveBatchOutcome { count: 1, removed_folder_ids: vec!["f-a".to_string()], removed_ownerless: 0 });
+
+        let outcome = remove_ids(&mut conn, &["acct1:/C:legacy"]).unwrap();
+        assert_eq!(outcome, RemoveBatchOutcome { count: 1, removed_folder_ids: vec![], removed_ownerless: 1 });
+
+        let outcome = remove_ids(&mut conn, &["acct1:/Z:absent", ""]).unwrap();
+        assert_eq!(outcome, RemoveBatchOutcome::default());
+    }
+
+    #[test]
+    fn test_remove_batch_reports_distinct_owners_for_a_mixed_batch() {
+        let (mut conn, _known_years) = removal_db();
+        let outcome = remove_ids(
+            &mut conn,
+            &["acct1:/B:b1", "acct1:/A:a1", "acct1:/A:a2", "acct1:/A:a1", "acct1:/C:legacy", "acct1:/Z:absent"],
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            RemoveBatchOutcome {
+                count: 4,
+                removed_folder_ids: vec!["f-a".to_string(), "f-b".to_string()],
+                removed_ownerless: 1,
+            }
+        );
+        assert_eq!(db_count(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_remove_batch_that_rolls_back_reports_nothing() {
+        let (mut conn, _known_years) = removal_db();
+        unsafe extern "C" fn deny_message_ids_delete(
+            _: *mut std::ffi::c_void,
+            action: i32,
+            table: *const std::ffi::c_char,
+            _: *const std::ffi::c_char,
+            _: *const std::ffi::c_char,
+            _: *const std::ffi::c_char,
+        ) -> i32 {
+            if action == rusqlite::ffi::SQLITE_DELETE
+                && !table.is_null()
+                && unsafe { CStr::from_ptr(table) }.to_bytes() == b"message_ids"
+            {
+                rusqlite::ffi::SQLITE_DENY
+            } else {
+                rusqlite::ffi::SQLITE_OK
+            }
+        }
+        unsafe {
+            assert_eq!(
+                rusqlite::ffi::sqlite3_set_authorizer(conn.handle(), Some(deny_message_ids_delete), std::ptr::null_mut()),
+                0
+            );
+        }
+        assert!(remove_ids(&mut conn, &["acct1:/A:a1", "acct1:/C:legacy"]).is_err());
+        unsafe {
+            rusqlite::ffi::sqlite3_set_authorizer(conn.handle(), None, std::ptr::null_mut());
+        }
+        assert_eq!(db_count(&conn).unwrap(), 4);
+        assert_eq!(folder_id(&conn, "acct1:/A:a1").as_deref(), Some("f-a"));
     }
 
     #[test]
