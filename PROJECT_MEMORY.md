@@ -57,6 +57,7 @@ Native messaging host for full-text search + semantic search. Communicates with 
 ## Recent Discoveries
 
 ### 2026-10-04
+- Added reader RPC `getAttachmentFlags { msgIds }` → `{ ok, flags }`: each msgId's stored `message_meta.hasAttachments` in request order, `true`/`false`, or `null` when not indexed. Reads only `message_ids` ⋈ `message_meta` (no shard, no body), so the add-on can label an inbox list from the index without one `getMessageByMsgId` round trip per message. At most `GET_ATTACHMENT_FLAGS_MAX_IDS` ids per request; non-string entries are refused. Older helpers answer "Unknown reader method".
 - Shards gained an `attachmentNames` FTS5 column (ADR-NF-005). The tokenizer migration became `rebuild_next_stale_shard`, run one shard at a time by the writer thread while no request waits — NEVER in `init`: a single large shard can outlast the add-on's 60 s init RPC timeout, and a timed-out init gets the helper killed mid-copy every start. Staleness now also means "no `attachmentNames` column" (`shard_has_attachment_names`, PRAGMA table_info). Rows copied into a converted shard, and rows from the monolithic migration, hold NULL in that column — read it with `COALESCE`. `bm25()` accepts more weights than a shard has columns, so one SQL works across converted and unconverted shards.
 
 ### 2026-08-22
