@@ -1016,12 +1016,14 @@ fn handle_init(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Res
         .and_then(|v| v.as_str())
         .unwrap_or("thunderbird@tabmail.ai");
 
-    // profilePath override (for testing): use the provided path directly, skip auto-detection
+    // profilePath: the add-on names this profile's data directory; use it directly.
+    // Without it, guess the profile (add-on releases before profilePath).
     let (tb_profile, new_fts_parent) =
         if let Some(override_path) = params.get("profilePath").and_then(|v| v.as_str()) {
             let p = PathBuf::from(override_path);
             log::info!("Using explicit profilePath: {}", p.display());
             std::fs::create_dir_all(&p)?;
+            adopt_or_remove_orphaned_indexes(&p, &guessed_profile_dirs());
             (p.clone(), p)
         } else {
             // Auto-detect Thunderbird profile
@@ -1188,18 +1190,9 @@ fn migrate_fts_data(old_fts_dir: &Path, new_fts_dir: &Path) -> anyhow::Result<bo
 }
 
 fn find_thunderbird_profile_dir() -> anyhow::Result<PathBuf> {
-    let system = std::env::consts::OS;
-    let profiles_dir = match system {
-        "macos" => home_dir()?.join("Library/Thunderbird/Profiles"),
-        "linux" => home_dir()?.join(".thunderbird"),
-        "windows" => {
-            let appdata = std::env::var("APPDATA").unwrap_or_default();
-            PathBuf::from(appdata).join("Thunderbird/Profiles")
-        }
-        _ => {
-            log::warn!("Unknown OS: {}, using fallback", system);
-            return Ok(home_dir()?.join(".tabmail"));
-        }
+    let Some(profiles_dir) = thunderbird_profiles_dir()? else {
+        log::warn!("Unknown OS: {}, using fallback", std::env::consts::OS);
+        return fallback_profile_dir();
     };
 
     if !profiles_dir.exists() {
@@ -1207,10 +1200,45 @@ fn find_thunderbird_profile_dir() -> anyhow::Result<PathBuf> {
             "TB profiles directory not found: {}",
             profiles_dir.display()
         );
-        return Ok(home_dir()?.join(".tabmail"));
+        return fallback_profile_dir();
     }
 
-    let mut candidates: Vec<PathBuf> = std::fs::read_dir(&profiles_dir)?
+    let mut candidates = profile_dir_candidates(&profiles_dir)?;
+
+    if candidates.is_empty() {
+        log::warn!("No profiles found in {}", profiles_dir.display());
+        return fallback_profile_dir();
+    }
+
+    candidates.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+    let most_recent = candidates.last().cloned().unwrap();
+    log::info!("Found TB profile: {}", most_recent.display());
+    Ok(most_recent)
+}
+
+/// The directory holding Thunderbird profiles on this OS; None on an OS the
+/// helper does not know.
+fn thunderbird_profiles_dir() -> anyhow::Result<Option<PathBuf>> {
+    Ok(match std::env::consts::OS {
+        "macos" => Some(home_dir()?.join("Library/Thunderbird/Profiles")),
+        "linux" => Some(home_dir()?.join(".thunderbird")),
+        "windows" => {
+            let appdata = std::env::var("APPDATA").unwrap_or_default();
+            Some(PathBuf::from(appdata).join("Thunderbird/Profiles"))
+        }
+        _ => None,
+    })
+}
+
+/// Where `find_thunderbird_profile_dir` lands when it finds no profile.
+fn fallback_profile_dir() -> anyhow::Result<PathBuf> {
+    Ok(home_dir()?.join(".tabmail"))
+}
+
+/// The non-hidden subdirectories of `profiles_dir`, any of which
+/// `find_thunderbird_profile_dir` may take for a profile.
+fn profile_dir_candidates(profiles_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    Ok(std::fs::read_dir(profiles_dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.is_dir())
@@ -1220,17 +1248,106 @@ fn find_thunderbird_profile_dir() -> anyhow::Result<PathBuf> {
                 .map(|s| !s.starts_with('.'))
                 .unwrap_or(false)
         })
-        .collect();
+        .collect())
+}
 
-    if candidates.is_empty() {
-        log::warn!("No profiles found in {}", profiles_dir.display());
-        return Ok(home_dir()?.join(".tabmail"));
+/// Every directory `find_thunderbird_profile_dir` can return.
+fn guessed_profile_dirs() -> Vec<PathBuf> {
+    let Ok(fallback) = fallback_profile_dir() else {
+        return Vec::new();
+    };
+    let mut dirs = vec![fallback];
+    if let Ok(Some(profiles_dir)) = thunderbird_profiles_dir() {
+        dirs.extend(profile_dir_candidates(&profiles_dir).unwrap_or_default());
     }
+    dirs
+}
 
-    candidates.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-    let most_recent = candidates.last().cloned().unwrap();
-    log::info!("Found TB profile: {}", most_recent.display());
-    Ok(most_recent)
+/// Before the add-on named its data directory (`profilePath`), the helper
+/// guessed the profile, and a wrong guess left an index where no profile
+/// reads it: `~/.tabmail`, a non-profile directory beside the profiles, or a
+/// profile without the add-on installed. When this profile has no index yet,
+/// the most recently written of those moves here, so its mail and chat memory
+/// carry over and the add-on's reconciliation repairs the mail index; the rest
+/// are removed. An index in another profile that has the add-on installed is
+/// that profile's own and is left alone.
+fn adopt_or_remove_orphaned_indexes(data_dir: &Path, guessed_profiles: &[PathBuf]) {
+    let mut orphans = orphaned_guessed_indexes(data_dir, guessed_profiles);
+    let own_fts_dir = data_dir.join("tabmail_fts");
+    if std::fs::symlink_metadata(&own_fts_dir).is_err() {
+        orphans.sort_by_key(|fts_dir| {
+            std::fs::metadata(fts_dir.join("fts.db"))
+                .and_then(|m| m.modified())
+                .ok()
+        });
+        if let Some(newest) = orphans.pop() {
+            match std::fs::rename(&newest, &own_fts_dir) {
+                Ok(()) => {
+                    log::info!("Moved orphaned index {} to {}", newest.display(), own_fts_dir.display());
+                    remove_empty_parents(&newest);
+                }
+                // Typically another volume. A copy there could outlast the
+                // init RPC, so the index is rebuilt instead.
+                Err(e) => {
+                    log::warn!("Could not move orphaned index {}: {}", newest.display(), e);
+                    orphans.push(newest);
+                }
+            }
+        }
+    }
+    for fts_dir in orphans {
+        match std::fs::remove_dir_all(&fts_dir) {
+            Ok(()) => {
+                log::info!("Removed orphaned index at {}", fts_dir.display());
+                remove_empty_parents(&fts_dir);
+            }
+            Err(e) => log::warn!("Could not remove orphaned index at {}: {}", fts_dir.display(), e),
+        }
+    }
+}
+
+/// The `tabmail_fts` directories, in the directories the guess could return,
+/// that no profile reads: not this profile's own, and not in a directory with
+/// the add-on installed.
+fn orphaned_guessed_indexes(data_dir: &Path, guessed_profiles: &[PathBuf]) -> Vec<PathBuf> {
+    let Some(addon_id) = data_dir.file_name() else {
+        return Vec::new();
+    };
+    let own = std::fs::canonicalize(data_dir).ok();
+    let xpi_name = {
+        let mut name = addon_id.to_os_string();
+        name.push(".xpi");
+        name
+    };
+    guessed_profiles
+        .iter()
+        .filter_map(|profile| {
+            let all_extension_data = profile.join("browser-extension-data");
+            let extension_data = all_extension_data.join(addon_id);
+            let fts_dir = extension_data.join("tabmail_fts");
+            // The index must physically live in this directory: a symlink on
+            // the way to it could lead into another profile, so none is followed.
+            let is_real_dir = [&all_extension_data, &extension_data, &fts_dir].iter().all(|dir| {
+                std::fs::symlink_metadata(dir)
+                    .map(|m| m.file_type().is_dir())
+                    .unwrap_or(false)
+            });
+            let orphaned = is_real_dir
+                && std::fs::canonicalize(&extension_data).ok() != own
+                && !profile.join("extensions").join(&xpi_name).exists();
+            orphaned.then_some(fts_dir)
+        })
+        .collect()
+}
+
+/// Removes the add-on's data directory and `browser-extension-data` above a
+/// moved or removed index, only while they are empty.
+fn remove_empty_parents(fts_dir: &Path) {
+    for dir in fts_dir.ancestors().skip(1).take(2) {
+        if std::fs::remove_dir(dir).is_err() {
+            break;
+        }
+    }
 }
 
 fn home_dir() -> anyhow::Result<PathBuf> {
@@ -1251,6 +1368,266 @@ fn home_dir() -> anyhow::Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::fts::synonyms::SynonymLookup;
+
+    // ------------------------------------------------------------------
+    // Orphaned indexes left by the profile guess (adopt_or_remove_orphaned_indexes).
+    // ------------------------------------------------------------------
+
+    const ADDON_ID: &str = "thunderbird@tabmail.ai";
+
+    fn guess_test_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "tabmail-guess-test-{}-{}",
+            name,
+            std::process::id()
+        ));
+        if root.exists() {
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn data_dir_of(profile: &Path) -> PathBuf {
+        profile.join("browser-extension-data").join(ADDON_ID)
+    }
+
+    /// Writes an index (fts.db and memory.db) into `profile`'s add-on data directory.
+    fn write_index(profile: &Path) -> PathBuf {
+        let fts_dir = data_dir_of(profile).join("tabmail_fts");
+        std::fs::create_dir_all(&fts_dir).unwrap();
+        std::fs::write(fts_dir.join("fts.db"), b"index").unwrap();
+        std::fs::write(fts_dir.join("memory.db"), b"memory").unwrap();
+        fts_dir
+    }
+
+    fn install_addon(profile: &Path) {
+        std::fs::create_dir_all(profile.join("extensions")).unwrap();
+        std::fs::write(profile.join("extensions").join(format!("{ADDON_ID}.xpi")), b"xpi").unwrap();
+    }
+
+    #[test]
+    fn removes_guessed_indexes_no_profile_reads() {
+        let root = guess_test_root("orphans");
+        let own = root.join("Profiles/own.default");
+        install_addon(&own);
+        let own_index = write_index(&own);
+        // The helper's fallback home also holds its models; only the index goes.
+        let fallback = root.join(".tabmail");
+        let fallback_index = write_index(&fallback);
+        std::fs::create_dir_all(fallback.join("models")).unwrap();
+        let crash_reports = root.join("Profiles/Crash Reports");
+        write_index(&crash_reports);
+        let unused_profile = root.join("Profiles/unused.default");
+        write_index(&unused_profile);
+        std::fs::write(unused_profile.join("prefs.js"), b"").unwrap();
+
+        adopt_or_remove_orphaned_indexes(
+            &data_dir_of(&own),
+            &[fallback.clone(), crash_reports.clone(), unused_profile.clone(), own.clone()],
+        );
+
+        assert!(!fallback_index.exists());
+        assert!(!fallback.join("browser-extension-data").exists());
+        assert!(fallback.join("models").is_dir());
+        assert!(!crash_reports.join("browser-extension-data").exists());
+        assert!(crash_reports.is_dir());
+        assert!(!unused_profile.join("browser-extension-data").exists());
+        assert!(unused_profile.join("prefs.js").exists());
+        assert!(own_index.join("fts.db").exists());
+        assert!(own_index.join("memory.db").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keeps_indexes_a_profile_reads() {
+        let root = guess_test_root("kept");
+        // This profile's own index, even with the add-on loaded from elsewhere
+        // (no xpi in the profile) and reached through a symlinked candidate.
+        let own = root.join("custom/own");
+        let own_index = write_index(&own);
+        let profiles = root.join("Profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        let own_link = profiles.join("own-link");
+        std::os::unix::fs::symlink(&own, &own_link).unwrap();
+        // Another profile with the add-on installed owns its index.
+        let other = profiles.join("other.default");
+        install_addon(&other);
+        let other_index = write_index(&other);
+        // Files beside an orphaned index are not the helper's and stay.
+        let shared = profiles.join("shared");
+        write_index(&shared);
+        std::fs::write(data_dir_of(&shared).join("storage.js"), b"{}").unwrap();
+
+        adopt_or_remove_orphaned_indexes(
+            &data_dir_of(&own),
+            &[own.clone(), own_link, other.clone(), shared.clone()],
+        );
+
+        assert!(own_index.join("fts.db").exists());
+        assert!(other_index.join("fts.db").exists());
+        assert!(!data_dir_of(&shared).join("tabmail_fts").exists());
+        assert!(data_dir_of(&shared).join("storage.js").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn never_follows_or_removes_a_symlinked_index() {
+        let root = guess_test_root("symlink");
+        let own = root.join("own");
+        std::fs::create_dir_all(data_dir_of(&own)).unwrap();
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("fts.db"), b"index").unwrap();
+        let linked = root.join("linked");
+        std::fs::create_dir_all(data_dir_of(&linked)).unwrap();
+        let link = data_dir_of(&linked).join("tabmail_fts");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+
+        adopt_or_remove_orphaned_indexes(&data_dir_of(&own), &[linked]);
+
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(elsewhere.join("fts.db").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn never_follows_a_symlink_on_the_way_to_an_index() {
+        let root = guess_test_root("symlinked-parent");
+        let own = root.join("own");
+        std::fs::create_dir_all(data_dir_of(&own)).unwrap();
+        // `reader` has the add-on and reads its index; `linked` has no add-on
+        // but reaches that index through a symlinked parent directory.
+        let reader = root.join("reader");
+        install_addon(&reader);
+        let reader_index = write_index(&reader);
+        let linked_whole = root.join("linked-whole");
+        std::fs::create_dir_all(&linked_whole).unwrap();
+        std::os::unix::fs::symlink(reader.join("browser-extension-data"), linked_whole.join("browser-extension-data")).unwrap();
+        let linked_addon = root.join("linked-addon");
+        std::fs::create_dir_all(linked_addon.join("browser-extension-data")).unwrap();
+        std::os::unix::fs::symlink(data_dir_of(&reader), data_dir_of(&linked_addon)).unwrap();
+
+        adopt_or_remove_orphaned_indexes(&data_dir_of(&own), &[linked_whole, linked_addon]);
+
+        assert!(reader_index.join("fts.db").exists());
+        assert!(reader_index.join("memory.db").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_index_that_cannot_be_removed_does_not_stop_the_rest() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = guess_test_root("locked");
+        let own = root.join("own");
+        write_index(&own);
+        let locked = root.join("locked");
+        let locked_index = write_index(&locked);
+        std::fs::set_permissions(&locked_index, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let removable = root.join("removable");
+        let removable_index = write_index(&removable);
+
+        adopt_or_remove_orphaned_indexes(&data_dir_of(&own), &[locked, removable]);
+
+        assert!(locked_index.join("fts.db").exists());
+        assert!(!removable_index.exists());
+        std::fs::set_permissions(&locked_index, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn set_index_age(fts_dir: &Path, seconds_ago: u64) {
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(seconds_ago);
+        std::fs::File::options()
+            .write(true)
+            .open(fts_dir.join("fts.db"))
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    #[test]
+    fn moves_the_newest_orphan_into_a_profile_without_an_index() {
+        let root = guess_test_root("adopt");
+        let own = root.join("Profiles/own.default");
+        install_addon(&own);
+        std::fs::create_dir_all(data_dir_of(&own)).unwrap();
+        let fallback = root.join(".tabmail");
+        let older = write_index(&fallback);
+        set_index_age(&older, 3600);
+        let crash_reports = root.join("Profiles/Crash Reports");
+        let newest = write_index(&crash_reports);
+        std::fs::write(newest.join("fts.db"), b"newest index").unwrap();
+        set_index_age(&newest, 60);
+
+        adopt_or_remove_orphaned_indexes(&data_dir_of(&own), &[crash_reports.clone(), fallback.clone(), own.clone()]);
+
+        let own_index = data_dir_of(&own).join("tabmail_fts");
+        assert_eq!(std::fs::read(own_index.join("fts.db")).unwrap(), b"newest index");
+        assert_eq!(std::fs::read(own_index.join("memory.db")).unwrap(), b"memory");
+        assert!(!crash_reports.join("browser-extension-data").exists());
+        assert!(!older.exists());
+        assert!(!fallback.join("browser-extension-data").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn never_moves_an_index_a_profile_reads() {
+        let root = guess_test_root("adopt-read");
+        let own = root.join("own");
+        std::fs::create_dir_all(data_dir_of(&own)).unwrap();
+        let other = root.join("other");
+        install_addon(&other);
+        let other_index = write_index(&other);
+
+        adopt_or_remove_orphaned_indexes(&data_dir_of(&own), &[other]);
+
+        assert!(other_index.join("fts.db").exists());
+        assert!(!data_dir_of(&own).join("tabmail_fts").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_orphan_that_cannot_be_moved_is_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = guess_test_root("adopt-fail");
+        let own = root.join("own");
+        std::fs::create_dir_all(data_dir_of(&own)).unwrap();
+        std::fs::set_permissions(data_dir_of(&own), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let orphan = root.join("orphan");
+        let orphan_index = write_index(&orphan);
+
+        adopt_or_remove_orphaned_indexes(&data_dir_of(&own), &[orphan]);
+
+        std::fs::set_permissions(data_dir_of(&own), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!orphan_index.exists());
+        assert!(!data_dir_of(&own).join("tabmail_fts").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn profile_candidates_are_the_non_hidden_directories() {
+        let root = guess_test_root("candidates");
+        std::fs::create_dir_all(root.join("a.default")).unwrap();
+        std::fs::create_dir_all(root.join("Crash Reports")).unwrap();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::write(root.join("profiles.ini"), b"").unwrap();
+
+        let mut names: Vec<String> = profile_dir_candidates(&root)
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+
+        assert_eq!(names, vec!["Crash Reports".to_string(), "a.default".to_string()]);
+        assert!(profile_dir_candidates(&root.join("missing")).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     // ------------------------------------------------------------------
     // Dispatch-layer tests for the msgId key-range RPCs (ADR-021 /

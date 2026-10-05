@@ -136,6 +136,12 @@ archives of any size.
 
 ---
 
+## ADR-NF-007: Move or Remove Indexes the Profile Guess Left Where No Profile Reads Them
+
+- **[Full ADR](Companion/Decisions/Active/adr-nf-007-move-or-remove-indexes-left-by-the-profile-guess.md)** — `init` with `profilePath` runs `adopt_or_remove_orphaned_indexes` over `guessed_profile_dirs` (`~/.tabmail` fallback + non-hidden profiles-directory children, the set `find_thunderbird_profile_dir` could return). Orphan = `<dir>/browser-extension-data/<addon id>/tabmail_fts` not this profile's own (canonicalized), no `<dir>/extensions/<addon id>.xpi`, no symlink on the way. MOVE FIRST (owner 2026-10-05 "move and fix"): if this profile has no `tabmail_fts`, rename the newest orphan (by `fts.db` mtime) in — index + `memory.db` chat memory carry over, add-on reconciliation repairs; then remove the rest; failed move (other volume) = remove, no copy (init RPC timeout); empty parents only; best effort, never fails init. Orphaned/stray/leftover old index after the multi-profile wrong-guess fix (Thunderbird ADR-025).
+
+---
+
 ## Template for New Decisions
 
 ```markdown
