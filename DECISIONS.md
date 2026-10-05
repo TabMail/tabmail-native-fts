@@ -100,6 +100,9 @@ relation beside message identity.
 5. Keep `SCHEMA_VERSION` at 1: the additive relation migrates locally and does
    not require Thunderbird to re-feed message content.
 
+Amended by ADR-NF-006: `folderMembershipSummary` is one unbounded O(rows) read
+per call, an exception to the bounded-call property above.
+
 **Rationale:** Exact equality makes colon-bearing and prefix-related folders
 independent without changing externally visible message keys. A separate,
 initially empty relation avoids a synchronous index build over every historical
@@ -124,6 +127,12 @@ archives of any size.
 ## ADR-NF-005: Attachment File Names Get Their Own FTS Column, Migrated In Place
 
 - **[Full ADR](Companion/Decisions/Active/adr-nf-005-attachment-names-column.md)** — eighth shard column `attachmentNames` appended last (positional bm25/snippet unchanged, weight 3.0); optional `indexBatch` field, no capability; stale = `tokenchars` OR missing column → `rebuild_next_stale_shard` in-place rowid-preserving copy on the IDLE WRITER THREAD, never in `init` (one big shard outlasted the 60 s init RPC → kill/rollback loop), newest first, once per process; SCHEMA_VERSION stays 1; unconverted shard drops names on write; `getMessageByMsgId` returns them; no backfill (smart reindex skips indexed rows).
+
+---
+
+## ADR-NF-006: Folder Membership Summary and Removal Owners
+
+- **[Full ADR](Companion/Decisions/Active/adr-nf-006-folder-membership-summary-and-removal-owners.md)** — reader RPC `folderMembershipSummary { folderIds, trustedAccountIds }` → `{ ownerlessRows, strayTrustedRows, strayUntrustedRows }` in ONE statement (one WAL snapshot), capability `folderMembershipSummaryV1`, stray split by msgId account prefix (first `:` at index > 0, else untrusted), fixed-size reply, one O(rows) read on the reader thread (amends ADR-NF-004 bounded-calls for this RPC); `removeBatch` adds `removedFolderIds` (`DELETE … RETURNING folderId`) + `removedOwnerless`, wire-compatible.
 
 ---
 

@@ -132,6 +132,14 @@ Helpers advertising
 - `assignFolderMembershipBatch { assignments: [{ msgId, folderId }] }` returns
   `{ ok, assigned, alreadyAssigned, missing }`
 
+Helpers advertising `capabilities.folderMembershipSummaryV1` also answer
+`folderMembershipSummary { folderIds, trustedAccountIds }` with
+`{ ok, ownerlessRows, strayTrustedRows, strayUntrustedRows }`: rows with no folder
+relation, and relation rows whose folder is not in `folderIds`, split by whether
+the msgId's account prefix is trusted. It is one read snapshot with a fixed-size
+reply. `removeBatch` returns `removedFolderIds` (distinct owners of the deleted
+rows) and `removedOwnerless` beside `count`.
+
 `indexBatch` accepts `folderId` on each row. Existing rows with no relation can
 adopt one; attempts to reassign a row from one non-empty folder identity to a
 different one fail closed. Paging and assignment batches are bounded per call,
