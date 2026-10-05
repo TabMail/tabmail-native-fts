@@ -2831,6 +2831,118 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_shard_rebuild_failing_after_the_drop_keeps_the_original_shard() {
+        // The copy, DROP and RENAME are one transaction: a failure at the
+        // rename must roll the DROP back, not leave indexed rows shardless.
+        let (mut conn, mut known_years) = setup_test_db();
+        create_shard_without_attachment_names(&conn, 2005);
+        known_years.insert(2005);
+        index_batch(&mut conn, &[row_with_names("acc:/:kept", 1104537600000, "Budget review", None)], None, &mut known_years).unwrap();
+        let before = get_message_by_msgid(&conn, "acc:/:kept").unwrap().unwrap();
+
+        unsafe extern "C" fn deny_alter_table(
+            denied: *mut std::ffi::c_void,
+            action: i32,
+            _: *const std::ffi::c_char,
+            _: *const std::ffi::c_char,
+            _: *const std::ffi::c_char,
+            _: *const std::ffi::c_char,
+        ) -> i32 {
+            if action == rusqlite::ffi::SQLITE_ALTER_TABLE {
+                *(denied as *mut usize) += 1;
+                rusqlite::ffi::SQLITE_DENY
+            } else {
+                rusqlite::ffi::SQLITE_OK
+            }
+        }
+        let mut denied = 0usize;
+        unsafe {
+            assert_eq!(rusqlite::ffi::sqlite3_set_authorizer(conn.handle(), Some(deny_alter_table), &mut denied as *mut usize as *mut _), 0);
+        }
+        assert!(rebuild_next_stale_shard(&mut conn, &mut HashSet::new()).unwrap());
+        unsafe {
+            rusqlite::ffi::sqlite3_set_authorizer(conn.handle(), None, std::ptr::null_mut());
+        }
+        assert!(denied > 0, "the rename, after the copy and the DROP, must have been refused");
+
+        assert_eq!(stale_shard_years(&conn).unwrap(), vec![2005]);
+        assert_eq!(get_message_by_msgid(&conn, "acc:/:kept").unwrap().unwrap(), before);
+        assert_eq!(search_ids(&conn, "budget", &known_years), vec!["acc:/:kept"]);
+        let leftovers: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'messages_fts_2005_retok'", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(leftovers, 0);
+
+        // The next start converts it.
+        assert!(rebuild_next_stale_shard(&mut conn, &mut HashSet::new()).unwrap());
+        assert!(stale_shard_years(&conn).unwrap().is_empty());
+        assert_eq!(get_message_by_msgid(&conn, "acc:/:kept").unwrap().unwrap(), before);
+    }
+
+    #[test]
+    fn test_shard_rebuild_copies_full_length_content() {
+        // Root data rule 11: the converter copies stored content whole.
+        let long_body = format!("{} 終端é bodytail", "fullcontent ".repeat(1000));
+        let long_names = format!("{} Final-Nametail.pdf", "Appendix.pdf ".repeat(100));
+
+        // Seven-column shard: the body survives.
+        let (mut conn, mut known_years) = setup_test_db();
+        create_shard_without_attachment_names(&conn, 2005);
+        known_years.insert(2005);
+        let mut row = row_with_names("acc:/:long", 1104537600000, "Subject", None);
+        row["body"] = Value::String(long_body.clone());
+        index_batch(&mut conn, &[row], None, &mut known_years).unwrap();
+        convert_all_stale_shards(&mut conn);
+        assert!(stale_shard_years(&conn).unwrap().is_empty());
+        assert_eq!(get_message_by_msgid(&conn, "acc:/:long").unwrap().unwrap()["body"], long_body.as_str());
+        assert_eq!(search_ids(&conn, "bodytail", &known_years), vec!["acc:/:long"]);
+
+        // Eight-column shard on an outdated tokenizer: body and names survive.
+        let (mut conn, mut known_years) = setup_test_db();
+        conn.execute_batch(
+            r#"CREATE VIRTUAL TABLE messages_fts_2006 USING fts5(
+                msgId, subject, from_, to_, cc, bcc, body, attachmentNames,
+                tokenize = "porter unicode61 remove_diacritics 2 tokenchars '-_.@'", prefix = '2 3 4')"#,
+        ).unwrap();
+        known_years.insert(2006);
+        let mut row = row_with_names("acc:/:named", 1136073600000, "Subject", Some(&long_names));
+        row["body"] = Value::String(long_body.clone());
+        index_batch(&mut conn, &[row], None, &mut known_years).unwrap();
+        assert_eq!(stale_shard_years(&conn).unwrap(), vec![2006]);
+        convert_all_stale_shards(&mut conn);
+        assert!(stale_shard_years(&conn).unwrap().is_empty());
+        let named = get_message_by_msgid(&conn, "acc:/:named").unwrap().unwrap();
+        assert_eq!(named["body"], long_body.as_str());
+        assert_eq!(named["attachmentNames"], long_names.as_str());
+        assert_eq!(search_ids(&conn, "nametail", &known_years), vec!["acc:/:named"]);
+    }
+
+    #[test]
+    fn test_attachment_name_match_ranks_above_a_body_match_in_hybrid_candidates() {
+        // The hybrid path ranks FTS candidates with its own bm25 call; it must
+        // weigh file names the same way search_fts_only does.
+        let (mut conn, mut known_years) = setup_test_db();
+        let mut by_name = row_with_names("acc:/:by-name", 0, "Update", Some("Quarterly.pdf"));
+        by_name["body"] = Value::String("see attached".to_string());
+        let mut by_body = row_with_names("acc:/:by-body", 0, "Update", None);
+        by_body["body"] = Value::String("quarterly attached".to_string());
+        let mut rows: Vec<Value> = (0..8).map(|i| row_with_names(&format!("acc:/:other{i}"), 0, "Update", None)).collect();
+        rows.push(by_name);
+        rows.push(by_body);
+        index_batch(&mut conn, &rows, None, &mut known_years).unwrap();
+
+        let candidates = search_fts_candidates(&conn, "quarterly", None, None, 50, &known_years).unwrap();
+        assert_eq!(candidates.len(), 2);
+        let rank_of = |id: &str| candidates.iter().find(|c| c.msg_id == id).unwrap().rank;
+        assert!(
+            rank_of("acc:/:by-name") < rank_of("acc:/:by-body"),
+            "name match {} should rank above body match {}",
+            rank_of("acc:/:by-name"),
+            rank_of("acc:/:by-body")
+        );
+    }
+
     /// Subject outranks sender outranks body, on the shard's current columns.
     fn assert_column_weights(conn: &mut Connection, known_years: &mut HashSet<i32>, date_ms: i64) {
         let mut rows: Vec<Value> = (0..8).map(|i| {

@@ -46,6 +46,27 @@ def _read_message(proc):
     return json.loads(message_bytes.decode("utf-8"))
 
 
+# Unrelated messages so a fixture's search term is rare in the index. In a
+# corpus of a few messages that all contain the term, bm25 scores it near zero,
+# and with embeddings on the hybrid merge drops the match below MIN_SCORE.
+FILLER_COUNT = 20
+
+
+def _filler_rows(prefix):
+    return [
+        {
+            "msgId": f"{prefix}-filler-{i}",
+            "subject": f"Lunch order {i}",
+            "from_": f"cafe{i}@example.com",
+            "to_": "office@example.com",
+            "body": f"Sandwich and soup options for day {i}.",
+            "dateMs": 1700000000000 + i * 1000,
+            "hasAttachments": False,
+        }
+        for i in range(FILLER_COUNT)
+    ]
+
+
 class TestRustHelperProcess(unittest.TestCase):
     """Integration tests using the Rust helper process."""
 
@@ -98,6 +119,10 @@ class TestRustHelperProcess(unittest.TestCase):
 
             # 3. Index a batch (use unique msgIds based on timestamp)
             unique_suffix = str(int(time.time() * 1000))
+            _send_message(proc, {"id": "3-filler", "method": "indexBatch", "params": {"rows": _filler_rows(f"test-{unique_suffix}")}})
+            response = _read_message(proc)
+            self.assert_success(response, "filler indexBatch")
+            self.assertEqual(response["result"]["count"], FILLER_COUNT)
             _send_message(
                 proc,
                 {
@@ -160,7 +185,7 @@ class TestRustHelperProcess(unittest.TestCase):
             response = _read_message(proc)
             self.assertEqual(response["id"], "6")
             self.assert_success(response, "stats")
-            self.assertEqual(response["result"]["docs"], 2)
+            self.assertEqual(response["result"]["docs"], 2 + FILLER_COUNT)
 
             # 7. Clear
             _send_message(proc, {"id": "7", "method": "clear", "params": {}})
