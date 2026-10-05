@@ -64,6 +64,8 @@ pub mod sqlite {
     pub const FOLDER_MEMBERSHIP_PAGE_DEFAULT_LIMIT: i64 = 500;
     pub const FOLDER_MEMBERSHIP_PAGE_MAX_LIMIT: i64 = 2_000;
     pub const ASSIGN_FOLDER_MEMBERSHIP_BATCH_MAX: usize = 1_000;
+    /// Most msgIds one `getAttachmentFlags` request may ask about.
+    pub const GET_ATTACHMENT_FLAGS_MAX_IDS: usize = 1_000;
 
     // Year-based FTS sharding
     pub const SHARD_MIN_YEAR: i32 = 2000;

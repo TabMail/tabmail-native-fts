@@ -147,7 +147,7 @@ enum MethodTarget {
 fn classify_method(method: &str) -> MethodTarget {
     match method {
         // Read-only email operations
-        "search" | "stats" | "filterNewMessages" | "getMessageByMsgId"
+        "search" | "stats" | "filterNewMessages" | "getMessageByMsgId" | "getAttachmentFlags"
         | "findByHeaderMessageId" | "queryByDateRange" | "debugSample"
         | "countMsgIdRange" | "fingerprintMsgIdRange" | "listMsgIdRange"
         | "listFolderMembership" | "listFolderMembershipState" => MethodTarget::Reader,
@@ -441,6 +441,25 @@ fn handle_read_request(
                 .context("msgId parameter is required and must be a string")?;
             log::info!("Getting message by msgId: {}", target);
             let res = crate::fts::db::get_message_by_msgid(email_conn, target)?;
+            Ok(serde_json::json!({ "id": msg_id, "result": res }))
+        }
+        "getAttachmentFlags" => {
+            let msg_ids = params
+                .get("msgIds")
+                .and_then(|v| v.as_array())
+                .context("msgIds parameter is required and must be an array")?;
+            if msg_ids.len() > config::sqlite::GET_ATTACHMENT_FLAGS_MAX_IDS {
+                anyhow::bail!(
+                    "msgIds has {} entries; at most {} are allowed",
+                    msg_ids.len(),
+                    config::sqlite::GET_ATTACHMENT_FLAGS_MAX_IDS
+                );
+            }
+            let msg_ids = msg_ids
+                .iter()
+                .map(|v| v.as_str().context("every msgIds entry must be a string"))
+                .collect::<anyhow::Result<Vec<&str>>>()?;
+            let res = crate::fts::db::get_attachment_flags(email_conn, &msg_ids)?;
             Ok(serde_json::json!({ "id": msg_id, "result": res }))
         }
         "findByHeaderMessageId" => {
@@ -1598,6 +1617,45 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.to_string().contains("startKey"), "got: {err}");
+    }
+
+    #[test]
+    fn test_dispatch_get_attachment_flags() {
+        let (email, memory) = test_conns();
+        email
+            .execute_batch(
+                "CREATE TABLE message_meta (rowid INTEGER PRIMARY KEY, dateMs INTEGER NOT NULL, \
+                 hasAttachments INTEGER NOT NULL, parsedIcsAttachments TEXT, shardYear INTEGER NOT NULL DEFAULT 0);",
+            )
+            .unwrap();
+        insert_keys(&email, &["account1:/INBOX:a@example.com", "account1:/INBOX:b@example.com"]);
+        email
+            .execute_batch(
+                "INSERT INTO message_meta (rowid, dateMs, hasAttachments) \
+                 SELECT rowid, 0, msgId = 'account1:/INBOX:a@example.com' FROM message_ids;",
+            )
+            .unwrap();
+        assert!(matches!(classify_method("getAttachmentFlags"), MethodTarget::Reader));
+
+        let resp = dispatch_read(&email, &memory, "getAttachmentFlags", serde_json::json!({
+            "msgIds": ["account1:/INBOX:b@example.com", "account1:/INBOX:c@example.com", "account1:/INBOX:a@example.com"],
+        }))
+        .unwrap();
+        assert_eq!(resp["id"], "test-1");
+        assert_eq!(resp["result"], serde_json::json!({ "ok": true, "flags": [false, null, true] }));
+
+        let err = dispatch_read(&email, &memory, "getAttachmentFlags", serde_json::json!({})).unwrap_err();
+        assert!(err.to_string().contains("msgIds"), "got: {err}");
+        let err = dispatch_read(&email, &memory, "getAttachmentFlags", serde_json::json!({ "msgIds": ["a", 7] })).unwrap_err();
+        assert!(err.to_string().contains("must be a string"), "got: {err}");
+
+        let max = config::sqlite::GET_ATTACHMENT_FLAGS_MAX_IDS;
+        let at_max: Vec<String> = (0..max).map(|i| format!("account1:/INBOX:{i}")).collect();
+        let resp = dispatch_read(&email, &memory, "getAttachmentFlags", serde_json::json!({ "msgIds": at_max })).unwrap();
+        assert_eq!(resp["result"]["flags"].as_array().unwrap().len(), max);
+        let over: Vec<String> = (0..=max).map(|i| format!("account1:/INBOX:{i}")).collect();
+        let err = dispatch_read(&email, &memory, "getAttachmentFlags", serde_json::json!({ "msgIds": over })).unwrap_err();
+        assert!(err.to_string().contains("at most"), "got: {err}");
     }
 
     #[test]

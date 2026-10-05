@@ -1649,6 +1649,20 @@ pub fn get_message_by_msgid(conn: &Connection, msg_id: &str) -> anyhow::Result<O
     })))
 }
 
+/// Each msgId's stored `hasAttachments` flag, in request order: true / false, or null when the
+/// msgId is not indexed. Reads only `message_ids` and `message_meta`, never a shard or a body.
+pub fn get_attachment_flags(conn: &Connection, msg_ids: &[&str]) -> anyhow::Result<Value> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT mm.hasAttachments FROM message_ids mi JOIN message_meta mm ON mi.rowid = mm.rowid WHERE mi.msgId = ?1",
+    )?;
+    let mut flags = Vec::with_capacity(msg_ids.len());
+    for msg_id in msg_ids {
+        let flag: Option<i64> = stmt.query_row(params![msg_id], |r| r.get(0)).optional()?;
+        flags.push(flag.map_or(Value::Null, |v| Value::Bool(v != 0)));
+    }
+    Ok(serde_json::json!({ "ok": true, "flags": flags }))
+}
+
 /// Find all indexed entries matching a specific headerMessageId within an account.
 /// Uses the unsharded message_ids table (no need to iterate FTS shards).
 /// Used by incremental indexer when the exact folder path is unknown (deletion events
@@ -2557,6 +2571,27 @@ mod tests {
         // Test non-existent message
         let result = get_message_by_msgid(&conn, "account1:/INBOX:nonexistent").unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_attachment_flags_returns_each_stored_flag_in_request_order() {
+        let (mut conn, mut known_years) = setup_test_db();
+        let row = |id: &str, has: bool| serde_json::json!({
+            "msgId": id, "subject": "s", "body": "b", "dateMs": 1_704_067_200_000_i64, "hasAttachments": has,
+        });
+        index_batch(&mut conn, &[row("acc:/:with", true), row("acc:/:without", false)], None, &mut known_years).unwrap();
+
+        let res = get_attachment_flags(&conn, &["acc:/:without", "acc:/:missing", "acc:/:with", "acc:/:with"]).unwrap();
+        assert_eq!(res, serde_json::json!({ "ok": true, "flags": [false, null, true, true] }));
+        assert_eq!(get_attachment_flags(&conn, &[]).unwrap(), serde_json::json!({ "ok": true, "flags": [] }));
+    }
+
+    #[test]
+    fn test_get_attachment_flags_reads_null_for_an_id_without_metadata() {
+        let (conn, _) = setup_test_db();
+        conn.execute("INSERT INTO message_ids (msgId) VALUES ('acc:/:orphan')", []).unwrap();
+        let res = get_attachment_flags(&conn, &["acc:/:orphan"]).unwrap();
+        assert_eq!(res["flags"], serde_json::json!([null]));
     }
 
     #[test]
