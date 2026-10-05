@@ -597,7 +597,13 @@ fn writer_thread_main(
 ) {
     log::info!("[writer] Thread started");
 
-    while let Ok(msg) = rx.recv() {
+    let mut attempted_shards: HashSet<i32> = HashSet::new();
+    let mut shards_left = true;
+    loop {
+        let next = next_write_request(&rx, || {
+            convert_one_shard_when_idle(&mut email_conn, &mut attempted_shards, &mut shards_left)
+        });
+        let Some(msg) = next else { break };
         let engine_ref = engine.as_deref();
         let resp = handle_write_request(
             &mut email_conn,
@@ -617,6 +623,46 @@ fn writer_thread_main(
     }
 
     log::info!("[writer] Thread stopped (channel closed)");
+}
+
+/// One idle step of the shard migration: converts the next stale shard and
+/// returns true, or returns false once nothing is left. An error stops the
+/// migration for this process (logged; the next start retries) so the idle
+/// writer can never spin on it.
+fn convert_one_shard_when_idle(conn: &mut Connection, attempted: &mut HashSet<i32>, shards_left: &mut bool) -> bool {
+    if !*shards_left {
+        return false;
+    }
+    match crate::fts::db::rebuild_next_stale_shard(conn, attempted) {
+        Ok(true) => true,
+        Ok(false) => {
+            *shards_left = false;
+            false
+        }
+        Err(e) => {
+            log::error!("[writer] Shard migration stopped until next start: {:?}", e);
+            *shards_left = false;
+            false
+        }
+    }
+}
+
+/// The writer's next request. While none is waiting, `convert_one_shard` runs one
+/// stale-shard conversion at a time (returning false once nothing is left), and
+/// the queue is checked again after each, so a request waits for at most the one
+/// shard in progress. None once the channel closes.
+fn next_write_request<T>(rx: &mpsc::Receiver<T>, mut convert_one_shard: impl FnMut() -> bool) -> Option<T> {
+    loop {
+        match rx.try_recv() {
+            Ok(msg) => return Some(msg),
+            Err(mpsc::TryRecvError::Disconnected) => return None,
+            Err(mpsc::TryRecvError::Empty) => {
+                if !convert_one_shard() {
+                    return rx.recv().ok();
+                }
+            }
+        }
+    }
 }
 
 fn handle_write_request(
@@ -1246,6 +1292,80 @@ mod tests {
             "test-write-1",
             &params,
         )
+    }
+
+    #[test]
+    fn test_idle_step_converts_until_nothing_is_left() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE VIRTUAL TABLE messages_fts_2005 USING fts5(msgId, subject, from_, to_, cc, bcc, body)").unwrap();
+        let (mut attempted, mut shards_left) = (HashSet::new(), true);
+        assert!(convert_one_shard_when_idle(&mut conn, &mut attempted, &mut shards_left));
+        assert!(!convert_one_shard_when_idle(&mut conn, &mut attempted, &mut shards_left));
+        assert!(!shards_left);
+    }
+
+    #[test]
+    fn test_idle_step_stops_for_this_process_on_an_error() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // A shard-like name the column check cannot query: listing stale shards fails.
+        conn.execute_batch(r#"CREATE TABLE "messages_fts_2005 x" (a TEXT)"#).unwrap();
+        assert!(crate::fts::db::rebuild_next_stale_shard(&mut conn, &mut HashSet::new()).is_err());
+        let (mut attempted, mut shards_left) = (HashSet::new(), true);
+        for _ in 0..3 {
+            assert!(!convert_one_shard_when_idle(&mut conn, &mut attempted, &mut shards_left), "an error must not keep the writer busy");
+        }
+        assert!(!shards_left);
+    }
+
+    #[test]
+    fn test_writer_serves_a_waiting_request_after_at_most_one_shard() {
+        let (tx, rx) = mpsc::channel();
+        let mut conversions = 0;
+        // The request arrives while the first shard converts.
+        let next = next_write_request(&rx, || {
+            conversions += 1;
+            tx.send("request").unwrap();
+            conversions < 10 // more shards remain; bounded so a regression fails instead of spinning
+        });
+        assert_eq!(next, Some("request"));
+        assert_eq!(conversions, 1, "the request must not wait for the next shard");
+    }
+
+    #[test]
+    fn test_writer_converts_every_shard_while_idle() {
+        let (tx, rx) = mpsc::channel();
+        // Answers a writer that wrongly waits with shards left, so the test fails instead of hanging.
+        let late = tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let _ = late.send("gave up waiting");
+        });
+        let mut shards = 3;
+        let mut conversions = 0;
+        let next = next_write_request(&rx, || {
+            if shards == 0 {
+                // Only once nothing is left does the writer wait for a request.
+                tx.send("request").unwrap();
+                return false;
+            }
+            shards -= 1;
+            conversions += 1;
+            true
+        });
+        assert_eq!(next, Some("request"));
+        assert_eq!(conversions, 3);
+    }
+
+    #[test]
+    fn test_writer_answers_queued_requests_before_converting_and_stops_when_closed() {
+        let (tx, rx) = mpsc::channel();
+        tx.send("first").unwrap();
+        let mut conversions = 0;
+        assert_eq!(next_write_request(&rx, || { conversions += 1; true }), Some("first"));
+        assert_eq!(conversions, 0);
+        drop(tx);
+        assert_eq!(next_write_request(&rx, || { conversions += 1; true }), None::<&str>);
+        assert_eq!(conversions, 0, "no conversion starts once the channel is closed");
     }
 
     #[test]

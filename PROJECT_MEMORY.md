@@ -56,6 +56,9 @@ Native messaging host for full-text search + semantic search. Communicates with 
 
 ## Recent Discoveries
 
+### 2026-10-04
+- Shards gained an `attachmentNames` FTS5 column (ADR-NF-005). The tokenizer migration became `rebuild_next_stale_shard`, run one shard at a time by the writer thread while no request waits — NEVER in `init`: a single large shard can outlast the add-on's 60 s init RPC timeout, and a timed-out init gets the helper killed mid-copy every start. Staleness now also means "no `attachmentNames` column" (`shard_has_attachment_names`, PRAGMA table_info). Rows copied into a converted shard, and rows from the monolithic migration, hold NULL in that column — read it with `COALESCE`. `bm25()` accepts more weights than a shard has columns, so one SQL works across converted and unconverted shards.
+
 ### 2026-08-22
 - Added capability `folderMembershipV1` and an additive `message_folder_membership(msgId, folderId)` relation with covering `(folderId, msgId)` index. Creating the initially empty relation is constant-size startup DDL; existing archives are not scanned. `indexBatch` accepts optional opaque `folderId`; duplicate rows adopt an absent relation, accept the same value idempotently, and reject a different value transactionally. `listFolderMembership` provides exact BINARY pages for incremental client-side digests. `listFolderMembershipState` pages the global `message_ids` keyspace before joining optional membership, bounding inspected archive rows as well as returned rows. `assignFolderMembershipBatch` reports assigned/alreadyAssigned/missing (outside-policy live messages are missing no-ops) while ownership conflicts remain atomic. Reconciliation is stateless and unbounded overall across bounded calls. Existing msgId keys and range RPCs remain unchanged. `SCHEMA_VERSION` stays 1 because the relation migrates in place and no Thunderbird re-feed is needed (ADR-NF-004).
 

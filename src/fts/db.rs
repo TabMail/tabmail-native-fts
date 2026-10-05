@@ -60,22 +60,41 @@ fn year_from_date_ms(date_ms: i64) -> i32 {
         .year()
 }
 
-fn ensure_shard(conn: &Connection, year: i32, known_years: &mut HashSet<i32>) -> anyhow::Result<()> {
-    if known_years.contains(&year) {
-        return Ok(());
-    }
-    let table = fts_table_name(year);
-    conn.execute_batch(&format!(
+/// The current shard schema. `attachmentNames` is last so every existing column
+/// keeps its position (bm25 weights and snippet indexes are positional).
+fn shard_create_sql(table: &str) -> String {
+    format!(
         r#"CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING fts5(
             msgId,
-            subject, from_, to_, cc, bcc, body,
+            subject, from_, to_, cc, bcc, body, attachmentNames,
             tokenize = "{tokenize}",
             prefix = '{prefix}'
         )"#,
         table = table,
         tokenize = config::sqlite::FTS_TOKENIZE,
         prefix = config::sqlite::FTS_PREFIXES,
-    ))?;
+    )
+}
+
+/// Whether a shard has the `attachmentNames` column. Shards created before it
+/// lack it until `rebuild_next_stale_shard` converts them.
+fn shard_has_attachment_names(conn: &Connection, table: &str) -> anyhow::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    for col in cols {
+        if col? == "attachmentNames" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn ensure_shard(conn: &Connection, year: i32, known_years: &mut HashSet<i32>) -> anyhow::Result<()> {
+    if known_years.contains(&year) {
+        return Ok(());
+    }
+    let table = fts_table_name(year);
+    conn.execute_batch(&shard_create_sql(&table))?;
     conn.execute(
         &format!("INSERT INTO {table}({table}, rank) VALUES('automerge', ?1)"),
         params![config::sqlite::FTS_AUTOMERGE],
@@ -107,12 +126,12 @@ pub fn load_known_years(conn: &Connection) -> anyhow::Result<HashSet<i32>> {
     Ok(years)
 }
 
-/// Year shards created with an outdated `tokenize=` string, detected from the
-/// stored CREATE statement in sqlite_master (current marker: anything still
-/// carrying `tokenchars`). Detection is stateless and needs NO schema version —
-/// bumping SCHEMA_VERSION would make the addon run a FULL re-index from
-/// Thunderbird (see config.rs). Newest years first.
-fn stale_tokenizer_years(conn: &Connection) -> anyhow::Result<Vec<i32>> {
+/// Year shards whose schema is out of date: created with an outdated `tokenize=`
+/// string (the stored CREATE statement in sqlite_master still carries
+/// `tokenchars`) or without the `attachmentNames` column. Detection is stateless
+/// and needs NO schema version — bumping SCHEMA_VERSION would make the addon run
+/// a FULL re-index from Thunderbird (see config.rs). Newest years first.
+fn stale_shard_years(conn: &Connection) -> anyhow::Result<Vec<i32>> {
     let mut stmt = conn.prepare(
         r"SELECT name, sql FROM sqlite_master WHERE type='table' AND name LIKE 'messages\_fts\_%' ESCAPE '\'",
     )?;
@@ -122,7 +141,8 @@ fn stale_tokenizer_years(conn: &Connection) -> anyhow::Result<Vec<i32>> {
     let mut years = Vec::new();
     for row in rows {
         let (name, sql) = row?;
-        if !sql.unwrap_or_default().contains("tokenchars") {
+        let stale_tokenizer = sql.unwrap_or_default().contains("tokenchars");
+        if !stale_tokenizer && shard_has_attachment_names(conn, &name)? {
             continue;
         }
         if let Some(suffix) = name.strip_prefix("messages_fts_") {
@@ -135,52 +155,42 @@ fn stale_tokenizer_years(conn: &Connection) -> anyhow::Result<Vec<i32>> {
     Ok(years)
 }
 
-/// In-place tokenizer migration: rebuild each stale shard with the current
-/// `FTS_TOKENIZE` via a rowid-preserving copy (FTS5 tables store their content,
-/// so `INSERT .. SELECT` re-tokenizes locally — NO re-feed from Thunderbird).
+/// In-place shard migration: rebuild the newest stale shard not yet in
+/// `attempted` with the current schema (`FTS_TOKENIZE`, `attachmentNames`
+/// column) via a rowid-preserving copy (FTS5 tables store their content, so
+/// `INSERT .. SELECT` re-tokenizes locally — NO re-feed from Thunderbird). Rows
+/// copied from a shard without the column get an empty `attachmentNames`.
 /// One transaction per shard: crash-safe, idempotent, message_meta/messages_vec
-/// rowid alignment untouched. Bounded by RETOKENIZE_TIME_BUDGET_SECS per call so
-/// a huge archive cannot blow the addon's init RPC timeout; leftover shards
-/// convert on the next init.
-pub fn rebuild_stale_tokenizer_shards(conn: &mut Connection) -> anyhow::Result<()> {
-    let stale = stale_tokenizer_years(conn)?;
-    if stale.is_empty() {
-        return Ok(());
-    }
-    log::info!("Tokenizer migration: {} shard(s) to rebuild: {:?}", stale.len(), stale);
-    let started = std::time::Instant::now();
-    let mut converted = 0usize;
-    for year in &stale {
-        if started.elapsed().as_secs() >= config::sqlite::RETOKENIZE_TIME_BUDGET_SECS {
-            log::info!(
-                "Tokenizer migration: time budget reached after {}/{} shards — rest convert on next start",
-                converted, stale.len()
-            );
-            return Ok(());
-        }
-        let shard_start = std::time::Instant::now();
-        let table = fts_table_name(*year);
-        let tmp = format!("{table}_retok");
-        // Contain per-shard failures (matches the iOS side): one corrupted
-        // shard must not abort init — the addon would retry-loop forever.
-        // Skipped shards stay stale and are retried on the next init.
-        let result = (|| -> anyhow::Result<()> {
+/// rowid alignment untouched.
+///
+/// The writer thread calls this while it has no request waiting, never `init`:
+/// one large shard can take longer than the addon's init RPC timeout, and a
+/// timed-out init kills the helper and rolls the shard back, every start. A
+/// write request that arrives mid-shard waits for that shard.
+///
+/// Returns false when no stale shard is left outside `attempted`. Each shard
+/// is attempted once per process; a failed one is logged and retried on the
+/// next start, so a broken shard cannot keep the writer busy.
+pub fn rebuild_next_stale_shard(conn: &mut Connection, attempted: &mut HashSet<i32>) -> anyhow::Result<bool> {
+    let Some(year) = stale_shard_years(conn)?.into_iter().find(|y| !attempted.contains(y)) else {
+        return Ok(false);
+    };
+    attempted.insert(year);
+    let shard_start = std::time::Instant::now();
+    let table = fts_table_name(year);
+    let tmp = format!("{table}_retok");
+    let result = (|| -> anyhow::Result<()> {
         let tx = conn.transaction()?;
         tx.execute_batch(&format!("DROP TABLE IF EXISTS {tmp}"))?;
-        tx.execute_batch(&format!(
-            r#"CREATE VIRTUAL TABLE {tmp} USING fts5(
-                msgId,
-                subject, from_, to_, cc, bcc, body,
-                tokenize = "{tokenize}",
-                prefix = '{prefix}'
-            )"#,
-            tokenize = config::sqlite::FTS_TOKENIZE,
-            prefix = config::sqlite::FTS_PREFIXES,
-        ))?;
+        tx.execute_batch(&shard_create_sql(&tmp))?;
         // rowid-preserving copy; SQLite streams rows internally (bounded memory)
+        let columns = if shard_has_attachment_names(&tx, &table)? {
+            "rowid, msgId, subject, from_, to_, cc, bcc, body, attachmentNames"
+        } else {
+            "rowid, msgId, subject, from_, to_, cc, bcc, body"
+        };
         tx.execute_batch(&format!(
-            "INSERT INTO {tmp}(rowid, msgId, subject, from_, to_, cc, bcc, body)
-             SELECT rowid, msgId, subject, from_, to_, cc, bcc, body FROM {table}"
+            "INSERT INTO {tmp}({columns}) SELECT {columns} FROM {table}"
         ))?;
         tx.execute_batch(&format!("DROP TABLE {table}"))?;
         tx.execute_batch(&format!("ALTER TABLE {tmp} RENAME TO {table}"))?;
@@ -195,23 +205,16 @@ pub fn rebuild_stale_tokenizer_shards(conn: &mut Connection) -> anyhow::Result<(
         )?;
         tx.commit()?;
         Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                converted += 1;
-                log::info!(
-                    "Tokenizer migration: rebuilt {} in {:.1}s",
-                    table,
-                    shard_start.elapsed().as_secs_f64()
-                );
-            }
-            Err(e) => {
-                log::error!("Tokenizer migration: shard {} failed (skipping, will retry next init): {:?}", table, e);
-            }
-        }
+    })();
+    match result {
+        Ok(()) => log::info!(
+            "Shard migration: rebuilt {} in {:.1}s",
+            table,
+            shard_start.elapsed().as_secs_f64()
+        ),
+        Err(e) => log::error!("Shard migration: shard {} failed (will retry next start): {:?}", table, e),
     }
-    log::info!("Tokenizer migration complete: {} shard(s) in {:.1}s", converted, started.elapsed().as_secs_f64());
-    Ok(())
+    Ok(true)
 }
 
 /// Crash-safe migration from monolithic messages_fts to year-sharded tables.
@@ -455,7 +458,7 @@ pub fn open_or_create_db(profile_dir: &Path) -> anyhow::Result<(PathBuf, Connect
     log::info!("  FTS Dir: {}", fts_dir.display());
     log::info!("  DB Path: {}", db_path.display());
 
-    let mut conn = Connection::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
+    let conn = Connection::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
     ensure_fts5_available(&conn)?;
 
     let mut known_years = HashSet::new();
@@ -494,10 +497,11 @@ pub fn open_or_create_db(profile_dir: &Path) -> anyhow::Result<(PathBuf, Connect
     // not call init_database(), so apply the additive relation on every open.
     ensure_folder_membership_schema(&conn)?;
 
-    // In-place tokenizer migration for shards created with an outdated
-    // tokenize= string. NO SCHEMA_VERSION bump — the addon must never see this
-    // (a version change triggers a full re-index from Thunderbird).
-    rebuild_stale_tokenizer_shards(&mut conn)?;
+    // Shards created with an outdated tokenize= string or without the
+    // attachmentNames column convert later on the writer thread
+    // (rebuild_next_stale_shard), never here: init must answer within the
+    // addon's RPC timeout. NO SCHEMA_VERSION bump — the addon must never see
+    // this (a version change triggers a full re-index from Thunderbird).
 
     let count = db_count(&conn)?;
     log::info!("Database initialized: {} documents indexed, {} year shards: {:?}", count, known_years.len(), known_years);
@@ -634,6 +638,16 @@ pub fn index_batch(conn: &mut Connection, rows: &[Value], engine: Option<&Embedd
         ensure_shard(conn, year, known_years)?;
     }
 
+    // A shard not yet converted by rebuild_next_stale_shard has no attachmentNames
+    // column; rows written to it keep the old column set.
+    let mut shard_has_names: HashMap<i32, bool> = HashMap::new();
+    for row in rows {
+        let year = year_from_date_ms(row.get("dateMs").and_then(|v| v.as_i64()).unwrap_or(0));
+        if !shard_has_names.contains_key(&year) {
+            shard_has_names.insert(year, shard_has_attachment_names(conn, &fts_table_name(year))?);
+        }
+    }
+
     let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
 
     let mut inserted: i64 = 0;
@@ -711,17 +725,27 @@ pub fn index_batch(conn: &mut Connection, rows: &[Value], engine: Option<&Embedd
         let cc = row.get("cc").and_then(|v| v.as_str()).unwrap_or("");
         let bcc = row.get("bcc").and_then(|v| v.as_str()).unwrap_or("");
         let body = row.get("body").and_then(|v| v.as_str()).unwrap_or("");
+        let attachment_names = row.get("attachmentNames").and_then(|v| v.as_str()).unwrap_or("");
 
         let date_ms = row.get("dateMs").and_then(|v| v.as_i64()).unwrap_or(0);
         let year = year_from_date_ms(date_ms);
         let table = fts_table_name(year);
 
-        tx.execute(
-            &format!(
-                "INSERT INTO {table} (rowid, msgId, subject, from_, to_, cc, bcc, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
-            ),
-            params![row_id, msg_id_val, subject, from_, to_, cc, bcc, body],
-        )?;
+        if shard_has_names[&year] {
+            tx.execute(
+                &format!(
+                    "INSERT INTO {table} (rowid, msgId, subject, from_, to_, cc, bcc, body, attachmentNames) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+                ),
+                params![row_id, msg_id_val, subject, from_, to_, cc, bcc, body, attachment_names],
+            )?;
+        } else {
+            tx.execute(
+                &format!(
+                    "INSERT INTO {table} (rowid, msgId, subject, from_, to_, cc, bcc, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+                ),
+                params![row_id, msg_id_val, subject, from_, to_, cc, bcc, body],
+            )?;
+        }
 
         let has_attachments = row
             .get("hasAttachments")
@@ -1152,7 +1176,7 @@ fn search_fts_only(
         let mut sq = format!(
             r#"SELECT fts.msgId, fts.from_, fts.subject, meta.dateMs, meta.hasAttachments,
                 snippet({table}, -1, '[', ']', '…', {st}) AS snippet,
-                bm25({table}, 0.0, 5.0, 3.0, 2.0, 1.0, 1.0, 1.0) AS rank
+                bm25({table}, 0.0, 5.0, 3.0, 2.0, 1.0, 1.0, 1.0, 3.0) AS rank
             FROM {table} fts
             JOIN message_meta meta ON fts.rowid = meta.rowid
             WHERE {table} MATCH ?1"#,
@@ -1234,7 +1258,7 @@ fn search_fts_candidates(
         let mut sq = format!(
             r#"SELECT fts.rowid, fts.msgId, fts.from_, fts.subject, meta.dateMs, meta.hasAttachments,
                 snippet({table}, -1, '[', ']', '…', {st}) AS snippet,
-                bm25({table}, 0.0, 5.0, 3.0, 2.0, 1.0, 1.0, 1.0) AS rank
+                bm25({table}, 0.0, 5.0, 3.0, 2.0, 1.0, 1.0, 1.0, 3.0) AS rank
             FROM {table} fts
             JOIN message_meta meta ON fts.rowid = meta.rowid
             WHERE {table} MATCH ?1"#,
@@ -1597,14 +1621,16 @@ pub fn get_message_by_msgid(conn: &Connection, msg_id: &str) -> anyhow::Result<O
 
     // Step 3: Get FTS columns from specific shard
     let table = fts_table_name(shard_year);
-    let fts_row: Option<(String, String, String, String, String, String)> = conn
+    // Rows copied in by a shard migration have a NULL attachmentNames.
+    let names_column = if shard_has_attachment_names(conn, &table)? { "COALESCE(attachmentNames, '')" } else { "''" };
+    let fts_row: Option<(String, String, String, String, String, String, String)> = conn
         .query_row(
-            &format!("SELECT subject, from_, to_, cc, bcc, body FROM {table} WHERE rowid = ?1"),
+            &format!("SELECT subject, from_, to_, cc, bcc, body, {names_column} FROM {table} WHERE rowid = ?1"),
             params![row_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
         )
         .optional()?;
-    let Some((subject, from_, to_, cc, bcc, body)) = fts_row else {
+    let Some((subject, from_, to_, cc, bcc, body, attachment_names)) = fts_row else {
         return Ok(None);
     };
 
@@ -1616,6 +1642,7 @@ pub fn get_message_by_msgid(conn: &Connection, msg_id: &str) -> anyhow::Result<O
         "to_": to_,
         "cc": cc,
         "bcc": bcc,
+        "attachmentNames": attachment_names,
         "hasAttachments": has_attachments,
         "parsedIcsAttachments": parsed_ics.unwrap_or_default(),
         "dateMs": date_ms
@@ -2070,6 +2097,12 @@ mod tests {
         0
     }
 
+    /// What the writer thread does while idle, until nothing is left to convert.
+    fn convert_all_stale_shards(conn: &mut Connection) {
+        let mut attempted = HashSet::new();
+        while rebuild_next_stale_shard(conn, &mut attempted).unwrap() {}
+    }
+
     /// Create an in-memory database with year-sharded FTS schema for testing.
     /// Returns (connection, known_years set).
     fn setup_test_db() -> (Connection, HashSet<i32>) {
@@ -2238,7 +2271,7 @@ mod tests {
         ).unwrap();
         assert_eq!(n, 0, "precondition: glued token must not part-match");
 
-        rebuild_stale_tokenizer_shards(&mut conn).unwrap();
+        convert_all_stale_shards(&mut conn);
 
         // Shard now uses the current tokenizer (no tokenchars)
         let sql: String = conn.query_row(
@@ -2265,7 +2298,7 @@ mod tests {
         );
 
         // Idempotent: second run is a no-op
-        rebuild_stale_tokenizer_shards(&mut conn).unwrap();
+        convert_all_stale_shards(&mut conn);
         let n: i64 = conn.query_row(
             "SELECT count(*) FROM messages_fts_2001 WHERE messages_fts_2001 MATCH 'billing'",
             [], |r| r.get(0),
@@ -2304,12 +2337,12 @@ mod tests {
             config::sqlite::FTS_TOKENIZE
         )).unwrap();
 
-        let stale = stale_tokenizer_years(&conn).unwrap();
+        let stale = stale_shard_years(&conn).unwrap();
         assert_eq!(stale, vec![2004], "only the real legacy shard must be stale, got {stale:?}");
 
         // Rebuild succeeds despite the leftover _retok (dropped + recreated)
-        rebuild_stale_tokenizer_shards(&mut conn).unwrap();
-        let stale_after = stale_tokenizer_years(&conn).unwrap();
+        convert_all_stale_shards(&mut conn);
+        let stale_after = stale_shard_years(&conn).unwrap();
         assert!(stale_after.is_empty(), "no stale shards after rebuild, got {stale_after:?}");
         let n: i64 = conn.query_row(
             "SELECT count(*) FROM messages_fts_2004 WHERE messages_fts_2004 MATCH 'domain'",
@@ -2608,6 +2641,255 @@ mod tests {
         assert!(subjects.iter().any(|s| s.contains("forecast")), "Missing 2024 result");
         assert!(subjects.iter().any(|s| s.contains("review")), "Missing 2023 result");
         assert!(subjects.iter().any(|s| s.contains("analysis")), "Missing 2000 result");
+    }
+
+    // --- attachmentNames column ---
+
+    /// A shard in the schema every install had before the attachmentNames
+    /// column: current tokenizer, seven columns.
+    fn create_shard_without_attachment_names(conn: &Connection, year: i32) {
+        conn.execute_batch(&format!(
+            r#"CREATE VIRTUAL TABLE messages_fts_{year} USING fts5(
+                msgId, subject, from_, to_, cc, bcc, body,
+                tokenize = "{}", prefix = '{}')"#,
+            config::sqlite::FTS_TOKENIZE,
+            config::sqlite::FTS_PREFIXES,
+        )).unwrap();
+    }
+
+    fn row_with_names(msg_id: &str, date_ms: i64, subject: &str, names: Option<&str>) -> Value {
+        let mut row = serde_json::json!({
+            "msgId": msg_id,
+            "dateMs": date_ms,
+            "subject": subject,
+            "from": "sender@example.com",
+            "body": "body",
+        });
+        if let Some(names) = names {
+            row["attachmentNames"] = Value::String(names.to_string());
+        }
+        row
+    }
+
+    fn search_ids(conn: &Connection, q: &str, known_years: &HashSet<i32>) -> Vec<String> {
+        let params = serde_json::json!({"ignoreDate": true});
+        let mut ids: Vec<String> = search(conn, q, &params, &SynonymLookup::new(), None, known_years)
+            .unwrap()
+            .iter()
+            .map(|r| r["uniqueId"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn test_index_batch_stores_and_searches_attachment_names() {
+        let (mut conn, mut known_years) = setup_test_db();
+        let rows = vec![
+            row_with_names("acc:/:named", 0, "Monthly update", Some("Statement-Quarterly.pdf")),
+            row_with_names("acc:/:plain", 0, "Monthly update", None),
+        ];
+        index_batch(&mut conn, &rows, None, &mut known_years).unwrap();
+
+        assert_eq!(search_ids(&conn, "quarterly", &known_years), vec!["acc:/:named"]);
+        assert_eq!(search_ids(&conn, "monthly", &known_years), vec!["acc:/:named", "acc:/:plain"]);
+
+        let named = get_message_by_msgid(&conn, "acc:/:named").unwrap().unwrap();
+        assert_eq!(named["attachmentNames"], "Statement-Quarterly.pdf");
+        let plain = get_message_by_msgid(&conn, "acc:/:plain").unwrap().unwrap();
+        assert_eq!(plain["attachmentNames"], "");
+    }
+
+    #[test]
+    fn test_shard_without_attachment_names_is_rebuilt_in_place() {
+        let (mut conn, mut known_years) = setup_test_db();
+        let year_2005_ms = 1104537600000; // 2005-01-01: the shard's year is what matters
+        create_shard_without_attachment_names(&conn, 2005);
+        known_years.insert(2005);
+        index_batch(&mut conn, &[row_with_names("acc:/:old", year_2005_ms, "Budget review", None)], None, &mut known_years).unwrap();
+        let old_rowid: i64 = conn.query_row(
+            "SELECT rowid FROM message_ids WHERE msgId = 'acc:/:old'", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(stale_shard_years(&conn).unwrap(), vec![2005]);
+
+        // Before the shard converts: writes to it succeed without the names,
+        // and search spans old and new shards together.
+        index_batch(&mut conn, &[
+            row_with_names("acc:/:early", year_2005_ms, "Budget early", Some("Early-Invoice.pdf")),
+            row_with_names("acc:/:new", 0, "Budget new", Some("Fresh-Invoice.pdf")),
+        ], None, &mut known_years).unwrap();
+        assert_eq!(get_message_by_msgid(&conn, "acc:/:early").unwrap().unwrap()["attachmentNames"], "");
+        assert_eq!(search_ids(&conn, "budget", &known_years), vec!["acc:/:early", "acc:/:new", "acc:/:old"]);
+        assert_eq!(search_ids(&conn, "invoice", &known_years), vec!["acc:/:new"]);
+
+        convert_all_stale_shards(&mut conn);
+
+        assert!(stale_shard_years(&conn).unwrap().is_empty());
+        assert!(shard_has_attachment_names(&conn, "messages_fts_2005").unwrap());
+        let (rowid, body): (i64, String) = conn.query_row(
+            "SELECT rowid, body FROM messages_fts_2005 WHERE msgId = 'acc:/:old'", [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!((rowid, body.as_str()), (old_rowid, "body"));
+        let old = get_message_by_msgid(&conn, "acc:/:old").unwrap().unwrap();
+        assert_eq!((old["subject"].as_str(), old["attachmentNames"].as_str()), (Some("Budget review"), Some("")));
+
+        // After converting, new rows in that shard keep their names.
+        index_batch(&mut conn, &[row_with_names("acc:/:late", year_2005_ms, "Budget late", Some("Late-Invoice.pdf"))], None, &mut known_years).unwrap();
+        assert_eq!(search_ids(&conn, "invoice", &known_years), vec!["acc:/:late", "acc:/:new"]);
+
+        convert_all_stale_shards(&mut conn);
+        assert_eq!(search_ids(&conn, "budget", &known_years).len(), 4, "second run must be a no-op");
+    }
+
+    #[test]
+    fn test_shard_rebuild_keeps_existing_attachment_names() {
+        // A shard that already has the column but an outdated tokenizer keeps
+        // its names through the rebuild.
+        let (mut conn, mut known_years) = setup_test_db();
+        conn.execute_batch(
+            r#"CREATE VIRTUAL TABLE messages_fts_2006 USING fts5(
+                msgId, subject, from_, to_, cc, bcc, body, attachmentNames,
+                tokenize = "porter unicode61 remove_diacritics 2 tokenchars '-_.@'", prefix = '2 3 4')"#,
+        ).unwrap();
+        known_years.insert(2006);
+        // Earlier messages in other shards, so this row's rowid is not the 1 an
+        // empty copy target would assign on its own.
+        index_batch(&mut conn, &[row_with_names("acc:/:a", 0, "Other", None), row_with_names("acc:/:b", 0, "Other", None)], None, &mut known_years).unwrap();
+        index_batch(&mut conn, &[row_with_names("acc:/:kept", 1136073600000, "Note", Some("Kept-Report.pdf"))], None, &mut known_years).unwrap();
+        let kept_rowid: i64 = conn.query_row("SELECT rowid FROM message_ids WHERE msgId = 'acc:/:kept'", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept_rowid, 3);
+        assert_eq!(stale_shard_years(&conn).unwrap(), vec![2006]);
+
+        convert_all_stale_shards(&mut conn);
+
+        assert!(stale_shard_years(&conn).unwrap().is_empty());
+        let shard_rowid: i64 = conn.query_row("SELECT rowid FROM messages_fts_2006 WHERE msgId = 'acc:/:kept'", [], |r| r.get(0)).unwrap();
+        assert_eq!(shard_rowid, kept_rowid);
+        assert_eq!(get_message_by_msgid(&conn, "acc:/:kept").unwrap().unwrap()["attachmentNames"], "Kept-Report.pdf");
+        assert_eq!(search_ids(&conn, "report", &known_years), vec!["acc:/:kept"]);
+    }
+
+    #[test]
+    fn test_attachment_name_match_ranks_above_a_body_match() {
+        // A file name weighs like the sender, above body text.
+        let (mut conn, mut known_years) = setup_test_db();
+        let mut by_name = row_with_names("acc:/:by-name", 0, "Update", Some("Quarterly.pdf"));
+        by_name["body"] = Value::String("see attached".to_string());
+        let mut by_body = row_with_names("acc:/:by-body", 0, "Update", None);
+        by_body["body"] = Value::String("quarterly attached".to_string());
+        // Unrelated messages, so the term is rare enough for bm25 to score it.
+        let mut rows: Vec<Value> = (0..8).map(|i| row_with_names(&format!("acc:/:other{i}"), 0, "Update", None)).collect();
+        rows.push(by_name);
+        rows.push(by_body);
+        index_batch(&mut conn, &rows, None, &mut known_years).unwrap();
+
+        let params = serde_json::json!({"ignoreDate": true});
+        let results = search(&conn, "quarterly", &params, &SynonymLookup::new(), None, &known_years).unwrap();
+        assert_eq!(results.len(), 2);
+        let rank_of = |id: &str| results.iter().find(|r| r["uniqueId"] == id).unwrap()["rank"].as_f64().unwrap();
+        // bm25 ranks are negative; more negative is a better match.
+        assert!(
+            rank_of("acc:/:by-name") < rank_of("acc:/:by-body"),
+            "name match {} should rank above body match {}",
+            rank_of("acc:/:by-name"),
+            rank_of("acc:/:by-body")
+        );
+    }
+
+    /// Subject outranks sender outranks body, on the shard's current columns.
+    fn assert_column_weights(conn: &mut Connection, known_years: &mut HashSet<i32>, date_ms: i64) {
+        let mut rows: Vec<Value> = (0..8).map(|i| {
+            let mut r = row_with_names(&format!("acc:/:filler{date_ms}-{i}"), date_ms, "lunch", None);
+            r["from"] = Value::String("friend@example.com".to_string());
+            r
+        }).collect();
+        let mut in_subject = row_with_names(&format!("acc:/:subject{date_ms}"), date_ms, "zephyr plans", None);
+        in_subject["from"] = Value::String("friend@example.com".to_string());
+        let mut in_from = row_with_names(&format!("acc:/:from{date_ms}"), date_ms, "plans", None);
+        in_from["from"] = Value::String("zephyr@example.com".to_string());
+        let mut in_body = row_with_names(&format!("acc:/:body{date_ms}"), date_ms, "plans", None);
+        in_body["from"] = Value::String("friend@example.com".to_string());
+        in_body["body"] = Value::String("zephyr".to_string());
+        rows.extend([in_subject, in_from, in_body]);
+        index_batch(conn, &rows, None, known_years).unwrap();
+
+        let params = serde_json::json!({"ignoreDate": true});
+        let results = search(conn, "zephyr", &params, &SynonymLookup::new(), None, known_years).unwrap();
+        let rank_of = |id: String| results.iter().find(|r| r["uniqueId"] == id.as_str()).unwrap()["rank"].as_f64().unwrap();
+        let (subject, from, body) = (
+            rank_of(format!("acc:/:subject{date_ms}")),
+            rank_of(format!("acc:/:from{date_ms}")),
+            rank_of(format!("acc:/:body{date_ms}")),
+        );
+        assert!(subject < from && from < body, "subject {subject} < from {from} < body {body}");
+    }
+
+    #[test]
+    fn test_attachment_names_column_keeps_existing_column_weights() {
+        // bm25 weights are positional: attachmentNames must stay the last column.
+        let (mut conn, mut known_years) = setup_test_db();
+        assert_column_weights(&mut conn, &mut known_years, 0);
+
+        let year_2005_ms = 1104537600000;
+        create_shard_without_attachment_names(&conn, 2005);
+        known_years.insert(2005);
+        convert_all_stale_shards(&mut conn);
+        assert_column_weights(&mut conn, &mut known_years, year_2005_ms);
+    }
+
+    #[test]
+    fn test_writer_idle_step_converts_newest_shard_first_one_at_a_time() {
+        let (mut conn, mut known_years) = setup_test_db();
+        for year in [2005, 2007] {
+            create_shard_without_attachment_names(&conn, year);
+            known_years.insert(year);
+        }
+        let mut attempted = HashSet::new();
+
+        assert!(rebuild_next_stale_shard(&mut conn, &mut attempted).unwrap());
+        assert_eq!(stale_shard_years(&conn).unwrap(), vec![2005], "newest year converts first");
+        assert!(rebuild_next_stale_shard(&mut conn, &mut attempted).unwrap());
+        assert!(stale_shard_years(&conn).unwrap().is_empty());
+        assert!(!rebuild_next_stale_shard(&mut conn, &mut attempted).unwrap());
+    }
+
+    #[test]
+    fn test_writer_idle_step_tries_a_failing_shard_once_per_process() {
+        let (mut conn, _known_years) = setup_test_db();
+        // Stale (no attachmentNames column) and cannot be copied (no FTS columns).
+        conn.execute_batch("CREATE TABLE messages_fts_2008 (x TEXT)").unwrap();
+        let mut attempted = HashSet::new();
+
+        assert!(rebuild_next_stale_shard(&mut conn, &mut attempted).unwrap());
+        assert_eq!(stale_shard_years(&conn).unwrap(), vec![2008], "the failed copy rolled back");
+        assert!(!rebuild_next_stale_shard(&mut conn, &mut attempted).unwrap(), "not retried until the next start");
+        assert!(rebuild_next_stale_shard(&mut conn, &mut HashSet::new()).unwrap(), "a new process tries it again");
+    }
+
+    #[test]
+    fn test_init_answers_without_converting_stale_shards() {
+        // One large shard can outlast the addon's init RPC timeout, so opening the
+        // database must leave conversion to the writer thread.
+        // As main() does before opening any connection; registering twice is a no-op.
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+        let profile = std::env::temp_dir().join(format!("tabmail-fts-init-test-{}", std::process::id()));
+        std::fs::create_dir_all(&profile).unwrap();
+        {
+            let (_path, conn, _years) = open_or_create_db(&profile).unwrap();
+            create_shard_without_attachment_names(&conn, 2005);
+        }
+        let (_path, mut conn, known_years) = open_or_create_db(&profile).unwrap();
+        assert!(known_years.contains(&2005));
+        assert_eq!(stale_shard_years(&conn).unwrap(), vec![2005]);
+
+        convert_all_stale_shards(&mut conn);
+        assert!(stale_shard_years(&conn).unwrap().is_empty());
+        drop(conn);
+        std::fs::remove_dir_all(&profile).unwrap();
     }
 
     // --- countMsgIdRange / fingerprintMsgIdRange / listMsgIdRange ---

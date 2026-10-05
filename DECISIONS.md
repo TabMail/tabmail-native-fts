@@ -121,6 +121,12 @@ archives of any size.
 
 ---
 
+## ADR-NF-005: Attachment File Names Get Their Own FTS Column, Migrated In Place
+
+- **[Full ADR](Companion/Decisions/Active/adr-nf-005-attachment-names-column.md)** — eighth shard column `attachmentNames` appended last (positional bm25/snippet unchanged, weight 3.0); optional `indexBatch` field, no capability; stale = `tokenchars` OR missing column → `rebuild_next_stale_shard` in-place rowid-preserving copy on the IDLE WRITER THREAD, never in `init` (one big shard outlasted the 60 s init RPC → kill/rollback loop), newest first, once per process; SCHEMA_VERSION stays 1; unconverted shard drops names on write; `getMessageByMsgId` returns them; no backfill (smart reindex skips indexed rows).
+
+---
+
 ## Template for New Decisions
 
 ```markdown
