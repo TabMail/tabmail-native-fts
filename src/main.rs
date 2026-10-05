@@ -1641,6 +1641,7 @@ mod tests {
             "msgIds": ["account1:/INBOX:b@example.com", "account1:/INBOX:c@example.com", "account1:/INBOX:a@example.com"],
         }))
         .unwrap();
+        assert_eq!(resp["id"], "test-1");
         assert_eq!(resp["result"], serde_json::json!({ "ok": true, "flags": [false, null, true] }));
 
         let err = dispatch_read(&email, &memory, "getAttachmentFlags", serde_json::json!({})).unwrap_err();
