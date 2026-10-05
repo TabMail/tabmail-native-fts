@@ -67,5 +67,6 @@ unreachable by that name. The owner weighed putting the names in an existing col
   second copy of one shard on disk), the same one-time cost as the 2026-06 tokenizer
   migration, but no longer on the startup path.
 - A row written to a not-yet-converted shard loses its names for good. Newest shard first
-  keeps this window short for new mail.
+  keeps this window short for new mail. **Owner-accepted 2026-10-04** over converting a
+  shard before writing to it.
 - iOS has its own index and is unchanged.
