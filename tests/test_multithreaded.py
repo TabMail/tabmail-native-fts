@@ -76,6 +76,27 @@ def _read_all_responses(proc, expected_count, timeout_seconds=60):
     return responses
 
 
+# Unrelated messages so a fixture's search term is rare in the index. In a
+# corpus of a few messages that all contain the term, bm25 scores it near zero,
+# and with embeddings on the hybrid merge drops the match below MIN_SCORE.
+FILLER_COUNT = 20
+
+
+def _filler_rows(prefix):
+    return [
+        {
+            "msgId": f"{prefix}-filler-{i}",
+            "subject": f"Lunch order {i}",
+            "from_": f"cafe{i}@example.com",
+            "to_": "office@example.com",
+            "body": f"Sandwich and soup options for day {i}.",
+            "dateMs": 1700000000000 + i * 1000,
+            "hasAttachments": False,
+        }
+        for i in range(FILLER_COUNT)
+    ]
+
+
 class TestMultiThreadedDispatch(unittest.TestCase):
     """Integration tests for multi-threaded reader/writer dispatch."""
 
@@ -113,6 +134,12 @@ class TestMultiThreadedDispatch(unittest.TestCase):
         self.assertTrue(init_resp["result"]["ok"])
 
         return hello_resp
+
+    def _index_filler(self, proc, prefix):
+        _send_message(proc, {"id": f"{prefix}-filler", "method": "indexBatch", "params": {"rows": _filler_rows(prefix)}})
+        resp = _read_message(proc)
+        self.assertIn("result", resp, f"filler indexBatch failed: {resp}")
+        self.assertEqual(resp["result"]["count"], FILLER_COUNT)
 
     def _stop_process(self, proc):
         try:
@@ -157,9 +184,10 @@ class TestMultiThreadedDispatch(unittest.TestCase):
         proc = self._start_process()
         try:
             self._hello_and_init(proc)
+            ts = str(int(time.time() * 1000))
+            self._index_filler(proc, f"mt-basic-{ts}")
 
             # Writer: index some data
-            ts = str(int(time.time() * 1000))
             rows = [
                 {
                     "msgId": f"mt-basic-{i}-{ts}",
@@ -181,7 +209,7 @@ class TestMultiThreadedDispatch(unittest.TestCase):
             _send_message(proc, {"id": "r1", "method": "stats", "params": {}})
             resp = _read_message(proc)
             self.assertIn("result", resp, f"stats failed: {resp}")
-            self.assertEqual(resp["result"]["docs"], 3)
+            self.assertEqual(resp["result"]["docs"], 3 + FILLER_COUNT)
 
             # Reader: search
             _send_message(proc, {"id": "r2", "method": "search", "params": {"q": "milestones", "limit": 10}})
@@ -217,6 +245,7 @@ class TestMultiThreadedDispatch(unittest.TestCase):
 
             # First, index some data so search has something to find
             ts = str(int(time.time() * 1000))
+            self._index_filler(proc, f"mt-seed-{ts}")
             seed_rows = [
                 {
                     "msgId": f"mt-seed-{i}-{ts}",
