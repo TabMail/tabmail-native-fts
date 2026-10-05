@@ -1539,38 +1539,37 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    fn set_index_age(fts_dir: &Path, seconds_ago: u64) {
+    fn set_age(file: &Path, seconds_ago: u64) {
         let when = std::time::SystemTime::now() - std::time::Duration::from_secs(seconds_ago);
-        std::fs::File::options()
-            .write(true)
-            .open(fts_dir.join("fts.db"))
-            .unwrap()
-            .set_modified(when)
-            .unwrap();
+        std::fs::File::options().write(true).open(file).unwrap().set_modified(when).unwrap();
     }
 
     #[test]
-    fn moves_the_newest_orphan_into_a_profile_without_an_index() {
+    fn moves_the_orphan_with_the_newest_mail_index_into_a_profile_without_one() {
         let root = guess_test_root("adopt");
         let own = root.join("Profiles/own.default");
         install_addon(&own);
         std::fs::create_dir_all(data_dir_of(&own)).unwrap();
+        // The newest mail index is created first, sorts first by path and has
+        // the older chat memory, so only its fts.db age selects it.
         let fallback = root.join(".tabmail");
-        let older = write_index(&fallback);
-        set_index_age(&older, 3600);
-        let crash_reports = root.join("Profiles/Crash Reports");
-        let newest = write_index(&crash_reports);
+        let newest = write_index(&fallback);
         std::fs::write(newest.join("fts.db"), b"newest index").unwrap();
-        set_index_age(&newest, 60);
+        set_age(&newest.join("fts.db"), 60);
+        set_age(&newest.join("memory.db"), 3600);
+        let crash_reports = root.join("Profiles/Crash Reports");
+        let older = write_index(&crash_reports);
+        set_age(&older.join("fts.db"), 3600);
+        set_age(&older.join("memory.db"), 60);
 
-        adopt_or_remove_orphaned_indexes(&data_dir_of(&own), &[crash_reports.clone(), fallback.clone(), own.clone()]);
+        adopt_or_remove_orphaned_indexes(&data_dir_of(&own), &[fallback.clone(), crash_reports.clone(), own.clone()]);
 
         let own_index = data_dir_of(&own).join("tabmail_fts");
         assert_eq!(std::fs::read(own_index.join("fts.db")).unwrap(), b"newest index");
         assert_eq!(std::fs::read(own_index.join("memory.db")).unwrap(), b"memory");
-        assert!(!crash_reports.join("browser-extension-data").exists());
-        assert!(!older.exists());
         assert!(!fallback.join("browser-extension-data").exists());
+        assert!(!older.exists());
+        assert!(!crash_reports.join("browser-extension-data").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

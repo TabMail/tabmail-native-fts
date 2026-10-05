@@ -69,6 +69,12 @@ do it costs one directory listing and a few `stat` calls.
 - Where several orphans exist, only the newest moves; the others, including their
   `memory.db`, are removed. A moved orphan may hold another profile's rows (two profiles
   that shared a guessed directory); they stay as accepted contamination.
+- **Release order: this helper before (or with) the add-on release carrying ADR-025.** The
+  add-on updates the helper before `init`, so a user who gets both at once moves the
+  orphan. If the add-on ships first, the old helper creates an empty index in this
+  profile on its first `init` with `profilePath`; when this helper arrives later, the
+  orphan is removed instead of moved and its chat memory is lost (the mail index has
+  already been rebuilt).
 - An orphan on another volume than the profile is removed instead of moved; that user's
   index is rebuilt and older chat memory is lost.
 - An add-on release older than ADR-025, running in another profile at the same time and
