@@ -120,6 +120,11 @@ pub mod memory {
     // continues it with positive steps, so a merge cut short survives the
     // next write's new segment.
     pub const TRIM_MERGE_STEP_PAGES: i64 = 256;
+    // A trim estimates each row's share of the used size from its content
+    // length plus this many bytes, for its index entries, metadata and vector
+    // row. Only how rows compare matters: the estimates are scaled to the
+    // measured used size, and the trim re-measures after each pass.
+    pub const TRIM_ROW_OVERHEAD_BYTES: i64 = 512;
 }
 
 pub mod hybrid {

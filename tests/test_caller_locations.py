@@ -91,6 +91,11 @@ class TestCallerLocations(unittest.TestCase):
         self.helper = str(Path(helper).resolve())
         self.home = Path(tempfile.mkdtemp(prefix="fts_locations_home_"))
         self.caller = Path(tempfile.mkdtemp(prefix="fts_locations_caller_"))
+        # The helper runs in its own folder whose `models` holds unreadable
+        # files, so a relative `modelDir` resolved against it loads nothing
+        # and downloads nothing.
+        self.cwd = Path(tempfile.mkdtemp(prefix="fts_locations_cwd_"))
+        _write_unreadable_model(self.cwd / "models")
 
         # A Thunderbird user's files the helper must never touch.
         profile = _profiles_dir(self.home) / "own.default"
@@ -108,6 +113,7 @@ class TestCallerLocations(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.home, ignore_errors=True)
         shutil.rmtree(self.caller, ignore_errors=True)
+        shutil.rmtree(self.cwd, ignore_errors=True)
 
     def _spawn(self, args=()):
         env = dict(os.environ)
@@ -120,6 +126,7 @@ class TestCallerLocations(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             env=env,
+            cwd=self.cwd,
         )
 
     def _session(self, args, requests):
@@ -226,9 +233,16 @@ class TestCallerLocations(unittest.TestCase):
         self.assertFalse(log_dir.exists())
         self.assertEqual(_tree_hashes(self.home), before)
 
-        # A level is still a level: the file log at "warn" is in the caller's folder.
-        self._session(["--log-dir", str(log_dir), "--log-level", "warn"], [("memoryStats", {})])
+        # A level is still a level: at "warn" the file log is in the caller's
+        # folder and leaves out info lines; at "debug" it has them.
+        listing = ("memorySearch", {"q": "", "ignoreDate": True})
+        db = {"profilePath": str(self.caller / "db" / "voice"), "modelDir": str(self.caller / "models")}
+        self._session(["--log-dir", str(log_dir), "--log-level", "warn"], [("init", db), listing])
         self.assertTrue(log_dir.is_dir())
+        logged = lambda: "".join(p.read_text(errors="replace") for p in log_dir.iterdir() if p.is_file())
+        self.assertNotIn("listing all by date", logged())
+        self._session(["--log-dir", str(log_dir), "--log-level", "debug"], [("init", db), listing])
+        self.assertIn("listing all by date", logged())
 
         for args in (["--log-level", "verbose"], ["--log-level"], ["--log-level=off"]):
             proc = self._spawn(args)
@@ -387,11 +401,15 @@ class TestCallerLocations(unittest.TestCase):
 
     def test_invalid_locations_and_limits_are_rejected(self):
         db_dir = self.caller / "db" / "voice"
-        bad_init, init = self._session(
+        bad_values = ["models", "", 5, {}, [str(self.caller)]]
+        *bad_inits, init = self._session(
             ["--log-dir", str(self.caller / "logs")],
-            [("init", {"profilePath": str(db_dir), "modelDir": "models"}), ("init", {"profilePath": str(db_dir)})],
+            [("init", {"profilePath": str(db_dir), "modelDir": value}) for value in bad_values]
+            + [("init", {"profilePath": str(db_dir)})],
         )
-        self.assertIn("modelDir", bad_init["error"])
+        for value, bad_init in zip(bad_values, bad_inits):
+            with self.subTest(modelDir=value):
+                self.assertIn("modelDir", bad_init.get("error", ""), bad_init)
         # A rejected init opens nothing, and the next init still works.
         self.assertTrue(init["result"]["ok"])
 

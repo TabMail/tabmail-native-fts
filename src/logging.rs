@@ -24,11 +24,8 @@ pub fn init_logging(log_dir_override: Option<&Path>, level: &str) -> anyhow::Res
         None => tabmail_log_dir()?,
     };
 
-    // Match python: file logs at DEBUG, stderr at WARNING+.
-    // flexi_logger doesn't do per-sink levels cleanly, so we:
-    // - keep file at debug
-    // - duplicate to stderr at info (TB captures stderr too), but we also rely on log level usage.
-    // This is acceptable because python also emits warnings/errors on stderr only; we preserve file fidelity.
+    // The file logs at the caller's level (`--log-level`, debug by default);
+    // warnings and errors are also copied to stderr, which Thunderbird captures.
     Logger::try_with_str(level)?
         .log_to_file(FileSpec::default().directory(log_dir).basename(config::logging::LOG_FILE_NAME))
         .rotate(

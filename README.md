@@ -123,7 +123,9 @@ The memory database enables:
 Each Thunderbird profile gets its own isolated FTS and memory databases.
 
 **Size limit.** A client can bound the memory database: `memoryIndexBatch` takes an
-optional `maxBytes`, and `memoryTrim { maxBytes }` applies a changed limit at once.
+optional `maxBytes`, and `memoryTrim { maxBytes }` applies a changed limit. A trim
+runs for at most about 20 s; one cut short reports `withinLimit: false`, and the next
+write or trim continues it.
 The oldest entries are removed first; the space they took is reused by new entries,
 and the file keeps its largest size. `memoryStats`
 reports `usedBytes`, the size the limit counts (pages in use). Without `maxBytes`
@@ -168,7 +170,7 @@ in `missing` and otherwise ignored.
 
 ## Logs
 
-Logs are written to: `~/.tabmail/logs/fts_helper.log` (or the folder given with `--log-dir <absolute path>`)
+Logs are written to: `~/.tabmail/logs/fts_helper.log` (or the folder given with `--log-dir <absolute path>`). `--log-level <off|error|warn|info|debug>` sets the level (debug by default); `off` writes no log file
 
 - Logs automatically rotate at **10MB**
 - Keeps **5 backup files**

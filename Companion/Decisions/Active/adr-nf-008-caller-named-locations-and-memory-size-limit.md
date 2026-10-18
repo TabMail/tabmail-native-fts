@@ -56,9 +56,19 @@ The helper must not know who runs it: no client modes, no client names.
 
 ## Trim mechanics
 
-- Each pass removes a share of the rows proportional to the excess over
-  `TRIM_TARGET_PERCENT` of the limit, then re-measures. Aiming below the limit means the next
-  batches do not each trim again.
+- Each pass removes the oldest rows whose estimated share of the used size covers the excess
+  over `TRIM_TARGET_PERCENT` of the limit, then re-measures. Aiming below the limit means the
+  next batches do not each trim again. A row's share is estimated from its content length plus
+  `TRIM_ROW_OVERHEAD_BYTES` (its index entries, metadata and vector row), scaled so all rows'
+  estimates add up to the used size; the sum is read once per call (one scan of the content),
+  when the first pass needs it (0.16 s on a 1 GB FTS-only database of 40,644 rows, warm cache;
+  there a trim to 99% of the used size removed 6% of the rows in 5.9 s, and a trim to half
+  stopped at the budget after 21 s with `withinLimit: false`). Rows differ widely in size: Thunderbird's whole-session rows,
+  written before its per-exchange rows, can be a hundred times larger. Sizing a pass by row
+  count instead (the first version) removed the fraction excess/used of the rows: with the
+  oldest rows largest, one trim removed 786 rows where about 84 would do and left memory at 41%
+  of the limit, and at the limit one new exchange removed 184 rows where about 21 would do.
+  Rows with the same date go in the order they were written (rowid).
 - **Removed rows' FTS space is reclaimed before more rows go.** An FTS5 delete leaves the row's
   entries (and the pages holding them) in the old segments until those are merged. Measuring
   that space and removing more rows for it empties memory without ever reaching a limit that the
@@ -75,13 +85,18 @@ The helper must not know who runs it: no client modes, no client names.
   M1 Pro under load; a full merge at 1 GB took about 7 s there). FTS5 `secure-delete` was tried and rejected:
   it empties the entries in place, but SQLite rebalances b-tree pages only on delete, so the pages
   stay allocated.
-- Wall time is bounded by `TRIM_TIME_BUDGET_MS`, asked after every row removed and every merge
-  step, so a trim overruns by one row or one step (and its commit) at most, and the rows it removed stay removed
-  (the transaction commits early). That is well under the add-on's 60 s native RPC timeout. A
+- Wall time is bounded by `TRIM_TIME_BUDGET_MS`, asked after every row removed and every positive
+  merge step. Past the deadline a call can still commit its removals, start the merge for them
+  (one negative step) and run one more positive step; an FTS5 step's work is not bounded by its
+  page count, so that is at most about one merge (about 7 s at 1 GB, measured below). The rows it
+  removed stay removed (the transaction commits early). That is well under the add-on's 60 s
+  native RPC timeout. A
   trim cut short reports `withinLimit: false`, and the next write or trim continues it.
   `memory_trim_to_bytes` takes the budget; the request handlers pass the config value, and unit
   tests drive the inner `trim_until` with a stop after a set number of questions.
-- **Overshoot, accepted:**
+- **Overshoot, accepted (owner decision pending):** the estimate only sizes a pass, and the loop
+  re-measures, so text rows land near the aim whatever their sizes. What remains is the vector
+  chunks:
   - sqlite-vec 0.1.9 stores vectors in chunks of 1024 rows (about 1.5 MB at 384 dimensions) and
     frees a chunk only once all its rows are deleted.
 
