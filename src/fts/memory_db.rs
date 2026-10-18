@@ -1220,6 +1220,70 @@ mod tests {
             .collect::<Result<_, _>>().unwrap()
     }
 
+    fn rowids(conn: &Connection, table: &str) -> Vec<i64> {
+        conn.prepare(&format!("SELECT rowid FROM {table} ORDER BY rowid")).unwrap()
+            .query_map([], |r| r.get(0)).unwrap()
+            .collect::<Result<_, _>>().unwrap()
+    }
+
+    /// Every table holds the same exchanges: equal counts are not enough, as
+    /// vectors removed for the wrong rows leave the counts equal.
+    fn assert_tables_hold(conn: &Connection, expected: &[i64]) {
+        for table in ["memory_fts", "memory_meta", "memory_vec", "memory_ids"] {
+            assert_eq!(rowids(conn, table), expected, "{table}");
+        }
+    }
+
+    #[test]
+    fn test_a_trim_removes_each_exchange_from_every_table_and_keeps_the_rest_whole() {
+        let (dir, mut conn) = temp_memory_db("identity");
+        let n = 3000;
+        fill(&mut conn, n, |i| i as i64);
+        let all = rowids(&conn, "memory_meta");
+        assert_tables_hold(&conn, &all);
+        let limit = memory_used_bytes(&conn).unwrap() * 9 / 10;
+
+        let trim = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap();
+
+        assert!(trim.within_limit && trim.removed > 0 && trim.removed < n as i64);
+        drop(conn);
+        let (_path, conn) = open_or_create_memory_db(&dir).unwrap();
+        // The oldest (lowest dates, so lowest rowids) went; the rest kept their
+        // text, metadata, vector and id.
+        assert_tables_hold(&conn, &all[trim.removed as usize..]);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_a_trim_that_fails_partway_through_an_exchange_leaves_every_table_whole() {
+        let (dir, mut conn) = temp_memory_db("failure");
+        let n = 3000;
+        fill(&mut conn, n, |i| i as i64);
+        let all = rowids(&conn, "memory_meta");
+        let limit = memory_used_bytes(&conn).unwrap() / 2;
+        // A storage error on an exchange's last table, after its other rows
+        // were deleted.
+        conn.execute_batch(
+            "CREATE TRIGGER fail_id_delete BEFORE DELETE ON memory_ids
+             BEGIN SELECT RAISE(ABORT, 'injected storage failure'); END",
+        ).unwrap();
+
+        let error = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap_err();
+
+        assert!(error.to_string().contains("injected storage failure"), "{error}");
+        drop(conn);
+        let (_path, mut conn) = open_or_create_memory_db(&dir).unwrap();
+        assert_tables_hold(&conn, &all);
+        // Once the storage works again, the next trim removes the oldest whole.
+        conn.execute_batch("DROP TRIGGER fail_id_delete").unwrap();
+        let retry = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap();
+        assert!(retry.within_limit && retry.removed > 0);
+        assert_tables_hold(&conn, &all[retry.removed as usize..]);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn test_trim_brings_used_size_within_limit_keeping_the_newest() {
         let (dir, mut conn) = temp_memory_db("limit");
