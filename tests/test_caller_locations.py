@@ -410,7 +410,7 @@ class TestCallerLocations(unittest.TestCase):
         for value, bad_init in zip(bad_values, bad_inits):
             with self.subTest(modelDir=value):
                 self.assertIn("modelDir", bad_init.get("error", ""), bad_init)
-        # A rejected init opens nothing, and the next init still works.
+        # The next init still works.
         self.assertTrue(init["result"]["ok"])
 
         _, bad_batch, bad_trim, stats = self._session(
@@ -428,14 +428,58 @@ class TestCallerLocations(unittest.TestCase):
         self.assertEqual(stats["result"]["docs"], 0)
 
         before = _tree_hashes(self.home)
-        for args in (["--log-dir", "logs"], [f"--log-dir={self.caller / 'logs'}"]):
+        # A file where the log folder's parent should be: the folder can't be made.
+        blocker = self.caller / "a-file"
+        blocker.write_bytes(b"in the way")
+        for args in (["--log-dir", "logs"], [f"--log-dir={self.caller / 'logs'}"], ["--log-dir", str(blocker / "logs")]):
             proc = self._spawn(args)
             proc.stdin.close()
             self.assertNotEqual(proc.wait(timeout=30), 0, args)
             proc.stdout.close()
-        # Refused before logging starts: nothing written to the default log folder.
+        # Refused before logging starts, and a log folder that can't be made
+        # is fatal: nothing written to the default log folder.
         self.assertEqual(_tree_hashes(self.home), before)
 
+    def test_a_rejected_init_creates_opens_and_moves_nothing(self):
+        # An index an earlier release left, which an init's clean-up could move.
+        orphan = _write_orphan(self.home / ".tabmail")
+        before = _tree_hashes(self.home)
+        db_dir = self.caller / "db" / "voice"
+        bad_values = ["models", "", 5, {}, [str(self.caller)]]
+        responses = self._session(
+            ["--log-dir", str(self.caller / "logs")],
+            [("init", {"profilePath": str(db_dir), "modelDir": value}) for value in bad_values],
+        )
+        for value, response in zip(bad_values, responses):
+            with self.subTest(modelDir=value):
+                self.assertIn("modelDir", response.get("error", ""), response)
+        self.assertFalse(db_dir.exists())
+        self.assertEqual(_tree_hashes(self.home), before)
+        self.assertEqual((orphan / "memory.db").read_bytes(), b"thunderbird chat memory")
+
+    def test_a_batch_whose_own_row_goes_over_the_limit_ends_within_it(self):
+        db_dir = self.caller / "db" / "voice"
+        init_params = {"profilePath": str(db_dir), "modelDir": str(self._caller_model_dir())}
+        logs = ["--log-dir", str(self.caller / "logs")]
+        _, _, stats = self._session(
+            logs, [("init", init_params), ("memoryIndexBatch", {"rows": self._rows(0, 400, 40)}), ("memoryStats", {})]
+        )
+        limit = stats["result"]["usedBytes"] * 9 // 10
+        # One new exchange (about 200 KB) far larger than the room the trim
+        # leaves below the limit: trimming before it is written would end over.
+        _, batch, after = self._session(
+            logs,
+            [
+                ("init", init_params),
+                ("memoryIndexBatch", {"rows": self._rows(400, 1, 8_000), "maxBytes": limit}),
+                ("memoryStats", {}),
+            ],
+        )
+        result = batch["result"]
+        self.assertEqual(result["count"], 1, batch)
+        self.assertTrue(result["withinLimit"], batch)
+        self.assertLessEqual(after["result"]["usedBytes"], limit)
+        self.assertEqual(result["usedBytes"], after["result"]["usedBytes"])
 
 if __name__ == "__main__":
     unittest.main()

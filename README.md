@@ -124,8 +124,8 @@ Each Thunderbird profile gets its own isolated FTS and memory databases.
 
 **Size limit.** A client can bound the memory database: `memoryIndexBatch` takes an
 optional `maxBytes`, and `memoryTrim { maxBytes }` applies a changed limit. A trim
-stops asking for more work after about 20 s, and can finish the step under way, which
-at 1 GB is at most about one index merge (about 7 s); one cut short reports
+stops asking for more work after about 20 s, and can finish the step under way (at
+5 GiB a call ran at most about 2 s past that); one cut short reports
 `withinLimit: false`, and the next write or trim continues it. The limit counts the
 database's pages in use; the write-ahead log can add to the files on disk.
 The oldest entries are removed first; the space they took is reused by new entries,

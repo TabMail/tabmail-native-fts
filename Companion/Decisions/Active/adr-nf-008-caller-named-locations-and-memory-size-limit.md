@@ -58,7 +58,8 @@ The helper must not know who runs it: no client modes, no client names.
 
 - Each pass removes the oldest rows whose estimated share of the used size covers the excess
   over `TRIM_TARGET_PERCENT` of the limit, then re-measures. Aiming below the limit means the
-  next batches do not each trim again. A row's share is estimated from its content length plus
+  next batches do not each trim again (for rows of similar size; with whole-session rows oldest,
+  a pass can free less than its estimate and the trim then ends just inside the limit). A row's share is estimated from its content length plus
   `TRIM_ROW_OVERHEAD_BYTES` (its index entries, metadata and vector row), scaled so all rows'
   estimates add up to the used size; the sum is read once per call (one scan of the content),
   when the first pass needs it (0.16 s on a 1 GB FTS-only database of 40,644 rows, warm cache;
@@ -92,10 +93,15 @@ The helper must not know who runs it: no client modes, no client names.
   stay allocated.
 - Wall time is bounded by `TRIM_TIME_BUDGET_MS`, asked after every row removed and every positive
   merge step. Past the deadline a call can still commit its removals, start the merge for them
-  (one negative step) and run one more positive step; an FTS5 step's work is not bounded by its
-  page count, so that is at most about one merge (about 7 s at 1 GB, measured below). The rows it
-  removed stay removed (the transaction commits early). That is well under the add-on's 60 s
-  native RPC timeout. A
+  (one negative step) and run one more positive step. FTS5 does not bound a step's work by its
+  page count, so the overrun is measured: on a 5 GiB memory (291,500 rows with vectors, whole
+  sessions oldest), the longest step took 0.23 s, a call ran at most 1.7 s past the deadline, and
+  the worst `memoryTrim` over native messaging took 21.7 s (a full merge there took 70 s, which is
+  why the merge is never run to its end in one call). The rows it removed stay removed (the
+  transaction commits early). That is well under the add-on's 60 s native RPC timeout for one
+  request; writer requests queued behind trims over a lowered limit answer one after another
+  (three back to back answered at 22, 42 and 62 s), and a late one only rejects the add-on's
+  promise while the helper finishes the work. A
   trim cut short reports `withinLimit: false`, and the next write or trim continues it.
   `memory_trim_to_bytes` takes the budget; the request handlers pass the config value, and unit
   tests drive the inner `trim_until` with a stop after a set number of questions.
@@ -107,8 +113,9 @@ The helper must not know who runs it: no client modes, no client names.
 
   sqlite-vec also adds rows only to its newest chunk. When rows are indexed in date order (each
   new exchange is the newest), the oldest rows fill the oldest chunks, so a trim can remove up to
-  about one chunk of rows beyond what is strictly needed. At a 1 GB limit (about 130k exchanges at
-  the roughly 7.6 KB per exchange measured with vectors) that is about 0.15%. Rows indexed out of
+  about one chunk of rows beyond what is strictly needed: 1,024 exchanges, about 7.8 MB at the
+  roughly 7.6 KB per exchange measured with vectors, so about 0.73% of a 1 GB limit (about 130k
+  exchanges) and about 7.8% of the smallest choice, 100 MB. Rows indexed out of
   date order (a re-feed of older history) spread the oldest dates over many chunks, and a trim
   then removes more than one chunk's worth; it is still oldest first and within the limit. On a
   tiny database whose rows all share one chunk, a trim below the chunk size empties the memory.
@@ -148,7 +155,9 @@ The helper must not know who runs it: no client modes, no client names.
   only to a helper that advertises it. An older helper ignores `maxBytes` and answers `memoryTrim`
   with "Unknown method: memoryTrim"; a client without the capability treats the limit as "applies
   once the helper updates" instead of matching that text.
-- Thunderbird's behaviour is unchanged until the add-on sends `maxBytes` / `memoryTrim`.
+- Thunderbird's behaviour is unchanged until the add-on sends `maxBytes` / `memoryTrim`, except
+  that `memoryRemoveBatch` (Delete Old) now starts the merge for the rows it removed, which the
+  user does not see.
 - Voice gets fully separate files by naming all three locations.
 - Tests:
   - `tests/test_caller_locations.py` runs a full memory session with all three locations given,
@@ -167,5 +176,8 @@ The helper must not know who runs it: no client modes, no client names.
     unfinished, the aim below the limit leaving room for the next writes, and memory at the limit
     removing only the oldest as each new exchange is kept (never emptied); a trim of several
     passes landing near its aim, one after `memoryRemoveBatch` removing only what the limit
-    needs, and memory whose oldest rows are the largest or the smallest keeping every newer row
-    that fits.
+    needs, memory whose oldest rows are the largest or the smallest keeping every newer row
+    that fits, and a trim with no time left removing nothing.
+  - The location tests also pin a rejected `init` creating, opening and moving nothing, a batch
+    whose own row goes over the limit ending within it, and a log folder that can't be made being
+    fatal.

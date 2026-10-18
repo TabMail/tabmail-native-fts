@@ -845,9 +845,10 @@ pub fn memory_trim_to_bytes(
 /// `memory_trim_to_bytes`, stopping once `out_of_time` answers true. It is
 /// asked after every row removed and every positive merge step. Past the
 /// deadline a call can still commit its removals, start the merge for them
-/// (one negative step) and run one more positive step before it stops; an
-/// FTS5 step's work is not bounded by its page count, so that is at most
-/// about one merge. The rows removed before it stopped stay removed.
+/// (one negative step) and run one more positive step before it stops. FTS5
+/// does not bound a step's work by its page count; measured at 5 GiB, a step
+/// took at most 0.23 s and a call ran at most 1.7 s past the deadline (see
+/// ADR-NF-008). The rows removed before it stopped stay removed.
 ///
 /// Sizing a pass: a row's share of the used size is estimated from its
 /// content length plus `config::memory::TRIM_ROW_OVERHEAD_BYTES`, scaled so
@@ -1643,6 +1644,27 @@ mod tests {
         let kept = table_counts(&conn)[0];
         assert_eq!(kept_dates(&conn), ((n - kept)..n).collect::<Vec<_>>());
         assert!(kept >= 4_000, "kept {kept}, removed {}", trim.removed);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A trim with no time left removes nothing and says it is over the
+    /// limit; given time, the same trim finishes. The wall clock is what
+    /// bounds a request, not only the size of the work.
+    #[test]
+    fn test_a_trim_with_no_time_left_removes_nothing() {
+        let (dir, mut conn) = temp_memory_db("no-time");
+        fill_text_only(&mut conn, 3, 100, 50);
+        merge_all(&conn);
+        let limit = memory_used_bytes(&conn).unwrap() / 2;
+
+        let none = memory_trim_to_bytes(&mut conn, limit, std::time::Duration::ZERO).unwrap();
+
+        assert!(!none.within_limit, "{none:?}");
+        assert_eq!(none.removed, 0);
+        assert_eq!(&table_counts(&conn)[..2], &[300; 2]);
+        let given_time = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap();
+        assert!(given_time.within_limit && given_time.removed > 0, "{given_time:?}");
         drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
     }
