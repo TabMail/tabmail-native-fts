@@ -2,22 +2,31 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use flexi_logger::{Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
 
 use crate::config;
 
-pub fn init_logging() -> anyhow::Result<()> {
-    let log_dir = tabmail_log_dir()?;
+/// Starts file logging at `level` (one of `config::logging::LOG_LEVELS`) in
+/// `log_dir_override` (the `--log-dir` argument) when given, else in
+/// ~/.tabmail/logs. At "off" nothing is logged and no folder or file is made.
+pub fn init_logging(log_dir_override: Option<&Path>, level: &str) -> anyhow::Result<()> {
+    if level == "off" {
+        return Ok(());
+    }
+    let log_dir = match log_dir_override {
+        Some(dir) => {
+            std::fs::create_dir_all(dir).with_context(|| format!("failed creating log dir {}", dir.display()))?;
+            dir.to_path_buf()
+        }
+        None => tabmail_log_dir()?,
+    };
 
-    // Match python: file logs at DEBUG, stderr at WARNING+.
-    // flexi_logger doesn't do per-sink levels cleanly, so we:
-    // - keep file at debug
-    // - duplicate to stderr at info (TB captures stderr too), but we also rely on log level usage.
-    // This is acceptable because python also emits warnings/errors on stderr only; we preserve file fidelity.
-    Logger::try_with_str("debug")?
+    // The file logs at the caller's level (`--log-level`, debug by default);
+    // warnings and errors are also copied to stderr, which Thunderbird captures.
+    Logger::try_with_str(level)?
         .log_to_file(FileSpec::default().directory(log_dir).basename(config::logging::LOG_FILE_NAME))
         .rotate(
             Criterion::Size(config::logging::LOG_ROTATE_SIZE_BYTES),

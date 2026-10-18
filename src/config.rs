@@ -22,6 +22,11 @@ pub mod logging {
 
     pub const LOG_ROTATE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
     pub const LOG_ROTATE_KEEP_FILES: usize = 5;
+
+    // `--log-level`: the file log's level, chosen by the caller (ADR-NF-008).
+    // "off" writes no log file. Absent: DEFAULT_LOG_LEVEL.
+    pub const LOG_LEVELS: [&str; 5] = ["off", "error", "warn", "info", "debug"];
+    pub const DEFAULT_LOG_LEVEL: &str = "debug";
 }
 
 pub mod native_messaging {
@@ -94,6 +99,32 @@ pub mod embedding {
 
     // Local model storage directory (relative to home)
     pub const MODEL_DIR_REL: &str = ".tabmail/models/all-MiniLM-L6-v2";
+}
+
+pub mod memory {
+    // Memory size limit (client-supplied `maxBytes`). Size = pages in use
+    // ((page_count - freelist_count) * page_size): freed pages are reused for
+    // new rows, so the file keeps its largest size and memory stays within the
+    // limit inside it.
+
+    // A trim removes oldest rows until the used size is at or below this
+    // percentage of the limit, so the next few batches do not each trim again.
+    pub const TRIM_TARGET_PERCENT: i64 = 95;
+    // Wall-time budget for one trim, checked after every row removed; well
+    // under the add-on's native RPC timeout (60 s). A trim cut short keeps the
+    // rows it removed, reports `withinLimit: false`, and the next write or trim
+    // continues it.
+    pub const TRIM_TIME_BUDGET_MS: u64 = 20_000;
+    // Pages one FTS merge step writes; the budget is checked between steps.
+    // The trim starts its merge once (negative) after removing rows and
+    // continues it with positive steps, so a merge cut short survives the
+    // next write's new segment.
+    pub const TRIM_MERGE_STEP_PAGES: i64 = 256;
+    // A trim estimates each row's share of the used size from its content
+    // length plus this many bytes, for its index entries, metadata and vector
+    // row. Only how rows compare matters: the estimates are scaled to the
+    // measured used size, and the trim re-measures after each pass.
+    pub const TRIM_ROW_OVERHEAD_BYTES: i64 = 512;
 }
 
 pub mod hybrid {

@@ -797,7 +797,177 @@ pub fn memory_remove_batch(conn: &mut Connection, ids: &[Value]) -> anyhow::Resu
 
     tx.commit()?;
     log::info!("Removed {} memory entries", removed);
+    // Start the merge that drops the removed rows' FTS entries and frees
+    // their pages, as the trim does after its own removals: a later trim's
+    // positive steps can only continue a merge, so without this it would
+    // count the dead entries against the rows still kept and remove more of
+    // them than the limit needs. A negative step restarts a merge in
+    // progress, so this suits occasional removals, not one before every write.
+    if removed > 0 {
+        merge_memory_fts_step(conn, -config::memory::TRIM_MERGE_STEP_PAGES)?;
+    }
     Ok(removed)
+}
+
+/// Bytes the memory database uses: pages in use times the page size. Freed
+/// pages stay in the file (the freelist) and are reused, so this is the size
+/// the limit applies to, not the file length.
+pub fn memory_used_bytes(conn: &Connection) -> anyhow::Result<i64> {
+    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+    let freelist_count: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    Ok((page_count - freelist_count) * page_size)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryTrimResult {
+    pub removed: i64,
+    pub used_bytes: i64,
+    pub within_limit: bool,
+}
+
+/// Remove the oldest memory rows (by dateMs, then rowid) until the used size is
+/// at or below `max_bytes`. Each pass removes the oldest rows whose estimated
+/// share of the used size covers the excess, then re-measures. Stops when
+/// within the limit, when no rows are left, or when `budget` runs out
+/// (`within_limit` false; the next call continues, even after rows are written
+/// in between: see `trim_until`). Callers pass
+/// `config::memory::TRIM_TIME_BUDGET_MS`.
+pub fn memory_trim_to_bytes(
+    conn: &mut Connection,
+    max_bytes: i64,
+    budget: std::time::Duration,
+) -> anyhow::Result<MemoryTrimResult> {
+    let deadline = std::time::Instant::now() + budget;
+    trim_until(conn, max_bytes, &mut || std::time::Instant::now() >= deadline)
+}
+
+/// `memory_trim_to_bytes`, stopping once `out_of_time` answers true. It is
+/// asked after every row removed and every positive merge step. Past the
+/// deadline a call can still commit its removals, start the merge for them
+/// (one negative step) and run one more positive step before it stops. FTS5
+/// does not bound a step's work by its page count; measured at 5 GiB, a step
+/// took at most 0.23 s and a call ran at most 1.7 s past the deadline (see
+/// ADR-NF-008). The rows removed before it stopped stay removed.
+///
+/// Sizing a pass: a row's share of the used size is estimated from its
+/// content length plus `config::memory::TRIM_ROW_OVERHEAD_BYTES`, scaled so
+/// all rows' estimates add up to the used size. Rows differ widely in size
+/// (a whole-session row can be a hundred times an exchange), so counting rows
+/// instead would remove far more than needed when the oldest are the largest.
+/// The estimate only sizes a pass; the loop re-measures after each one.
+///
+/// FTS5 merge sign discipline: a negative `merge` merges every segment into
+/// one, and restarts from the first term whenever a segment was added since
+/// the last step; a positive `merge` continues a merge in progress even after
+/// new segments arrive. So the merge that drops removed rows' entries is
+/// started once, negative, right after they are removed, and every later step
+/// is positive. A merge cut short by the budget is then continued by the next
+/// call, though each memory write adds a segment first.
+fn trim_until(
+    conn: &mut Connection,
+    max_bytes: i64,
+    out_of_time: &mut dyn FnMut() -> bool,
+) -> anyhow::Result<MemoryTrimResult> {
+    let mut removed: i64 = 0;
+    // The rows' estimated weights added up, once a pass needs it.
+    let mut total_weight: Option<i64> = None;
+    loop {
+        let used = memory_used_bytes(conn)?;
+        if used <= max_bytes {
+            if removed > 0 {
+                log::info!("Memory trim: removed {} oldest entries, {} bytes used (limit {})", removed, used, max_bytes);
+            }
+            return Ok(MemoryTrimResult { removed, used_bytes: used, within_limit: true });
+        }
+        // Rows already removed keep their FTS entries, and the pages holding
+        // them, until the segments are merged: free that space before
+        // counting it against the rows still kept.
+        if merge_memory_fts_step(conn, config::memory::TRIM_MERGE_STEP_PAGES)? {
+            if out_of_time() {
+                log::warn!("Memory trim stopped while merging: {} bytes used, limit {}, removed {}", used, max_bytes, removed);
+                return Ok(MemoryTrimResult { removed, used_bytes: used, within_limit: false });
+            }
+            continue;
+        }
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM memory_meta", [], |r| r.get(0))?;
+        if count == 0 || out_of_time() {
+            log::warn!(
+                "Memory trim stopped above the limit: {} bytes used, limit {}, {} entries left, removed {}",
+                used, max_bytes, count, removed
+            );
+            return Ok(MemoryTrimResult { removed, used_bytes: used, within_limit: false });
+        }
+        let target = max_bytes * config::memory::TRIM_TARGET_PERCENT / 100;
+        let total = match total_weight {
+            Some(total) => total,
+            None => memory_total_weight(conn)?,
+        };
+        // The weight whose share of the used size is the excess.
+        let excess = (used - target) as i128;
+        let needed = ((total as i128 * excess + used as i128 - 1) / used as i128) as i64;
+        let (n, weight) = remove_oldest_memory_rows(conn, needed, out_of_time)?;
+        removed += n;
+        total_weight = Some(total - weight);
+        merge_memory_fts_step(conn, -config::memory::TRIM_MERGE_STEP_PAGES)?;
+    }
+}
+
+/// One FTS5 `merge` step of about `pages.abs()` pages written: negative starts
+/// merging every segment into one, positive continues a merge in progress (see
+/// `trim_until`). The merge drops removed rows' entries and frees their pages.
+/// Answers whether there was work to do: FTS5 makes fewer than two changes
+/// when there is none.
+fn merge_memory_fts_step(conn: &Connection, pages: i64) -> anyhow::Result<bool> {
+    let before = conn.total_changes();
+    conn.execute(
+        "INSERT INTO memory_fts(memory_fts, rank) VALUES('merge', ?1)",
+        params![pages],
+    )?;
+    Ok(conn.total_changes() - before >= 2)
+}
+
+/// The estimated weights of all memory rows added up (see `trim_until`).
+fn memory_total_weight(conn: &Connection) -> anyhow::Result<i64> {
+    let (count, content): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(octet_length(content)), 0) FROM memory_fts",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(content + count * config::memory::TRIM_ROW_OVERHEAD_BYTES)
+}
+
+/// Removes the oldest rows from all four tables in one transaction, until
+/// their estimated weights reach `weight` (at least one row), committing early
+/// once `out_of_time` answers true. Answers the rows removed and their weight.
+fn remove_oldest_memory_rows(
+    conn: &mut Connection,
+    weight: i64,
+    out_of_time: &mut dyn FnMut() -> bool,
+) -> anyhow::Result<(i64, i64)> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (mut removed, mut removed_weight): (i64, i64) = (0, 0);
+    {
+        let mut oldest = tx.prepare("SELECT rowid FROM memory_meta ORDER BY dateMs ASC, rowid ASC")?;
+        let mut length = tx.prepare("SELECT octet_length(content) FROM memory_fts WHERE rowid = ?1")?;
+        let mut rows = oldest.query([])?;
+        while removed_weight < weight {
+            let Some(row) = rows.next()? else { break };
+            let row_id: i64 = row.get(0)?;
+            let content: Option<i64> = length.query_row(params![row_id], |r| r.get(0)).optional()?.flatten();
+            tx.execute("DELETE FROM memory_fts WHERE rowid = ?1", params![row_id])?;
+            tx.execute("DELETE FROM memory_meta WHERE rowid = ?1", params![row_id])?;
+            tx.execute("DELETE FROM memory_vec WHERE rowid = ?1", params![row_id])?;
+            tx.execute("DELETE FROM memory_ids WHERE rowid = ?1", params![row_id])?;
+            removed += 1;
+            removed_weight += content.unwrap_or(0) + config::memory::TRIM_ROW_OVERHEAD_BYTES;
+            if out_of_time() {
+                break;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok((removed, removed_weight))
 }
 
 /// Start rebuilding memory vector embeddings: clear vec tables and return total count.
@@ -992,6 +1162,628 @@ fn truncate_for_log(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh on-disk memory database (WAL, like the helper's) in its own temp folder.
+    fn temp_memory_db(name: &str) -> (PathBuf, Connection) {
+        // As main() does before opening any connection; registering twice is a no-op.
+        type ExtensionInit = unsafe extern "C" fn(
+            *mut rusqlite::ffi::sqlite3,
+            *mut *mut std::os::raw::c_char,
+            *const rusqlite::ffi::sqlite3_api_routines,
+        ) -> std::os::raw::c_int;
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<*const (), ExtensionInit>(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+        let dir = std::env::temp_dir().join(format!("tabmail-memory-trim-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (_path, conn) = open_or_create_memory_db(&dir).unwrap();
+        (dir, conn)
+    }
+
+    /// Index `n` exchanges whose dateMs follows `date_of(i)`, each with a vector row.
+    fn fill(conn: &mut Connection, n: usize, date_of: impl Fn(usize) -> i64) {
+        let filler = "planning notes for the quarterly review meeting ".repeat(20);
+        let rows: Vec<Value> = (0..n)
+            .map(|i| serde_json::json!({
+                "memId": format!("turn:{i}"), "role": "session",
+                "content": format!("[USER]: question {i}\n\n[AGENT]: {filler}"),
+                "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": date_of(i),
+            }))
+            .collect();
+        memory_index_batch(conn, &rows, None).unwrap();
+        let blob = crate::fts::db::f32_vec_to_blob(&vec![0.5f32; config::embedding::EMBEDDING_DIMS]);
+        let ids: Vec<i64> = conn
+            .prepare("SELECT rowid FROM memory_ids").unwrap()
+            .query_map([], |r| r.get(0)).unwrap()
+            .collect::<Result<_, _>>().unwrap();
+        for id in ids {
+            conn.execute("INSERT INTO memory_vec (rowid, embedding) VALUES (?1, ?2)", params![id, blob]).unwrap();
+        }
+    }
+
+    fn table_counts(conn: &Connection) -> [i64; 4] {
+        ["memory_fts", "memory_meta", "memory_vec", "memory_ids"].map(|t| {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0)).unwrap()
+        })
+    }
+
+    fn budget() -> std::time::Duration {
+        std::time::Duration::from_millis(config::memory::TRIM_TIME_BUDGET_MS)
+    }
+
+    fn kept_dates(conn: &Connection) -> Vec<i64> {
+        conn.prepare("SELECT dateMs FROM memory_meta ORDER BY dateMs").unwrap()
+            .query_map([], |r| r.get(0)).unwrap()
+            .collect::<Result<_, _>>().unwrap()
+    }
+
+    fn rowids(conn: &Connection, table: &str) -> Vec<i64> {
+        conn.prepare(&format!("SELECT rowid FROM {table} ORDER BY rowid")).unwrap()
+            .query_map([], |r| r.get(0)).unwrap()
+            .collect::<Result<_, _>>().unwrap()
+    }
+
+    /// Every table holds the same exchanges: equal counts are not enough, as
+    /// vectors removed for the wrong rows leave the counts equal.
+    fn assert_tables_hold(conn: &Connection, expected: &[i64]) {
+        for table in ["memory_fts", "memory_meta", "memory_vec", "memory_ids"] {
+            assert_eq!(rowids(conn, table), expected, "{table}");
+        }
+    }
+
+    #[test]
+    fn test_a_trim_removes_each_exchange_from_every_table_and_keeps_the_rest_whole() {
+        let (dir, mut conn) = temp_memory_db("identity");
+        let n = 3000;
+        fill(&mut conn, n, |i| i as i64);
+        let all = rowids(&conn, "memory_meta");
+        assert_tables_hold(&conn, &all);
+        let limit = memory_used_bytes(&conn).unwrap() * 9 / 10;
+
+        let trim = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap();
+
+        assert!(trim.within_limit && trim.removed > 0 && trim.removed < n as i64);
+        drop(conn);
+        let (_path, conn) = open_or_create_memory_db(&dir).unwrap();
+        // The oldest (lowest dates, so lowest rowids) went; the rest kept their
+        // text, metadata, vector and id.
+        assert_tables_hold(&conn, &all[trim.removed as usize..]);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_a_trim_that_fails_partway_through_an_exchange_leaves_every_table_whole() {
+        let (dir, mut conn) = temp_memory_db("failure");
+        let n = 3000;
+        fill(&mut conn, n, |i| i as i64);
+        let all = rowids(&conn, "memory_meta");
+        let limit = memory_used_bytes(&conn).unwrap() / 2;
+        // A storage error on an exchange's last table, after its other rows
+        // were deleted.
+        conn.execute_batch(
+            "CREATE TRIGGER fail_id_delete BEFORE DELETE ON memory_ids
+             BEGIN SELECT RAISE(ABORT, 'injected storage failure'); END",
+        ).unwrap();
+
+        let error = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap_err();
+
+        assert!(error.to_string().contains("injected storage failure"), "{error}");
+        drop(conn);
+        let (_path, mut conn) = open_or_create_memory_db(&dir).unwrap();
+        assert_tables_hold(&conn, &all);
+        // Once the storage works again, the next trim removes the oldest whole.
+        conn.execute_batch("DROP TRIGGER fail_id_delete").unwrap();
+        let retry = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap();
+        assert!(retry.within_limit && retry.removed > 0);
+        assert_tables_hold(&conn, &all[retry.removed as usize..]);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_trim_brings_used_size_within_limit_keeping_the_newest() {
+        let (dir, mut conn) = temp_memory_db("limit");
+        // Dates run against rowid order, so "oldest" can only mean dateMs.
+        let n = 3000;
+        fill(&mut conn, n, |i| 1_000_000 - i as i64);
+        let before = memory_used_bytes(&conn).unwrap();
+        let limit = before / 2;
+
+        let trim = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap();
+
+        assert!(trim.within_limit);
+        let used = memory_used_bytes(&conn).unwrap();
+        assert_eq!(trim.used_bytes, used);
+        assert!(used <= limit, "used {used} > limit {limit}");
+        let counts = table_counts(&conn);
+        let kept = counts[0];
+        assert_eq!(counts, [kept; 4], "FTS, meta, vector and id rows are removed together");
+        assert_eq!(trim.removed, n as i64 - kept);
+        // Kept rows are exactly the newest `kept` dates.
+        let expected: Vec<i64> = ((1_000_000 - kept + 1)..=1_000_000).collect();
+        assert_eq!(kept_dates(&conn), expected);
+        // Half the size should keep a fair share, not empty the memory.
+        assert!(kept * 100 >= n as i64 * 30, "kept only {kept} of {n}");
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Merges the FTS index fully, as the trim does: started once, then continued.
+    fn merge_all(conn: &Connection) {
+        if merge_memory_fts_step(conn, -config::memory::TRIM_MERGE_STEP_PAGES).unwrap() {
+            while merge_memory_fts_step(conn, config::memory::TRIM_MERGE_STEP_PAGES).unwrap() {}
+        }
+    }
+
+    /// Answers true from its `k`th question on.
+    fn out_of_time_after(k: usize) -> impl FnMut() -> bool {
+        let mut asked = 0;
+        move || {
+            asked += 1;
+            asked >= k
+        }
+    }
+
+    #[test]
+    fn test_trim_cut_short_keeps_its_progress_and_the_next_call_continues() {
+        let (dir, mut conn) = temp_memory_db("budget");
+        let n = 3000;
+        fill(&mut conn, n, |i| i as i64);
+        let limit = memory_used_bytes(&conn).unwrap() / 4;
+        // Index merged first, so the trim's first question about time comes
+        // just before it removes rows.
+        merge_all(&conn);
+
+        // Time runs out after the 100th row of a pass that wanted far more:
+        // the call stops there, over the limit, and those 100 rows (the
+        // oldest) are gone from every table, durably.
+        let cut_short = trim_until(&mut conn, limit, &mut out_of_time_after(101)).unwrap();
+        assert!(!cut_short.within_limit);
+        assert!(cut_short.used_bytes > limit);
+        assert_eq!(cut_short.removed, 100);
+        drop(conn);
+        let (_path, mut conn) = open_or_create_memory_db(&dir).unwrap();
+        assert_eq!(table_counts(&conn), [n as i64 - 100; 4]);
+        assert_eq!(kept_dates(&conn), (100..n as i64).collect::<Vec<_>>());
+
+        // Out of time while merging the removed rows' entries: nothing more
+        // is removed until that space is freed.
+        let merging = trim_until(&mut conn, limit, &mut out_of_time_after(1)).unwrap();
+        assert_eq!(merging.removed, 0);
+        assert_eq!(table_counts(&conn), [n as i64 - 100; 4]);
+        // Out of time once rows are being removed: a call removes one and stops.
+        merge_all(&conn);
+        let one = trim_until(&mut conn, limit, &mut out_of_time_after(2)).unwrap();
+        assert_eq!(one.removed, 1);
+        assert_eq!(kept_dates(&conn).first(), Some(&101));
+
+        // The next call, with the normal budget, finishes the job.
+        let finished = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap();
+        assert!(finished.within_limit);
+        assert!(memory_used_bytes(&conn).unwrap() <= limit);
+        let kept = table_counts(&conn)[0];
+        assert!(kept > 0);
+        assert_eq!(table_counts(&conn), [kept; 4]);
+        assert_eq!(kept_dates(&conn), ((n as i64 - kept)..n as i64).collect::<Vec<_>>());
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Index `batches` batches of `per_batch` exchanges of varied words, as
+    /// that many index calls (so the FTS index holds several segments), with
+    /// no vectors: the helper's mode when the model can't load.
+    fn fill_text_only(conn: &mut Connection, batches: usize, per_batch: usize, words: usize) {
+        let mut seed: u64 = 7;
+        let mut word = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            format!("w{}", (seed >> 33) % 20_000)
+        };
+        for b in 0..batches {
+            let rows: Vec<Value> = (0..per_batch)
+                .map(|j| {
+                    let i = b * per_batch + j;
+                    let text: Vec<String> = (0..words).map(|_| word()).collect();
+                    serde_json::json!({
+                        "memId": format!("turn:{i}"), "role": "session",
+                        "content": format!("[USER]: question {i}\n\n[AGENT]: {}", text.join(" ")),
+                        "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": i as i64,
+                    })
+                })
+                .collect();
+            memory_index_batch(conn, &rows, None).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_trim_keeps_the_newest_rows_that_fit_rather_than_emptying_memory() {
+        let (dir, mut conn) = temp_memory_db("fts-only");
+        let (batches, per_batch) = (10, 200);
+        let n = (batches * per_batch) as i64;
+        fill_text_only(&mut conn, batches, per_batch, 400);
+        let full = memory_used_bytes(&conn).unwrap();
+        // The newest twentieth of the rows fits in about a twentieth of the
+        // space, so the trim keeps rows; a deleted row's index entries are
+        // freed as it goes, not left behind to be counted against the rest.
+        let limit = full / 20;
+
+        let trim = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap();
+
+        assert!(trim.within_limit, "{trim:?}, limit {limit}, was {full}");
+        assert!(memory_used_bytes(&conn).unwrap() <= limit);
+        let kept = table_counts(&conn)[0];
+        assert_eq!(&table_counts(&conn)[..2], &[kept; 2]);
+        assert!(kept * 100 >= n * 2, "kept {kept} of {n}");
+        assert_eq!(kept_dates(&conn), ((n - kept)..n).collect::<Vec<_>>());
+        // Already within the limit: a second trim removes nothing.
+        assert_eq!(memory_trim_to_bytes(&mut conn, limit, budget()).unwrap().removed, 0);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+
+    /// Indexes one text-only exchange dated `i`, as one memory write does.
+    fn add_text(conn: &mut Connection, i: usize) {
+        let row = serde_json::json!({
+            "memId": format!("turn:{i}"), "role": "session",
+            "content": format!("[USER]: question {i}\n\n[AGENT]: answer {i} about the launch"),
+            "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": i as i64,
+        });
+        memory_index_batch(conn, &[row], None).unwrap();
+    }
+
+    /// Where a full merge takes longer than one call's budget, each call cut
+    /// short and each followed by a memory write (as `memoryIndexBatch` writes
+    /// before it trims), the calls still continue the merge and go on removing
+    /// the oldest rows; restarting the merge at every write would remove none.
+    #[test]
+    fn test_trims_cut_short_while_merging_keep_removing_the_oldest_across_writes() {
+        let (dir, mut conn) = temp_memory_db("merge-across-writes");
+        let (batches, per_batch) = (10, 200);
+        let n = batches * per_batch;
+        fill_text_only(&mut conn, batches, per_batch, 400);
+        let limit = memory_used_bytes(&conn).unwrap() / 20;
+
+        let (mut removed, mut cut_short_merging) = (0, 0);
+        for round in 0..30 {
+            let trim = trim_until(&mut conn, limit, &mut out_of_time_after(4)).unwrap();
+            if trim.removed == 0 && !trim.within_limit {
+                cut_short_merging += 1;
+            }
+            removed += trim.removed;
+            add_text(&mut conn, n + round);
+        }
+        // The budget really did cut merges short, and rows still went.
+        assert!(cut_short_merging > 0);
+        assert!(removed > 0, "no row removed in 30 calls");
+        let kept = table_counts(&conn)[0];
+        assert_eq!(&table_counts(&conn)[..2], &[kept; 2]);
+        let newest = (n + 29) as i64;
+        assert_eq!(kept_dates(&conn), ((newest + 1 - kept)..=newest).collect::<Vec<_>>());
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Out of time while merging, a call stops there, with the merge unfinished:
+    /// one call never runs a whole merge past its budget.
+    #[test]
+    fn test_trim_out_of_time_while_merging_stops_with_the_merge_unfinished() {
+        let (dir, mut conn) = temp_memory_db("merge-budget");
+        fill_text_only(&mut conn, 10, 200, 400);
+        let limit = memory_used_bytes(&conn).unwrap() / 20;
+        // A merge in progress, as one a call cut short leaves.
+        assert!(merge_memory_fts_step(&conn, -config::memory::TRIM_MERGE_STEP_PAGES).unwrap());
+
+        let trim = trim_until(&mut conn, limit, &mut out_of_time_after(1)).unwrap();
+
+        assert_eq!(trim.removed, 0);
+        assert!(!trim.within_limit);
+        assert!(merge_memory_fts_step(&conn, config::memory::TRIM_MERGE_STEP_PAGES).unwrap(), "the merge was finished past the budget");
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A trim aims below the limit, so the writes right after it don't each
+    /// trim again: memory can grow by a few percent of the limit first.
+    #[test]
+    fn test_the_writes_just_after_a_trim_remove_nothing() {
+        let (dir, mut conn) = temp_memory_db("aim");
+        let n = 2000;
+        fill_text_only(&mut conn, 10, n / 10, 400);
+        let limit = memory_used_bytes(&conn).unwrap() / 2;
+        assert!(memory_trim_to_bytes(&mut conn, limit, budget()).unwrap().within_limit);
+        let kept = table_counts(&conn)[0];
+        let grown_to = memory_used_bytes(&conn).unwrap() + limit * 3 / 100;
+
+        let mut i = n;
+        while memory_used_bytes(&conn).unwrap() < grown_to {
+            let words: Vec<String> = (0..400).map(|k| format!("x{i}y{k}")).collect();
+            let row = serde_json::json!({
+                "memId": format!("turn:{i}"), "role": "session",
+                "content": format!("[USER]: question {i}\n\n[AGENT]: {}", words.join(" ")),
+                "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": i as i64,
+            });
+            memory_index_batch(&mut conn, &[row], None).unwrap();
+            let trim = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap();
+            assert_eq!((trim.removed, trim.within_limit), (0, true), "after exchange {i}");
+            i += 1;
+        }
+        assert_eq!(table_counts(&conn)[0], kept + (i - n) as i64);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Keeps exchange `i` (dated `i`) with its vector row, as one index call.
+    fn add(conn: &mut Connection, i: usize) {
+        let row = serde_json::json!({
+            "memId": format!("turn:{i}"), "role": "session",
+            "content": format!("[USER]: question {i}\n\n[AGENT]: {}", "planning notes for the quarterly review meeting ".repeat(20)),
+            "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": i as i64,
+        });
+        memory_index_batch(conn, &[row], None).unwrap();
+        let id: i64 = conn.query_row("SELECT max(rowid) FROM memory_ids", [], |r| r.get(0)).unwrap();
+        let blob = crate::fts::db::f32_vec_to_blob(&vec![0.5f32; config::embedding::EMBEDDING_DIMS]);
+        conn.execute("INSERT INTO memory_vec (rowid, embedding) VALUES (?1, ?2)", params![id, blob]).unwrap();
+    }
+
+    /// At the limit, as each new exchange is kept and trimmed for, only the
+    /// oldest go and memory stays near the limit, never emptied. The vector
+    /// index frees its space a chunk at a time (sqlite-vec's 1,024 rows) and
+    /// adds only to its newest chunk, so exchanges kept in date order empty
+    /// the oldest chunk first: a trim removes at most a chunk's worth more
+    /// than the text alone would need.
+    #[test]
+    fn test_at_the_limit_each_new_exchange_removes_only_the_oldest() {
+        const CHUNK_ROWS: i64 = 1_024;
+        let (dir, mut conn) = temp_memory_db("steady");
+        let n = 3000;
+        fill(&mut conn, n, |i| i as i64);
+        let limit = memory_used_bytes(&conn).unwrap() * 9 / 10;
+        assert!(memory_trim_to_bytes(&mut conn, limit, budget()).unwrap().within_limit);
+        let fitted = table_counts(&conn)[0];
+        let mut fewest = fitted;
+
+        for i in n..n + CHUNK_ROWS as usize + 200 {
+            add(&mut conn, i);
+            let trim = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap();
+            assert!(trim.within_limit, "{trim:?} after exchange {i}");
+            let kept = table_counts(&conn)[0];
+            assert_eq!(table_counts(&conn), [kept; 4]);
+            // The newest `kept`, the new one among them.
+            assert_eq!(kept_dates(&conn), ((i as i64 + 1 - kept)..=i as i64).collect::<Vec<_>>());
+            fewest = fewest.min(kept);
+        }
+        assert!(fewest >= fitted - CHUNK_ROWS, "kept as few as {fewest}; {fitted} fitted the limit");
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Keeps `count` text-only rows of about `words` words each, dated
+    /// `first..first + count`, in one index call.
+    fn add_sized(conn: &mut Connection, first: usize, count: usize, words: usize) {
+        let rows: Vec<Value> = (first..first + count)
+            .map(|i| {
+                let text: Vec<String> = (0..words).map(|k| format!("w{}", (i * 7919 + k * 104_729) % 50_000)).collect();
+                serde_json::json!({
+                    "memId": format!("turn:{i}"), "role": "session",
+                    "content": format!("[USER]: question {i}\n\n[AGENT]: {}", text.join(" ")),
+                    "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": i as i64,
+                })
+            })
+            .collect();
+        memory_index_batch(conn, &rows, None).unwrap();
+    }
+
+    /// Memory where the oldest rows are much larger than the newer ones, as
+    /// whole-session rows written before per-exchange rows are: 300 rows of
+    /// about 6,000 words, then 3,000 of about 60. Answers the number of rows.
+    fn fill_large_then_small(conn: &mut Connection) -> usize {
+        for b in 0..3 {
+            add_sized(conn, b * 100, 100, 6_000);
+        }
+        for b in 0..3 {
+            add_sized(conn, 300 + b * 1_000, 1_000, 60);
+        }
+        merge_all(conn);
+        3_300
+    }
+
+    /// The trim removes only as many of the oldest rows as the limit needs,
+    /// even when they are far larger than the rest: memory lands near its aim
+    /// below the limit, and every newer row that fits is kept.
+    #[test]
+    fn test_trim_keeps_every_newer_row_that_fits_when_the_oldest_are_largest() {
+        let (dir, mut conn) = temp_memory_db("skew");
+        let n = fill_large_then_small(&mut conn) as i64;
+        let limit = memory_used_bytes(&conn).unwrap() * 8 / 10;
+
+        let trim = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap();
+
+        assert!(trim.within_limit, "{trim:?}");
+        let used = memory_used_bytes(&conn).unwrap();
+        assert!(used <= limit);
+        assert!(used * 100 >= limit * 85, "used {used} of the limit {limit} after removing {}", trim.removed);
+        let kept = table_counts(&conn)[0];
+        assert_eq!(kept_dates(&conn), ((n - kept)..n).collect::<Vec<_>>());
+        // Only large rows went: all 3,000 newer small ones are kept.
+        assert!(kept >= 3_000, "kept {kept}, removed {}", trim.removed);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// At the limit with the oldest rows largest, one new exchange removes
+    /// about one old row, not a share of every row.
+    #[test]
+    fn test_at_the_limit_a_new_exchange_removes_only_what_it_needs_when_the_oldest_are_largest() {
+        let (dir, mut conn) = temp_memory_db("skew-steady");
+        let n = fill_large_then_small(&mut conn);
+        let limit = memory_used_bytes(&conn).unwrap() * 99 / 100;
+        add_sized(&mut conn, n, 1, 60);
+        let used_before = memory_used_bytes(&conn).unwrap();
+        assert!(used_before > limit);
+
+        let trim = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap();
+
+        assert!(trim.within_limit, "{trim:?}");
+        let used = memory_used_bytes(&conn).unwrap();
+        assert!(used * 100 >= limit * 90, "used {used} of the limit {limit} after removing {}", trim.removed);
+        let kept = table_counts(&conn)[0];
+        assert_eq!(kept_dates(&conn), ((n as i64 + 1 - kept)..=n as i64).collect::<Vec<_>>());
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 2,000 text-only exchanges of about 400 words, in ten index calls,
+    /// merged. Answers the used size.
+    fn fill_merged_text_only(conn: &mut Connection) -> i64 {
+        fill_text_only(conn, 10, 200, 400);
+        merge_all(conn);
+        memory_used_bytes(conn).unwrap()
+    }
+
+    /// A trim that needs several passes reclaims the space of each pass's
+    /// removed rows before sizing the next, so memory lands near its aim
+    /// below the limit rather than far under it.
+    #[test]
+    fn test_a_trim_of_several_passes_lands_near_its_aim() {
+        let (dir, mut conn) = temp_memory_db("passes");
+        let full = fill_merged_text_only(&mut conn);
+        let limit = full / 2;
+
+        let trim = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap();
+
+        assert!(trim.within_limit, "{trim:?}");
+        merge_all(&conn);
+        let used = memory_used_bytes(&conn).unwrap();
+        assert!(used <= limit);
+        assert!(used * 100 >= limit * 85, "used {used} of the limit {limit} after removing {}", trim.removed);
+        let kept = table_counts(&conn)[0];
+        assert!(kept >= 900, "kept {kept} of 2000");
+        assert_eq!(kept_dates(&conn), ((2_000 - kept)..2_000).collect::<Vec<_>>());
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Rows removed by id free their space before a later trim measures it:
+    /// the trim removes only what the rows still kept need, as many as if
+    /// the removed rows had never been written.
+    #[test]
+    fn test_a_trim_after_rows_were_removed_removes_only_what_the_limit_needs() {
+        let (dir, mut conn) = temp_memory_db("removed-then-trim");
+        let full = fill_merged_text_only(&mut conn);
+        let oldest: Vec<Value> = (0..1_000).map(|i| Value::from(format!("turn:{i}"))).collect();
+        assert_eq!(memory_remove_batch(&mut conn, &oldest).unwrap(), 1_000);
+
+        let trim = memory_trim_to_bytes(&mut conn, full / 2, budget()).unwrap();
+
+        assert!(trim.within_limit, "{trim:?}");
+        let kept = table_counts(&conn)[0];
+        assert!(kept >= 900, "kept {kept} of the 1000 left, removed {}", trim.removed);
+        assert_eq!(kept_dates(&conn), ((2_000 - kept)..2_000).collect::<Vec<_>>());
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The trim removes only as many of the oldest rows as the limit needs
+    /// when they are small next to their fixed cost and the newest are large.
+    #[test]
+    fn test_trim_keeps_every_newer_row_that_fits_when_the_oldest_are_smallest() {
+        let (dir, mut conn) = temp_memory_db("skew-small");
+        for b in 0..10 {
+            add_sized(&mut conn, b * 1_000, 1_000, 20);
+        }
+        for b in 0..3 {
+            add_sized(&mut conn, 10_000 + b * 100, 100, 6_000);
+        }
+        merge_all(&conn);
+        let n = 10_300;
+        let limit = memory_used_bytes(&conn).unwrap() * 9 / 10;
+
+        let trim = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap();
+
+        assert!(trim.within_limit, "{trim:?}");
+        let kept = table_counts(&conn)[0];
+        assert_eq!(kept_dates(&conn), ((n - kept)..n).collect::<Vec<_>>());
+        assert!(kept >= 4_000, "kept {kept}, removed {}", trim.removed);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A trim with no time left removes nothing and says it is over the
+    /// limit; given time, the same trim finishes. The wall clock is what
+    /// bounds a request, not only the size of the work.
+    #[test]
+    fn test_a_trim_with_no_time_left_removes_nothing() {
+        let (dir, mut conn) = temp_memory_db("no-time");
+        fill_text_only(&mut conn, 3, 100, 50);
+        merge_all(&conn);
+        let limit = memory_used_bytes(&conn).unwrap() / 2;
+
+        let none = memory_trim_to_bytes(&mut conn, limit, std::time::Duration::ZERO).unwrap();
+
+        assert!(!none.within_limit, "{none:?}");
+        assert_eq!(none.removed, 0);
+        assert_eq!(&table_counts(&conn)[..2], &[300; 2]);
+        let given_time = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap();
+        assert!(given_time.within_limit && given_time.removed > 0, "{given_time:?}");
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Rows with the same date go in the order they were written.
+    #[test]
+    fn test_trim_removes_rows_of_the_same_date_first_written_first() {
+        let (dir, mut conn) = temp_memory_db("same-date");
+        let rows: Vec<Value> = (0..40)
+            .map(|i| serde_json::json!({
+                "memId": format!("turn:{i}"), "role": "session",
+                "content": format!("[USER]: question {i}\n\n[AGENT]: {}", "notes for the launch review ".repeat(40)),
+                "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": 5,
+            }))
+            .collect();
+        memory_index_batch(&mut conn, &rows, None).unwrap();
+        merge_all(&conn);
+        let limit = memory_used_bytes(&conn).unwrap() - 1;
+
+        let trim = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap();
+
+        assert!(trim.within_limit && trim.removed > 0, "{trim:?}");
+        let kept: Vec<String> = conn
+            .prepare("SELECT memId FROM memory_ids ORDER BY rowid").unwrap()
+            .query_map([], |r| r.get(0)).unwrap()
+            .collect::<Result<_, _>>().unwrap();
+        let expected: Vec<String> = (trim.removed..40).map(|i| format!("turn:{i}")).collect();
+        assert_eq!(kept, expected);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_trim_within_limit_removes_nothing() {
+        let (dir, mut conn) = temp_memory_db("noop");
+        fill(&mut conn, 50, |i| i as i64);
+        let used = memory_used_bytes(&conn).unwrap();
+        let trim = memory_trim_to_bytes(&mut conn, used, budget()).unwrap();
+        assert_eq!(trim, MemoryTrimResult { removed: 0, used_bytes: used, within_limit: true });
+        assert_eq!(table_counts(&conn), [50; 4]);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_trim_below_the_empty_schema_removes_everything_and_reports_over_limit() {
+        let (dir, mut conn) = temp_memory_db("tiny");
+        fill(&mut conn, 20, |i| i as i64);
+        let trim = memory_trim_to_bytes(&mut conn, 1, budget()).unwrap();
+        assert!(!trim.within_limit);
+        assert_eq!(trim.removed, 20);
+        assert_eq!(table_counts(&conn), [0; 4]);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn test_memory_fts_tokenizer_rebuild_in_place() {

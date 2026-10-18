@@ -37,11 +37,31 @@ fn main() {
 }
 
 fn real_main() -> anyhow::Result<()> {
-    logging::init_logging()?;
+    // `--log-dir <absolute path>`: the caller names the log folder. It is an
+    // argument, not an init parameter, because logging starts before the first message.
+    let args: Vec<String> = std::env::args().collect();
+    // `--log-level <level>`: the file log's level ("off" writes none), so a
+    // caller whose policy keeps user content out of logs can turn it off.
+    // `--log-dir=<path>` and `--log-level=<level>` are not the documented form;
+    // refusing them keeps a slip from logging into the default folder.
+    if args.iter().any(|a| a.starts_with("--log-dir=") || a.starts_with("--log-level=")) {
+        anyhow::bail!("--log-dir and --log-level take their value as the next argument");
+    }
+    let log_dir = match args.iter().any(|a| a == "--log-dir") {
+        true => Some(parse_absolute_dir(read_arg_value(&args, "--log-dir").as_deref(), "--log-dir")?),
+        false => None,
+    };
+    let log_level = match args.iter().any(|a| a == "--log-level") {
+        true => match read_arg_value(&args, "--log-level") {
+            Some(v) if config::logging::LOG_LEVELS.contains(&v.as_str()) => v,
+            v => anyhow::bail!("--log-level must be one of {:?}, got {v:?}", config::logging::LOG_LEVELS),
+        },
+        false => config::logging::DEFAULT_LOG_LEVEL.to_string(),
+    };
+    logging::init_logging(log_dir.as_deref(), &log_level)?;
 
     // Special mode used by Windows self-update: run as a short-lived helper that swaps files.
     // This must happen BEFORE we start native-messaging framing.
-    let args: Vec<String> = std::env::args().collect();
     if args.len() >= 2 && args[1] == "--apply-update" {
         let target = read_arg_value(&args, "--target").context("missing --target")?;
         let staged = read_arg_value(&args, "--staged").context("missing --staged")?;
@@ -110,6 +130,10 @@ fn real_main() -> anyhow::Result<()> {
             "init" => {
                 let resp = handle_init(&mut state, &req.id, &req.params)?;
                 native_messaging::write_json(&mut out_stream, &resp)?;
+                // A rejected init (invalid parameters) opened nothing; wait for another.
+                if resp.get("error").is_some() {
+                    continue;
+                }
                 // init done — transition to Phase B (multi-threaded)
                 break;
             }
@@ -162,7 +186,7 @@ fn classify_method(method: &str) -> MethodTarget {
         | "assignFolderMembershipBatch" => MethodTarget::Writer,
 
         // Write memory operations
-        "memoryIndexBatch" | "memoryRemoveBatch" | "memoryClear" => MethodTarget::Writer,
+        "memoryIndexBatch" | "memoryRemoveBatch" | "memoryClear" | "memoryTrim" => MethodTarget::Writer,
 
         _ => MethodTarget::Unknown,
     }
@@ -581,9 +605,14 @@ fn handle_read_request(
                 .ok()
                 .map(|m| m.len() as i64)
                 .unwrap_or(0);
+            // usedBytes is what the size limit counts (pages in use).
+            let used_bytes = memory_db::memory_used_bytes(memory_conn)?;
             Ok(serde_json::json!({
                 "id": msg_id,
-                "result": { "ok": true, "docs": docs, "vecDocs": vec_docs, "dbBytes": db_bytes }
+                "result": {
+                    "ok": true, "docs": docs, "vecDocs": vec_docs,
+                    "dbBytes": db_bytes, "usedBytes": used_bytes
+                }
             }))
         }
         "memoryDebugSample" => {
@@ -804,10 +833,31 @@ fn handle_write_request(
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default();
+            // Optional size limit: older clients send none and keep no limit.
+            let max_bytes = match params.get("maxBytes") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(parse_memory_max_bytes(v)?),
+            };
             let (count, skipped) = memory_db::memory_index_batch(memory_conn, &rows, engine)?;
+            let mut result = serde_json::json!({ "ok": true, "count": count, "skippedDuplicates": skipped });
+            if let Some(max_bytes) = max_bytes {
+                let trim = memory_db::memory_trim_to_bytes(memory_conn, max_bytes, trim_budget())?;
+                result["trimmed"] = serde_json::json!(trim.removed);
+                result["usedBytes"] = serde_json::json!(trim.used_bytes);
+                result["withinLimit"] = serde_json::json!(trim.within_limit);
+            }
+            Ok(serde_json::json!({ "id": msg_id, "result": result }))
+        }
+        "memoryTrim" => {
+            // Sent when the client lowers its limit.
+            let max_bytes = parse_memory_max_bytes(params.get("maxBytes").unwrap_or(&Value::Null))?;
+            let trim = memory_db::memory_trim_to_bytes(memory_conn, max_bytes, trim_budget())?;
             Ok(serde_json::json!({
                 "id": msg_id,
-                "result": { "ok": true, "count": count, "skippedDuplicates": skipped }
+                "result": {
+                    "ok": true, "trimmed": trim.removed, "usedBytes": trim.used_bytes,
+                    "withinLimit": trim.within_limit
+                }
             }))
         }
         "memoryRemoveBatch" => {
@@ -904,8 +954,13 @@ fn handle_hello(msg_id: &str, params: &Value) -> anyhow::Result<Value> {
 fn hello_capabilities() -> Value {
     serde_json::json!({
         "folderMembershipV1": true,
-        "folderMembershipSummaryV1": true
+        "folderMembershipSummaryV1": true,
+        "memorySizeLimitV1": true
     })
+}
+
+fn trim_budget() -> std::time::Duration {
+    std::time::Duration::from_millis(config::memory::TRIM_TIME_BUDGET_MS)
 }
 
 fn required_nonempty_string<'a>(params: &'a Value, name: &str) -> anyhow::Result<&'a str> {
@@ -1010,6 +1065,15 @@ fn handle_update_request(msg_id: &str, params: &Value) -> anyhow::Result<Value> 
 }
 
 fn handle_init(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Result<Value> {
+    // Validate before touching any folder; an invalid value is answered, not fatal.
+    let model_dir = match params.get("modelDir") {
+        None | Some(Value::Null) => None,
+        Some(v) => match parse_absolute_dir(v.as_str(), "modelDir") {
+            Ok(dir) => Some(dir),
+            Err(e) => return Ok(serde_json::json!({ "id": msg_id, "error": format!("{e}") })),
+        },
+    };
+
     // Get addon ID (required for new storage location)
     let addon_id = params
         .get("addonId")
@@ -1023,7 +1087,12 @@ fn handle_init(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Res
             let p = PathBuf::from(override_path);
             log::info!("Using explicit profilePath: {}", p.display());
             std::fs::create_dir_all(&p)?;
-            adopt_or_remove_orphaned_indexes(&p, &guessed_profile_dirs());
+            // A caller that names its model folder owns every location it uses
+            // and is not the add-on: it never adopts or removes the indexes an
+            // earlier add-on release left in a guessed profile.
+            if model_dir.is_none() {
+                adopt_or_remove_orphaned_indexes(&p, &guessed_profile_dirs());
+            }
             (p.clone(), p)
         } else {
             // Auto-detect Thunderbird profile
@@ -1091,7 +1160,8 @@ fn handle_init(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Res
 
     // Initialize embedding engine (lazy model download on first init).
     // If download or load fails, we continue in FTS-only mode (graceful degradation).
-    let has_embeddings = match crate::embeddings::download::ensure_model_files() {
+    // modelDir: the caller names the model folder; without it, ~/.tabmail/models/….
+    let has_embeddings = match crate::embeddings::download::ensure_model_files(model_dir.as_deref()) {
         Ok(model_dir) => match crate::embeddings::engine::EmbeddingEngine::load(&model_dir) {
             Ok(engine) => {
                 log::info!("Embedding engine loaded successfully");
@@ -1129,6 +1199,22 @@ fn handle_init(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Res
 // ============================================================================
 // Utility functions
 // ============================================================================
+
+/// A caller-named folder (`--log-dir`, `modelDir`) must be a non-empty absolute path.
+fn parse_absolute_dir(value: Option<&str>, name: &str) -> anyhow::Result<PathBuf> {
+    match value {
+        Some(v) if !v.is_empty() && Path::new(v).is_absolute() => Ok(PathBuf::from(v)),
+        _ => anyhow::bail!("{name} must be an absolute path, got {value:?}"),
+    }
+}
+
+/// A memory size limit must be a positive whole number of bytes.
+fn parse_memory_max_bytes(v: &Value) -> anyhow::Result<i64> {
+    match v.as_i64() {
+        Some(n) if n > 0 => Ok(n),
+        _ => anyhow::bail!("maxBytes must be a positive integer, got {v}"),
+    }
+}
 
 fn read_arg_value(args: &[String], key: &str) -> Option<String> {
     args.iter()
@@ -1882,6 +1968,7 @@ mod tests {
     fn test_hello_advertises_folder_membership_v1() {
         assert_eq!(hello_capabilities()["folderMembershipV1"], true);
         assert_eq!(hello_capabilities()["folderMembershipSummaryV1"], true);
+        assert_eq!(hello_capabilities()["memorySizeLimitV1"], true);
     }
 
     #[test]
