@@ -9,9 +9,13 @@ use flexi_logger::{Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
 
 use crate::config;
 
-/// Starts file logging in `log_dir_override` (the `--log-dir` argument) when
-/// given, else in ~/.tabmail/logs.
-pub fn init_logging(log_dir_override: Option<&Path>) -> anyhow::Result<()> {
+/// Starts file logging at `level` (one of `config::logging::LOG_LEVELS`) in
+/// `log_dir_override` (the `--log-dir` argument) when given, else in
+/// ~/.tabmail/logs. At "off" nothing is logged and no folder or file is made.
+pub fn init_logging(log_dir_override: Option<&Path>, level: &str) -> anyhow::Result<()> {
+    if level == "off" {
+        return Ok(());
+    }
     let log_dir = match log_dir_override {
         Some(dir) => {
             std::fs::create_dir_all(dir).with_context(|| format!("failed creating log dir {}", dir.display()))?;
@@ -25,7 +29,7 @@ pub fn init_logging(log_dir_override: Option<&Path>) -> anyhow::Result<()> {
     // - keep file at debug
     // - duplicate to stderr at info (TB captures stderr too), but we also rely on log level usage.
     // This is acceptable because python also emits warnings/errors on stderr only; we preserve file fidelity.
-    Logger::try_with_str("debug")?
+    Logger::try_with_str(level)?
         .log_to_file(FileSpec::default().directory(log_dir).basename(config::logging::LOG_FILE_NAME))
         .rotate(
             Criterion::Size(config::logging::LOG_ROTATE_SIZE_BYTES),

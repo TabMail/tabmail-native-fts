@@ -24,6 +24,11 @@ The helper must not know who runs it: no client modes, no client names.
 1. **`--log-dir <absolute path>`** (start-up argument). It is an argument because logging starts
    in `real_main` before the first message. Absent: `~/.tabmail/logs`. A relative or empty value,
    or the `--log-dir=<path>` form, is a fatal start-up error, before anything is logged.
+   **`--log-level <off|error|warn|info|debug>`** (start-up argument) sets the file log's level.
+   Absent: `debug`, as before. At `off` nothing is logged and no log folder or file is made. A
+   caller whose policy keeps user content out of logs (TabMail Voice outside its debug mode) needs
+   it: the memory search paths log the query text, and an error reply quotes it. Any other value,
+   or the `--log-level=<level>` form, is a fatal start-up error.
 2. **`init` `modelDir`** (absolute path). The model is downloaded to and loaded from there.
    Absent: `~/.tabmail/models/all-MiniLM-L6-v2`. A relative or empty value gets an error
    response and opens nothing; the helper stays in pre-init and accepts another `init`.
@@ -105,6 +110,8 @@ The helper must not know who runs it: no client modes, no client names.
 - The orphan clean-up ran for every caller (point 4).
 - Every merge step was negative, so a merge cut short restarted at the next write (merge sign
   discipline above).
+- The file log was always at `debug`, so a caller could not keep search text out of it
+  (`--log-level`, point 1).
 
 ## Consequences
 

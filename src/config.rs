@@ -22,6 +22,11 @@ pub mod logging {
 
     pub const LOG_ROTATE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
     pub const LOG_ROTATE_KEEP_FILES: usize = 5;
+
+    // `--log-level`: the file log's level, chosen by the caller (ADR-NF-008).
+    // "off" writes no log file. Absent: DEFAULT_LOG_LEVEL.
+    pub const LOG_LEVELS: [&str; 5] = ["off", "error", "warn", "info", "debug"];
+    pub const DEFAULT_LOG_LEVEL: &str = "debug";
 }
 
 pub mod native_messaging {

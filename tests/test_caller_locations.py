@@ -203,6 +203,40 @@ class TestCallerLocations(unittest.TestCase):
 
         self.assertEqual(_tree_hashes(self.home), before)
 
+    def test_log_level_off_writes_no_log_anywhere(self):
+        _replace_with_fifo(self.home / ".tabmail" / "logs" / LIVE_LOG)
+        before = _tree_hashes(self.home)
+        log_dir = self.caller / "logs"
+        rows = [{"memId": "turn:1", "role": "session", "content": "[USER]: the planning note\n\n[AGENT]: Done.",
+                 "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": 1_700_000_000_000}]
+        responses = self._session(
+            ["--log-dir", str(log_dir), "--log-level", "off"],
+            [
+                ("init", {"profilePath": str(self.caller / "db" / "voice"), "modelDir": str(self._caller_model_dir())}),
+                ("memoryIndexBatch", {"rows": rows}),
+                ("memorySearch", {"q": "re: planning", "ignoreDate": True}),
+                ("memorySearch", {"q": "planning", "ignoreDate": True}),
+                ("memoryStats", {}),
+            ],
+        )
+        self.assertIn("result", responses[1], responses[1])
+        self.assertIn("result", responses[3], responses[3])
+        self.assertEqual(responses[4]["result"]["docs"], 1)
+        # Not even a folder: the search text, refused or not, is written nowhere.
+        self.assertFalse(log_dir.exists())
+        self.assertEqual(_tree_hashes(self.home), before)
+
+        # A level is still a level: the file log at "warn" is in the caller's folder.
+        self._session(["--log-dir", str(log_dir), "--log-level", "warn"], [("memoryStats", {})])
+        self.assertTrue(log_dir.is_dir())
+
+        for args in (["--log-level", "verbose"], ["--log-level"], ["--log-level=off"]):
+            proc = self._spawn(args)
+            proc.stdin.close()
+            self.assertNotEqual(proc.wait(timeout=30), 0, args)
+            proc.stdout.close()
+        self.assertEqual(_tree_hashes(self.home), before)
+
     def test_without_locations_the_defaults_are_used(self):
         log = self.home / ".tabmail" / "logs" / LIVE_LOG
         log_before = log.read_bytes()
