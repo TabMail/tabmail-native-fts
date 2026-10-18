@@ -212,6 +212,85 @@ class TestCallerLocations(unittest.TestCase):
         self.assertIn("result", newest, newest)
         self.assertIn("note 399", str(newest["result"]))
 
+    def _rows(self, start, count, words):
+        return [
+            {
+                "memId": f"turn:{i}",
+                "role": "session",
+                "content": f"[USER]: note {i}\n\n[AGENT]: " + "quarterly planning notes " * words,
+                "sessionId": "persistent_chat",
+                "turnIndex": 0,
+                "dateMs": 1_700_000_000_000 + i * DAY_MS,
+            }
+            for i in range(start, start + count)
+        ]
+
+    def test_index_batch_with_a_limit_removes_the_oldest_and_keeps_the_new_row(self):
+        db_dir = self.caller / "db" / "voice"
+        init_params = {"profilePath": str(db_dir), "modelDir": str(self._caller_model_dir())}
+        logs = ["--log-dir", str(self.caller / "logs")]
+        old = self._rows(0, 400, 40)
+        _, _, stats = self._session(
+            logs, [("init", init_params), ("memoryIndexBatch", {"rows": old}), ("memoryStats", {})]
+        )
+        limit = stats["result"]["usedBytes"] * 9 // 10
+        new = self._rows(400, 1, 40)
+        _, batch, after, oldest, newest = self._session(
+            logs,
+            [
+                ("init", init_params),
+                ("memoryIndexBatch", {"rows": new, "maxBytes": limit}),
+                ("memoryStats", {}),
+                ("memoryRead", {"timestampMs": old[0]["dateMs"], "toleranceMs": 60_000}),
+                ("memoryRead", {"timestampMs": new[0]["dateMs"], "toleranceMs": 60_000}),
+            ],
+        )
+        result = batch["result"]
+        self.assertEqual(result["count"], 1, batch)
+        self.assertGreater(result["trimmed"], 0)
+        self.assertTrue(result["withinLimit"])
+        self.assertLessEqual(result["usedBytes"], limit)
+        self.assertLessEqual(after["result"]["usedBytes"], limit)
+        self.assertEqual(after["result"]["docs"], len(old) + 1 - result["trimmed"])
+        self.assertGreater(after["result"]["docs"], 1)
+        self.assertEqual(oldest["result"], [], oldest)
+        self.assertEqual(len(newest["result"]), 1, newest)
+        self.assertIn("note 400", newest["result"][0]["content"])
+
+    def test_memory_trim_gives_the_disk_space_back(self):
+        db_dir = self.caller / "db" / "voice"
+        init_params = {"profilePath": str(db_dir), "modelDir": str(self._caller_model_dir())}
+        logs = ["--log-dir", str(self.caller / "logs")]
+        # Long exchanges, so the text outweighs the shared vector chunk and a
+        # trim to half frees pages.
+        rows = self._rows(0, 200, 800)
+        _, _, nothing_to_do, stats = self._session(
+            logs,
+            [
+                ("init", init_params),
+                ("memoryIndexBatch", {"rows": rows}),
+                ("memoryTrim", {"maxBytes": 1 << 40}),
+                ("memoryStats", {}),
+            ],
+        )
+        self.assertEqual(nothing_to_do["result"]["trimmed"], 0, nothing_to_do)
+        self.assertFalse(nothing_to_do["result"]["compacted"])
+
+        def on_disk():
+            return sum(
+                (db_dir / "tabmail_fts" / name).stat().st_size
+                for name in ("memory.db", "memory.db-wal")
+                if (db_dir / "tabmail_fts" / name).exists()
+            )
+
+        before = on_disk()
+        limit = stats["result"]["usedBytes"] // 2
+        _, trim = self._session(logs, [("init", init_params), ("memoryTrim", {"maxBytes": limit})])
+        self.assertTrue(trim["result"]["withinLimit"], trim)
+        self.assertTrue(trim["result"]["compacted"])
+        after = on_disk()
+        self.assertLessEqual(after, limit, f"{after} bytes on disk, limit {limit}, was {before}")
+
     def test_invalid_locations_and_limits_are_rejected(self):
         db_dir = self.caller / "db" / "voice"
         bad_init, init = self._session(

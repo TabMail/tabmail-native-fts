@@ -54,7 +54,8 @@ folders under its own name, which Thunderbird never creates.
   small, so the budget can interrupt a long trim; a budget checked only around one large unit
   cannot. That is well under the
   add-on's 60 s native RPC timeout. A trim cut short reports `withinLimit: false`, and the next
-  write or trim continues it.
+  write or trim continues it. The budget is a parameter of `memory_trim_to_bytes`; both request
+  handlers pass the config value, and a unit test passes zero to pin the cut-short path.
 - **Overshoot, accepted:**
   - FTS5 deletes leave tombstones until segments merge, so freeing a byte takes deleting a little
     more than a byte of rows.
@@ -62,15 +63,18 @@ folders under its own name, which Thunderbird never creates.
     frees a chunk only once all its rows are deleted.
 
   A trim can therefore remove up to about one chunk of rows beyond what is strictly needed. At a
-  1 GB limit (about 700k exchanges) that is about 0.15%. On a tiny database whose rows all share
+  1 GB limit (about 130k exchanges at the roughly 7.6 KB per exchange measured with vectors) that
+  is about 0.15%. On a tiny database whose rows all share
   one chunk, a trim below the chunk size empties the memory.
 - `VACUUM` keeps `memory_ids` rowids aligned with the other tables; a unit test pins this.
 
 ## Consequences
 
-- Thunderbird's behaviour is unchanged until the add-on sends `maxBytes` / `memoryTrim`. An older
-  helper ignores `maxBytes` and answers `memoryTrim` with "Unknown writer method", so the add-on
-  treats that as "no limit until the helper updates".
+- `hello` advertises `capabilities.memorySizeLimitV1`. Clients send `maxBytes` and `memoryTrim`
+  only to a helper that advertises it. An older helper ignores `maxBytes` and answers `memoryTrim`
+  with "Unknown method: memoryTrim"; a client without the capability treats the limit as "applies
+  once the helper updates" instead of matching that text.
+- Thunderbird's behaviour is unchanged until the add-on sends `maxBytes` / `memoryTrim`.
 - Voice gets fully separate files by naming all three locations.
 - Tests:
   - `tests/test_caller_locations.py` runs a full memory session with all three locations given,

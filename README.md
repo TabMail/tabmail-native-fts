@@ -126,7 +126,8 @@ Each Thunderbird profile gets its own isolated FTS and memory databases.
 optional `maxBytes`, and `memoryTrim { maxBytes }` applies a lowered limit and gives
 the freed disk space back. The oldest entries are removed first. `memoryStats`
 reports `usedBytes`, the size the limit counts (pages in use). Without `maxBytes`
-there is no limit.
+there is no limit. Helpers with this support advertise `capabilities.memorySizeLimitV1`
+in `hello`.
 
 **Caller-named locations.** A client that ships its own copy of the helper can keep
 every file apart from Thunderbird's: the database folder is `init` `profilePath`,

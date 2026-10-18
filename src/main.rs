@@ -827,7 +827,7 @@ fn handle_write_request(
             let (count, skipped) = memory_db::memory_index_batch(memory_conn, &rows, engine)?;
             let mut result = serde_json::json!({ "ok": true, "count": count, "skippedDuplicates": skipped });
             if let Some(max_bytes) = max_bytes {
-                let trim = memory_db::memory_trim_to_bytes(memory_conn, max_bytes)?;
+                let trim = memory_db::memory_trim_to_bytes(memory_conn, max_bytes, trim_budget())?;
                 result["trimmed"] = serde_json::json!(trim.removed);
                 result["usedBytes"] = serde_json::json!(trim.used_bytes);
                 result["withinLimit"] = serde_json::json!(trim.within_limit);
@@ -837,7 +837,7 @@ fn handle_write_request(
         "memoryTrim" => {
             // Sent when the client lowers its limit: trim, then give disk space back.
             let max_bytes = parse_memory_max_bytes(params.get("maxBytes").unwrap_or(&Value::Null))?;
-            let trim = memory_db::memory_trim_to_bytes(memory_conn, max_bytes)?;
+            let trim = memory_db::memory_trim_to_bytes(memory_conn, max_bytes, trim_budget())?;
             let compacted = memory_db::memory_compact_if_mostly_free(memory_conn)?;
             Ok(serde_json::json!({
                 "id": msg_id,
@@ -941,8 +941,13 @@ fn handle_hello(msg_id: &str, params: &Value) -> anyhow::Result<Value> {
 fn hello_capabilities() -> Value {
     serde_json::json!({
         "folderMembershipV1": true,
-        "folderMembershipSummaryV1": true
+        "folderMembershipSummaryV1": true,
+        "memorySizeLimitV1": true
     })
+}
+
+fn trim_budget() -> std::time::Duration {
+    std::time::Duration::from_millis(config::memory::TRIM_TIME_BUDGET_MS)
 }
 
 fn required_nonempty_string<'a>(params: &'a Value, name: &str) -> anyhow::Result<&'a str> {
@@ -1945,6 +1950,7 @@ mod tests {
     fn test_hello_advertises_folder_membership_v1() {
         assert_eq!(hello_capabilities()["folderMembershipV1"], true);
         assert_eq!(hello_capabilities()["folderMembershipSummaryV1"], true);
+        assert_eq!(hello_capabilities()["memorySizeLimitV1"], true);
     }
 
     #[test]

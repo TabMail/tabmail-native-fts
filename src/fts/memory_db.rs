@@ -820,11 +820,14 @@ pub struct MemoryTrimResult {
 /// Remove the oldest memory rows (by dateMs, then rowid) until the used size is
 /// at or below `max_bytes`. Each pass removes a share of the rows proportional
 /// to the excess, then re-measures. Stops when within the limit, when no rows
-/// are left, or when the time budget runs out (`within_limit` false; the next
-/// call continues).
-pub fn memory_trim_to_bytes(conn: &mut Connection, max_bytes: i64) -> anyhow::Result<MemoryTrimResult> {
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_millis(config::memory::TRIM_TIME_BUDGET_MS);
+/// are left, or when `budget` runs out (`within_limit` false; the next call
+/// continues). Callers pass `config::memory::TRIM_TIME_BUDGET_MS`.
+pub fn memory_trim_to_bytes(
+    conn: &mut Connection,
+    max_bytes: i64,
+    budget: std::time::Duration,
+) -> anyhow::Result<MemoryTrimResult> {
+    let deadline = std::time::Instant::now() + budget;
     let mut removed: i64 = 0;
     loop {
         let used = memory_used_bytes(conn)?;
@@ -1125,6 +1128,10 @@ mod tests {
         })
     }
 
+    fn budget() -> std::time::Duration {
+        std::time::Duration::from_millis(config::memory::TRIM_TIME_BUDGET_MS)
+    }
+
     fn kept_dates(conn: &Connection) -> Vec<i64> {
         conn.prepare("SELECT dateMs FROM memory_meta ORDER BY dateMs").unwrap()
             .query_map([], |r| r.get(0)).unwrap()
@@ -1140,7 +1147,7 @@ mod tests {
         let before = memory_used_bytes(&conn).unwrap();
         let limit = before / 2;
 
-        let trim = memory_trim_to_bytes(&mut conn, limit).unwrap();
+        let trim = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap();
 
         assert!(trim.within_limit);
         let used = memory_used_bytes(&conn).unwrap();
@@ -1160,11 +1167,39 @@ mod tests {
     }
 
     #[test]
+    fn test_trim_stops_when_its_time_budget_runs_out_and_the_next_call_continues() {
+        let (dir, mut conn) = temp_memory_db("budget");
+        let n = 3000;
+        fill(&mut conn, n, |i| i as i64);
+        let limit = memory_used_bytes(&conn).unwrap() / 4;
+
+        // No time left: the call returns over the limit after at most one pass,
+        // and whatever it removed is the oldest rows, from every table.
+        let cut_short = memory_trim_to_bytes(&mut conn, limit, std::time::Duration::ZERO).unwrap();
+        assert!(!cut_short.within_limit);
+        assert!(cut_short.used_bytes > limit);
+        assert!(cut_short.removed <= config::memory::TRIM_DELETE_BATCH_MAX_ROWS);
+        let kept = table_counts(&conn)[0];
+        assert_eq!(table_counts(&conn), [kept; 4]);
+        assert_eq!(kept_dates(&conn), ((n as i64 - kept)..n as i64).collect::<Vec<_>>());
+
+        // The next call, with the normal budget, finishes the job.
+        let finished = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap();
+        assert!(finished.within_limit);
+        assert!(memory_used_bytes(&conn).unwrap() <= limit);
+        let kept = table_counts(&conn)[0];
+        assert!(kept > 0);
+        assert_eq!(kept_dates(&conn), ((n as i64 - kept)..n as i64).collect::<Vec<_>>());
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn test_trim_within_limit_removes_nothing() {
         let (dir, mut conn) = temp_memory_db("noop");
         fill(&mut conn, 50, |i| i as i64);
         let used = memory_used_bytes(&conn).unwrap();
-        let trim = memory_trim_to_bytes(&mut conn, used).unwrap();
+        let trim = memory_trim_to_bytes(&mut conn, used, budget()).unwrap();
         assert_eq!(trim, MemoryTrimResult { removed: 0, used_bytes: used, within_limit: true });
         assert_eq!(table_counts(&conn), [50; 4]);
         drop(conn);
@@ -1175,7 +1210,7 @@ mod tests {
     fn test_trim_below_the_empty_schema_removes_everything_and_reports_over_limit() {
         let (dir, mut conn) = temp_memory_db("tiny");
         fill(&mut conn, 20, |i| i as i64);
-        let trim = memory_trim_to_bytes(&mut conn, 1).unwrap();
+        let trim = memory_trim_to_bytes(&mut conn, 1, budget()).unwrap();
         assert!(!trim.within_limit);
         assert_eq!(trim.removed, 20);
         assert_eq!(table_counts(&conn), [0; 4]);
@@ -1194,7 +1229,7 @@ mod tests {
         };
         let before = disk(&dir);
         let limit = memory_used_bytes(&conn).unwrap() / 4;
-        assert!(memory_trim_to_bytes(&mut conn, limit).unwrap().within_limit);
+        assert!(memory_trim_to_bytes(&mut conn, limit, budget()).unwrap().within_limit);
         assert!(memory_compact_if_mostly_free(&conn).unwrap());
         let after = disk(&dir);
         assert!(after as i64 <= limit, "files take {after} bytes after compacting, limit {limit} (was {before})");
