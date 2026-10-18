@@ -32,33 +32,42 @@ The helper must not know who runs it: no client modes, no client names.
      oldest rows (by `dateMs`, then rowid) from `memory_fts`, `memory_meta`, `memory_vec` and
      `memory_ids` together until the used size is within the limit. The result gains `trimmed`,
      `usedBytes` and `withinLimit`. Without `maxBytes` nothing changes (older clients).
-   - New writer method `memoryTrim { maxBytes }`, sent when the user lowers the limit: the same
-     trim, then `VACUUM` + `wal_checkpoint(TRUNCATE)` when at least
-     `TRIM_VACUUM_MIN_FREE_PERCENT` of the pages are free, so the disk space comes back. Result:
-     `{ trimmed, usedBytes, withinLimit, compacted }`.
+   - New writer method `memoryTrim { maxBytes }`, sent when the user changes the limit: the same
+     trim. Result: `{ trimmed, usedBytes, withinLimit }`. It does not compact the file (see
+     Revisions).
    - `memoryStats` gains `usedBytes`.
    - **Used size** = `(page_count - freelist_count) * page_size`. Freed pages stay in the file and
-     are reused, so the file length is not the measure.
+     are reused, so the file length is not the measure: the file keeps its largest size, and
+     memory stays within the limit inside it.
    - A non-positive or non-integer `maxBytes` is an error, and nothing is written.
 
-The orphan clean-up (ADR-NF-007) is unchanged. It takes the add-on id from the last component of
-`profilePath`, so a caller whose folder is not named `thunderbird@tabmail.ai` only ever looks for
-folders under its own name, which Thunderbird never creates.
+4. **A caller that names its model folder never runs the orphan clean-up** (ADR-NF-007). The
+   clean-up takes the add-on id from the last component of `profilePath`, and nothing stops a
+   caller's folder from having the add-on's name; with that name, an init would move an index an
+   earlier add-on release left behind into the caller's folder, or delete it. Naming `modelDir`
+   marks a caller that owns all its locations, without a client mode; the add-on sends no
+   `modelDir` and keeps the clean-up.
 
 ## Trim mechanics
 
 - Each pass removes a share of the rows proportional to the excess over
-  `TRIM_TARGET_PERCENT` of the limit (at most `TRIM_DELETE_BATCH_MAX_ROWS` per transaction), then
-  re-measures. Aiming below the limit means the next batches do not each trim again.
-- Wall time is bounded by `TRIM_TIME_BUDGET_MS`, checked between delete transactions. Each is
-  small, so the budget can interrupt a long trim; a budget checked only around one large unit
-  cannot. That is well under the
-  add-on's 60 s native RPC timeout. A trim cut short reports `withinLimit: false`, and the next
-  write or trim continues it. The budget is a parameter of `memory_trim_to_bytes`; both request
-  handlers pass the config value, and a unit test passes zero to pin the cut-short path.
+  `TRIM_TARGET_PERCENT` of the limit, then re-measures. Aiming below the limit means the next
+  batches do not each trim again.
+- **Removed rows' FTS space is reclaimed before more rows go.** An FTS5 delete leaves the row's
+  entries (and the pages holding them) in the old segments until those are merged. Measuring
+  that space and removing more rows for it empties memory without ever reaching a limit that the
+  newest rows fit in. So, while over the limit, each pass first runs FTS5 `merge` steps (negative
+  `TRIM_MERGE_STEP_PAGES`: all segments eligible), re-measuring after each, and removes rows only
+  once a step finds no work (fewer than two changes). FTS5 `secure-delete` was tried and rejected:
+  it empties the entries in place, but SQLite rebalances b-tree pages only on delete, so the pages
+  stay allocated.
+- Wall time is bounded by `TRIM_TIME_BUDGET_MS`, asked after every row removed and every merge
+  step, so a trim overruns by one row or one step at most, and the rows it removed stay removed
+  (the transaction commits early). That is well under the add-on's 60 s native RPC timeout. A
+  trim cut short reports `withinLimit: false`, and the next write or trim continues it.
+  `memory_trim_to_bytes` takes the budget; the request handlers pass the config value, and unit
+  tests drive the inner `trim_until` with a stop after a set number of questions.
 - **Overshoot, accepted:**
-  - FTS5 deletes leave tombstones until segments merge, so freeing a byte takes deleting a little
-    more than a byte of rows.
   - sqlite-vec 0.1.9 stores vectors in chunks of 1024 rows (about 1.5 MB at 384 dimensions) and
     frees a chunk only once all its rows are deleted.
 
@@ -66,7 +75,21 @@ folders under its own name, which Thunderbird never creates.
   1 GB limit (about 130k exchanges at the roughly 7.6 KB per exchange measured with vectors) that
   is about 0.15%. On a tiny database whose rows all share
   one chunk, a trim below the chunk size empties the memory.
-- `VACUUM` keeps `memory_ids` rowids aligned with the other tables; a unit test pins this.
+
+## Revisions before merge (review round 2026-10-18)
+
+- `memoryTrim` first compacted the file (`VACUUM` + `wal_checkpoint(TRUNCATE)` when at least 10%
+  of pages were free, result field `compacted`) so a lowered limit gave disk space back. Removed:
+  `VACUUM` copies everything kept and cannot be bounded by the trim's budget (about 31 s for
+  2.2 GB measured, with the copy in RAM under `temp_store = MEMORY`), and it relied on `VACUUM`
+  keeping `memory_ids` rowids, which SQLite does not document for a table without an INTEGER
+  PRIMARY KEY.
+- The budget was checked only between delete transactions of up to 5,000 rows
+  (`TRIM_DELETE_BATCH_MAX_ROWS`); one transaction of long rows took about 22 s, and 6,000 rows of
+  360 KB took 219 s. Now asked after every row; the row cap is gone.
+- Without the merge step, 5,000 FTS-only rows trimmed to a twentieth of their size were all
+  removed, leaving 38 MB of segments and `withinLimit: false` on every retry.
+- The orphan clean-up ran for every caller (point 4).
 
 ## Consequences
 
@@ -80,4 +103,12 @@ folders under its own name, which Thunderbird never creates.
   - `tests/test_caller_locations.py` runs a full memory session with all three locations given,
     under a temporary HOME holding a fake Thunderbird profile index, model folder and log. Every
     file under HOME stays byte-identical.
-  - Unit tests in `memory_db.rs` cover trim and compact.
+    The default model files and the default live log are FIFOs there, so a read of either (or a
+    write to the log) stalls the session, which a deadline fails.
+  - The same file pins point 4 with recoverable orphans and a caller folder named
+    `thunderbird@tabmail.ai`, fresh and existing, and refuses every `maxBytes` that is not a
+    positive integer (fractions, `2.0`, `1e30`, `2^63`, strings, booleans, arrays, objects)
+    without writing.
+  - Unit tests in `memory_db.rs` cover the trim: newest kept, all four tables together, the
+    FTS-only case converging on a feasible limit, and a cut-short trim keeping its progress across
+    a reopen and continuing.

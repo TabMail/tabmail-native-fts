@@ -24,7 +24,7 @@ Native messaging host for full-text search + semantic search. Communicates with 
 - `EmbeddingEngine` and `SynonymLookup` shared via `Arc`
 - Responses written through `Arc<Mutex<Stdout>>`
 - `clear`/`memoryClear` in writer signals reader via `AtomicBool` to reopen its read-only connection
-- `memoryTrim` / `memoryIndexBatch{maxBytes}` trim in the writer; VACUUM keeps the same file, so the reader needs no reopen (ADR-NF-008)
+- `memoryTrim` / `memoryIndexBatch{maxBytes}` trim in the writer: FTS5 `merge` steps reclaim removed rows' segment space before more rows go; budget asked per row and per step; no VACUUM, so the file keeps its largest size; caller with `modelDir` skips the orphan clean-up (ADR-NF-008)
 - No new crate dependencies — uses `std::sync::{mpsc, Arc, Mutex, atomic::AtomicBool}`
 
 ### SchemaVersion

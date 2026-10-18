@@ -835,15 +835,14 @@ fn handle_write_request(
             Ok(serde_json::json!({ "id": msg_id, "result": result }))
         }
         "memoryTrim" => {
-            // Sent when the client lowers its limit: trim, then give disk space back.
+            // Sent when the client lowers its limit.
             let max_bytes = parse_memory_max_bytes(params.get("maxBytes").unwrap_or(&Value::Null))?;
             let trim = memory_db::memory_trim_to_bytes(memory_conn, max_bytes, trim_budget())?;
-            let compacted = memory_db::memory_compact_if_mostly_free(memory_conn)?;
             Ok(serde_json::json!({
                 "id": msg_id,
                 "result": {
                     "ok": true, "trimmed": trim.removed, "usedBytes": trim.used_bytes,
-                    "withinLimit": trim.within_limit, "compacted": compacted
+                    "withinLimit": trim.within_limit
                 }
             }))
         }
@@ -1074,7 +1073,12 @@ fn handle_init(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Res
             let p = PathBuf::from(override_path);
             log::info!("Using explicit profilePath: {}", p.display());
             std::fs::create_dir_all(&p)?;
-            adopt_or_remove_orphaned_indexes(&p, &guessed_profile_dirs());
+            // A caller that names its model folder owns every location it uses
+            // and is not the add-on: it never adopts or removes the indexes an
+            // earlier add-on release left in a guessed profile.
+            if model_dir.is_none() {
+                adopt_or_remove_orphaned_indexes(&p, &guessed_profile_dirs());
+            }
             (p.clone(), p)
         } else {
             // Auto-detect Thunderbird profile

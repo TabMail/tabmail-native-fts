@@ -98,21 +98,20 @@ pub mod embedding {
 
 pub mod memory {
     // Memory size limit (client-supplied `maxBytes`). Size = pages in use
-    // ((page_count - freelist_count) * page_size): freed pages are reused, so
-    // the file itself only shrinks when `memoryTrim` compacts it.
+    // ((page_count - freelist_count) * page_size): freed pages are reused for
+    // new rows, so the file keeps its largest size and memory stays within the
+    // limit inside it.
 
     // A trim removes oldest rows until the used size is at or below this
     // percentage of the limit, so the next few batches do not each trim again.
     pub const TRIM_TARGET_PERCENT: i64 = 95;
-    // Most rows removed in one delete transaction before re-measuring.
-    pub const TRIM_DELETE_BATCH_MAX_ROWS: i64 = 5_000;
-    // Wall-time budget for one trim, checked between delete transactions; well
-    // under the add-on's native RPC timeout (60 s). A trim cut short reports
-    // `withinLimit: false` and the next write or trim continues it.
+    // Wall-time budget for one trim, checked after every row removed; well
+    // under the add-on's native RPC timeout (60 s). A trim cut short keeps the
+    // rows it removed, reports `withinLimit: false`, and the next write or trim
+    // continues it.
     pub const TRIM_TIME_BUDGET_MS: u64 = 20_000;
-    // `memoryTrim` compacts the file (VACUUM) when at least this percentage of
-    // its pages are free after trimming, so lowering the limit frees disk space.
-    pub const TRIM_VACUUM_MIN_FREE_PERCENT: i64 = 10;
+    // Pages one FTS merge step writes; the budget is checked between steps.
+    pub const TRIM_MERGE_STEP_PAGES: i64 = 256;
 }
 
 pub mod hybrid {

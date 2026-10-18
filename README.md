@@ -123,8 +123,9 @@ The memory database enables:
 Each Thunderbird profile gets its own isolated FTS and memory databases.
 
 **Size limit.** A client can bound the memory database: `memoryIndexBatch` takes an
-optional `maxBytes`, and `memoryTrim { maxBytes }` applies a lowered limit and gives
-the freed disk space back. The oldest entries are removed first. `memoryStats`
+optional `maxBytes`, and `memoryTrim { maxBytes }` applies a changed limit at once.
+The oldest entries are removed first; the space they took is reused by new entries,
+and the file keeps its largest size. `memoryStats`
 reports `usedBytes`, the size the limit counts (pages in use). Without `maxBytes`
 there is no limit. Helpers with this support advertise `capabilities.memorySizeLimitV1`
 in `hello`.

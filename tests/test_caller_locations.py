@@ -22,8 +22,10 @@ Run:
 import hashlib
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -35,18 +37,40 @@ REAL_MODEL_DIR = Path.home() / ".tabmail" / "models" / "all-MiniLM-L6-v2"
 DAY_MS = 24 * 60 * 60 * 1000
 # flexi_logger's name for the live file (rotated ones get numbers).
 LIVE_LOG = "fts_helper.log_rCURRENT.log"
+# A session that has not finished by then is stuck (a read of a FIFO blocks).
+SESSION_DEADLINE_S = 60
 
 
 def _tree_hashes(root):
-    """Path -> SHA-256 of every file under root, plus every directory (None)."""
+    """Path -> SHA-256 of every file under root, every directory (None), and
+    every FIFO ("fifo", never opened)."""
     out = {}
     for dirpath, dirnames, filenames in os.walk(root):
         for d in dirnames:
             out[str(Path(dirpath, d).relative_to(root))] = None
         for f in filenames:
             p = Path(dirpath, f)
-            out[str(p.relative_to(root))] = hashlib.sha256(p.read_bytes()).hexdigest()
+            if stat.S_ISFIFO(p.lstat().st_mode):
+                out[str(p.relative_to(root))] = "fifo"
+            else:
+                out[str(p.relative_to(root))] = hashlib.sha256(p.read_bytes()).hexdigest()
     return out
+
+
+def _replace_with_fifo(path):
+    """Any open of `path` now blocks until the other end opens: a read of it,
+    or a write to it, stalls the helper rather than passing unseen."""
+    path.unlink()
+    os.mkfifo(path)
+
+
+def _write_orphan(root):
+    """An index an earlier add-on release left at `root` (a guessed profile)."""
+    fts_dir = root / "browser-extension-data" / ADDON_ID / "tabmail_fts"
+    fts_dir.mkdir(parents=True)
+    (fts_dir / "fts.db").write_bytes(b"thunderbird mail index")
+    (fts_dir / "memory.db").write_bytes(b"thunderbird chat memory")
+    return fts_dir
 
 
 def _write_unreadable_model(model_dir):
@@ -99,17 +123,24 @@ class TestCallerLocations(unittest.TestCase):
         )
 
     def _session(self, args, requests):
-        """Runs `requests` (no hello) and returns their responses."""
+        """Runs `requests` (no hello) and returns their responses. A helper
+        still running after SESSION_DEADLINE_S is killed, and its missing
+        responses fail the test."""
         proc = self._spawn(args)
+        watchdog = threading.Timer(SESSION_DEADLINE_S, proc.kill)
+        watchdog.start()
         try:
             responses = []
             for i, (method, params) in enumerate(requests):
                 _send_message(proc, {"id": f"r{i}", "method": method, "params": params})
-                responses.append(_read_message(proc))
+                response = _read_message(proc)
+                self.assertIsNotNone(response, f"no response to {method}: the helper stalled or died")
+                responses.append(response)
             return responses
         finally:
             proc.stdin.close()
-            proc.wait(timeout=30)
+            proc.wait(timeout=SESSION_DEADLINE_S)
+            watchdog.cancel()
             proc.stdout.close()
 
     def _caller_model_dir(self):
@@ -121,6 +152,12 @@ class TestCallerLocations(unittest.TestCase):
         return model_dir
 
     def test_session_with_all_three_locations_leaves_everything_else_identical(self):
+        # The default model and live log become FIFOs, so a read of either (or
+        # a write to the log) stalls the session instead of leaving every
+        # hash unchanged.
+        for name in MODEL_FILES:
+            _replace_with_fifo(self.home / ".tabmail" / "models" / "all-MiniLM-L6-v2" / name)
+        _replace_with_fifo(self.home / ".tabmail" / "logs" / LIVE_LOG)
         before = _tree_hashes(self.home)
         db_dir = self.caller / "db" / "voice"
         log_dir = self.caller / "logs"
@@ -257,39 +294,62 @@ class TestCallerLocations(unittest.TestCase):
         self.assertEqual(len(newest["result"]), 1, newest)
         self.assertIn("note 400", newest["result"][0]["content"])
 
-    def test_memory_trim_gives_the_disk_space_back(self):
-        db_dir = self.caller / "db" / "voice"
-        init_params = {"profilePath": str(db_dir), "modelDir": str(self._caller_model_dir())}
+    def test_a_caller_never_moves_or_removes_an_earlier_releases_index(self):
+        # The caller's database folder has the add-on's name, which the API
+        # allows, and the indexes an earlier release left in ~/.tabmail and in
+        # a profile without the add-on are recoverable orphans.
+        orphans = [
+            _write_orphan(self.home / ".tabmail"),
+            _write_orphan(_profiles_dir(self.home) / "no-addon.default"),
+        ]
+        before = _tree_hashes(self.home)
         logs = ["--log-dir", str(self.caller / "logs")]
-        # Long exchanges, so the text outweighs the shared vector chunk and a
-        # trim to half frees pages.
-        rows = self._rows(0, 200, 800)
-        _, _, nothing_to_do, stats = self._session(
-            logs,
-            [
-                ("init", init_params),
-                ("memoryIndexBatch", {"rows": rows}),
-                ("memoryTrim", {"maxBytes": 1 << 40}),
-                ("memoryStats", {}),
-            ],
-        )
-        self.assertEqual(nothing_to_do["result"]["trimmed"], 0, nothing_to_do)
-        self.assertFalse(nothing_to_do["result"]["compacted"])
+        model_dir = str(self._caller_model_dir())
+        fresh = self.caller / "fresh" / ADDON_ID
+        existing = self.caller / "existing" / ADDON_ID
+        (existing / "tabmail_fts").mkdir(parents=True)
+        for db_dir in (fresh, existing):
+            with self.subTest(db_dir=db_dir.parent.name):
+                init, stats = self._session(
+                    logs, [("init", {"profilePath": str(db_dir), "modelDir": model_dir}), ("memoryStats", {})]
+                )
+                self.assertIn("result", init, init)
+                self.assertEqual(stats["result"]["docs"], 0)
+                self.assertEqual(_tree_hashes(self.home), before)
+        for fts_dir in orphans:
+            self.assertEqual((fts_dir / "memory.db").read_bytes(), b"thunderbird chat memory")
 
-        def on_disk():
-            return sum(
-                (db_dir / "tabmail_fts" / name).stat().st_size
-                for name in ("memory.db", "memory.db-wal")
-                if (db_dir / "tabmail_fts" / name).exists()
-            )
-
-        before = on_disk()
-        limit = stats["result"]["usedBytes"] // 2
-        _, trim = self._session(logs, [("init", init_params), ("memoryTrim", {"maxBytes": limit})])
-        self.assertTrue(trim["result"]["withinLimit"], trim)
-        self.assertTrue(trim["result"]["compacted"])
-        after = on_disk()
-        self.assertLessEqual(after, limit, f"{after} bytes on disk, limit {limit}, was {before}")
+    def test_a_limit_that_is_not_a_positive_integer_is_refused_and_writes_nothing(self):
+        db_dir = self.caller / "db" / "voice"
+        row = {"memId": "turn:1", "role": "session", "content": "[USER]: hello", "sessionId": "s", "turnIndex": 0, "dateMs": 1}
+        invalid = [0, -1, 1.5, 2.0, 1e30, 2**63, "100", True, False, [100], {"bytes": 100}]
+        requests = [("init", {"profilePath": str(db_dir)})]
+        for value in invalid:
+            requests.append(("memoryIndexBatch", {"rows": [row], "maxBytes": value}))
+            requests.append(("memoryTrim", {"maxBytes": value}))
+        requests += [
+            ("memoryTrim", {"maxBytes": None}),
+            ("memoryStats", {}),
+            # Without a limit (null or absent) a batch keeps no limit, as before.
+            ("memoryIndexBatch", {"rows": [row], "maxBytes": None}),
+            ("memoryIndexBatch", {"rows": [dict(row, memId="turn:2", dateMs=2)]}),
+            ("memoryIndexBatch", {"rows": [dict(row, memId="turn:3", dateMs=3)], "maxBytes": 1 << 30}),
+            ("memoryTrim", {"maxBytes": 1 << 30}),
+            ("memoryStats", {}),
+        ]
+        responses = self._session(["--log-dir", str(self.caller / "logs")], requests)
+        refused = responses[1 : 1 + 2 * len(invalid) + 1]
+        for (method, params), response in zip(requests[1:], refused):
+            with self.subTest(method=method, maxBytes=params["maxBytes"]):
+                self.assertIn("maxBytes", response.get("error", ""), response)
+        stats, null_batch, absent_batch, limited_batch, trim, after = (r["result"] for r in responses[-6:])
+        self.assertEqual(stats["docs"], 0)
+        self.assertEqual(null_batch["count"], 1)
+        self.assertNotIn("withinLimit", null_batch)
+        self.assertNotIn("withinLimit", absent_batch)
+        self.assertTrue(limited_batch["withinLimit"])
+        self.assertTrue(trim["withinLimit"])
+        self.assertEqual(after["docs"], 3)
 
     def test_invalid_locations_and_limits_are_rejected(self):
         db_dir = self.caller / "db" / "voice"
