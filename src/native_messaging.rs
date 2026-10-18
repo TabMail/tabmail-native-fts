@@ -88,6 +88,25 @@ mod tests {
         assert!(read_message(&mut stdin).unwrap().is_none(), "end of input after the last message");
     }
 
+    /// Fails every read with `ErrorKind::Other`, counting the reads asked of it.
+    struct Failing(usize);
+
+    impl Read for Failing {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0 += 1;
+            Err(std::io::Error::other("stdin failed"))
+        }
+    }
+
+    #[test]
+    fn test_a_failed_read_before_a_message_is_an_error_not_the_end_of_input() {
+        let mut stdin = Failing(0);
+        let error = read_message(&mut stdin).expect_err("a failed read is not the end of the stream");
+        assert!(stdin.0 > 0, "the fault was read");
+        let io = error.downcast_ref::<std::io::Error>().expect("the read's own error");
+        assert_eq!(io.kind(), std::io::ErrorKind::Other);
+    }
+
     #[test]
     fn test_end_of_input_inside_a_length_prefix_is_an_error() {
         let mut stdin: &[u8] = &[7, 0];
