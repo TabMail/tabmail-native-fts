@@ -74,7 +74,12 @@ The helper must not know who runs it: no client modes, no client names.
   that space and removing more rows for it empties memory without ever reaching a limit that the
   newest rows fit in. So, while over the limit, each pass first runs FTS5 `merge` steps,
   re-measuring after each, and removes rows only once a step finds no work (fewer than two
-  changes).
+  changes). `memoryRemoveBatch` (Thunderbird's Delete Old) leaves the same dead entries, and a
+  positive step cannot start the merge that drops them, so it starts it itself, with one negative
+  step after it removes rows. Without that, a trim after Delete Old of 1,000 of 2,000 rows to half
+  the original size kept 532 rows where 937 fit. A negative step restarts a merge in progress, so
+  this suits occasional removals; a caller that removed rows before every write on a multi-GB
+  memory would bring back the restart stall described below.
 - **Merge sign discipline.** A negative `merge` merges every segment into one, and FTS5 restarts it
   from the first term whenever a segment was added since the last step; a positive `merge`
   continues the merge in progress even after new segments arrive (FTS5 documentation, `merge`
@@ -108,6 +113,15 @@ The helper must not know who runs it: no client modes, no client names.
   then removes more than one chunk's worth; it is still oldest first and within the limit. On a
   tiny database whose rows all share one chunk, a trim below the chunk size empties the memory.
   This is sqlite-vec's observed source behaviour (no documented contract).
+
+- **What the limit bounds.** It bounds the database's pages in use, not the files on disk: the
+  write-ahead log (`memory.db-wal`) can grow to `PRAGMA_WAL_AUTOCHECKPOINT_PAGES` pages (about
+  800 MB at 4 KB pages) during heavy writing and keeps that size after a checkpoint, and freed
+  pages stay in the file. At the 100 MB choice the files can be several times the limit.
+- **A bundling caller sends no update requests.** `hello` and `updateCheck`/`updateRequest` run
+  the self-update mechanics, which install into Thunderbird's user-local helper folder when the
+  helper's own folder can't be written. A client that ships its own copy (Voice) never sends
+  them; it sends only `init` and the memory methods.
 
 ## Revisions before merge (review round 2026-10-18)
 
@@ -151,4 +165,7 @@ The helper must not know who runs it: no client modes, no client names.
     a reopen and continuing, trims cut short while merging that still remove the oldest rows
     with a write between calls, a call out of time while merging stopping with the merge
     unfinished, the aim below the limit leaving room for the next writes, and memory at the limit
-    removing only the oldest as each new exchange is kept (never emptied).
+    removing only the oldest as each new exchange is kept (never emptied); a trim of several
+    passes landing near its aim, one after `memoryRemoveBatch` removing only what the limit
+    needs, and memory whose oldest rows are the largest or the smallest keeping every newer row
+    that fits.

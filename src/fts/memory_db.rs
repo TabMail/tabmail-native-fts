@@ -797,6 +797,15 @@ pub fn memory_remove_batch(conn: &mut Connection, ids: &[Value]) -> anyhow::Resu
 
     tx.commit()?;
     log::info!("Removed {} memory entries", removed);
+    // Start the merge that drops the removed rows' FTS entries and frees
+    // their pages, as the trim does after its own removals: a later trim's
+    // positive steps can only continue a merge, so without this it would
+    // count the dead entries against the rows still kept and remove more of
+    // them than the limit needs. A negative step restarts a merge in
+    // progress, so this suits occasional removals, not one before every write.
+    if removed > 0 {
+        merge_memory_fts_step(conn, -config::memory::TRIM_MERGE_STEP_PAGES)?;
+    }
     Ok(removed)
 }
 
@@ -1558,6 +1567,82 @@ mod tests {
         assert!(used * 100 >= limit * 90, "used {used} of the limit {limit} after removing {}", trim.removed);
         let kept = table_counts(&conn)[0];
         assert_eq!(kept_dates(&conn), ((n as i64 + 1 - kept)..=n as i64).collect::<Vec<_>>());
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 2,000 text-only exchanges of about 400 words, in ten index calls,
+    /// merged. Answers the used size.
+    fn fill_merged_text_only(conn: &mut Connection) -> i64 {
+        fill_text_only(conn, 10, 200, 400);
+        merge_all(conn);
+        memory_used_bytes(conn).unwrap()
+    }
+
+    /// A trim that needs several passes reclaims the space of each pass's
+    /// removed rows before sizing the next, so memory lands near its aim
+    /// below the limit rather than far under it.
+    #[test]
+    fn test_a_trim_of_several_passes_lands_near_its_aim() {
+        let (dir, mut conn) = temp_memory_db("passes");
+        let full = fill_merged_text_only(&mut conn);
+        let limit = full / 2;
+
+        let trim = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap();
+
+        assert!(trim.within_limit, "{trim:?}");
+        merge_all(&conn);
+        let used = memory_used_bytes(&conn).unwrap();
+        assert!(used <= limit);
+        assert!(used * 100 >= limit * 85, "used {used} of the limit {limit} after removing {}", trim.removed);
+        let kept = table_counts(&conn)[0];
+        assert!(kept >= 900, "kept {kept} of 2000");
+        assert_eq!(kept_dates(&conn), ((2_000 - kept)..2_000).collect::<Vec<_>>());
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Rows removed by id free their space before a later trim measures it:
+    /// the trim removes only what the rows still kept need, as many as if
+    /// the removed rows had never been written.
+    #[test]
+    fn test_a_trim_after_rows_were_removed_removes_only_what_the_limit_needs() {
+        let (dir, mut conn) = temp_memory_db("removed-then-trim");
+        let full = fill_merged_text_only(&mut conn);
+        let oldest: Vec<Value> = (0..1_000).map(|i| Value::from(format!("turn:{i}"))).collect();
+        assert_eq!(memory_remove_batch(&mut conn, &oldest).unwrap(), 1_000);
+
+        let trim = memory_trim_to_bytes(&mut conn, full / 2, budget()).unwrap();
+
+        assert!(trim.within_limit, "{trim:?}");
+        let kept = table_counts(&conn)[0];
+        assert!(kept >= 900, "kept {kept} of the 1000 left, removed {}", trim.removed);
+        assert_eq!(kept_dates(&conn), ((2_000 - kept)..2_000).collect::<Vec<_>>());
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The trim removes only as many of the oldest rows as the limit needs
+    /// when they are small next to their fixed cost and the newest are large.
+    #[test]
+    fn test_trim_keeps_every_newer_row_that_fits_when_the_oldest_are_smallest() {
+        let (dir, mut conn) = temp_memory_db("skew-small");
+        for b in 0..10 {
+            add_sized(&mut conn, b * 1_000, 1_000, 20);
+        }
+        for b in 0..3 {
+            add_sized(&mut conn, 10_000 + b * 100, 100, 6_000);
+        }
+        merge_all(&conn);
+        let n = 10_300;
+        let limit = memory_used_bytes(&conn).unwrap() * 9 / 10;
+
+        let trim = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap();
+
+        assert!(trim.within_limit, "{trim:?}");
+        let kept = table_counts(&conn)[0];
+        assert_eq!(kept_dates(&conn), ((n - kept)..n).collect::<Vec<_>>());
+        assert!(kept >= 4_000, "kept {kept}, removed {}", trim.removed);
         drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
     }
