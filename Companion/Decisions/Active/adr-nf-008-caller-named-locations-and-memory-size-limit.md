@@ -22,8 +22,8 @@ The helper must not know who runs it: no client modes, no client names.
 ## Decision
 
 1. **`--log-dir <absolute path>`** (start-up argument). It is an argument because logging starts
-   in `real_main` before the first message. Absent: `~/.tabmail/logs`. A relative or empty value
-   is a fatal start-up error.
+   in `real_main` before the first message. Absent: `~/.tabmail/logs`. A relative or empty value,
+   or the `--log-dir=<path>` form, is a fatal start-up error, before anything is logged.
 2. **`init` `modelDir`** (absolute path). The model is downloaded to and loaded from there.
    Absent: `~/.tabmail/models/all-MiniLM-L6-v2`. A relative or empty value gets an error
    response and opens nothing; the helper stays in pre-init and accepts another `init`.
@@ -46,7 +46,8 @@ The helper must not know who runs it: no client modes, no client names.
    caller's folder from having the add-on's name; with that name, an init would move an index an
    earlier add-on release left behind into the caller's folder, or delete it. Naming `modelDir`
    marks a caller that owns all its locations, without a client mode; the add-on sends no
-   `modelDir` and keeps the clean-up.
+   `modelDir` and keeps the clean-up. If the add-on ever sends `modelDir`, it loses that clean-up
+   with it, so it must then do without it or a successor is needed.
 
 ## Trim mechanics
 
@@ -56,13 +57,21 @@ The helper must not know who runs it: no client modes, no client names.
 - **Removed rows' FTS space is reclaimed before more rows go.** An FTS5 delete leaves the row's
   entries (and the pages holding them) in the old segments until those are merged. Measuring
   that space and removing more rows for it empties memory without ever reaching a limit that the
-  newest rows fit in. So, while over the limit, each pass first runs FTS5 `merge` steps (negative
-  `TRIM_MERGE_STEP_PAGES`: all segments eligible), re-measuring after each, and removes rows only
-  once a step finds no work (fewer than two changes). FTS5 `secure-delete` was tried and rejected:
+  newest rows fit in. So, while over the limit, each pass first runs FTS5 `merge` steps,
+  re-measuring after each, and removes rows only once a step finds no work (fewer than two
+  changes).
+- **Merge sign discipline.** A negative `merge` merges every segment into one, and FTS5 restarts it
+  from the first term whenever a segment was added since the last step; a positive `merge`
+  continues the merge in progress even after new segments arrive (FTS5 documentation, `merge`
+  command). So the trim starts the merge once, with one negative `TRIM_MERGE_STEP_PAGES` step right
+  after it removes rows, and every other step is positive. Before this, every step was negative:
+  where one full merge took longer than the budget, each `memoryIndexBatch` added a segment before
+  trimming, the merge restarted every call, and no row was ever removed (measured at 4.6 GB on an
+  M1 Pro under load; a full merge at 1 GB took about 7 s there). FTS5 `secure-delete` was tried and rejected:
   it empties the entries in place, but SQLite rebalances b-tree pages only on delete, so the pages
   stay allocated.
 - Wall time is bounded by `TRIM_TIME_BUDGET_MS`, asked after every row removed and every merge
-  step, so a trim overruns by one row or one step at most, and the rows it removed stay removed
+  step, so a trim overruns by one row or one step (and its commit) at most, and the rows it removed stay removed
   (the transaction commits early). That is well under the add-on's 60 s native RPC timeout. A
   trim cut short reports `withinLimit: false`, and the next write or trim continues it.
   `memory_trim_to_bytes` takes the budget; the request handlers pass the config value, and unit
@@ -71,10 +80,14 @@ The helper must not know who runs it: no client modes, no client names.
   - sqlite-vec 0.1.9 stores vectors in chunks of 1024 rows (about 1.5 MB at 384 dimensions) and
     frees a chunk only once all its rows are deleted.
 
-  A trim can therefore remove up to about one chunk of rows beyond what is strictly needed. At a
-  1 GB limit (about 130k exchanges at the roughly 7.6 KB per exchange measured with vectors) that
-  is about 0.15%. On a tiny database whose rows all share
-  one chunk, a trim below the chunk size empties the memory.
+  sqlite-vec also adds rows only to its newest chunk. When rows are indexed in date order (each
+  new exchange is the newest), the oldest rows fill the oldest chunks, so a trim can remove up to
+  about one chunk of rows beyond what is strictly needed. At a 1 GB limit (about 130k exchanges at
+  the roughly 7.6 KB per exchange measured with vectors) that is about 0.15%. Rows indexed out of
+  date order (a re-feed of older history) spread the oldest dates over many chunks, and a trim
+  then removes more than one chunk's worth; it is still oldest first and within the limit. On a
+  tiny database whose rows all share one chunk, a trim below the chunk size empties the memory.
+  This is sqlite-vec's observed source behaviour (no documented contract).
 
 ## Revisions before merge (review round 2026-10-18)
 
@@ -90,6 +103,8 @@ The helper must not know who runs it: no client modes, no client names.
 - Without the merge step, 5,000 FTS-only rows trimmed to a twentieth of their size were all
   removed, leaving 38 MB of segments and `withinLimit: false` on every retry.
 - The orphan clean-up ran for every caller (point 4).
+- Every merge step was negative, so a merge cut short restarted at the next write (merge sign
+  discipline above).
 
 ## Consequences
 
@@ -110,5 +125,8 @@ The helper must not know who runs it: no client modes, no client names.
     positive integer (fractions, `2.0`, `1e30`, `2^63`, strings, booleans, arrays, objects)
     without writing.
   - Unit tests in `memory_db.rs` cover the trim: newest kept, all four tables together, the
-    FTS-only case converging on a feasible limit, and a cut-short trim keeping its progress across
-    a reopen and continuing.
+    FTS-only case converging on a feasible limit, a cut-short trim keeping its progress across
+    a reopen and continuing, trims cut short while merging that still remove the oldest rows
+    with a write between calls, a call out of time while merging stopping with the merge
+    unfinished, the aim below the limit leaving room for the next writes, and memory at the limit
+    removing only the oldest as each new exchange is kept (never emptied).

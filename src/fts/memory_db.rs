@@ -821,7 +821,8 @@ pub struct MemoryTrimResult {
 /// at or below `max_bytes`. Each pass removes a share of the rows proportional
 /// to the excess, then re-measures. Stops when within the limit, when no rows
 /// are left, or when `budget` runs out (`within_limit` false; the next call
-/// continues). Callers pass `config::memory::TRIM_TIME_BUDGET_MS`.
+/// continues, even after rows are written in between: see `trim_until`).
+/// Callers pass `config::memory::TRIM_TIME_BUDGET_MS`.
 pub fn memory_trim_to_bytes(
     conn: &mut Connection,
     max_bytes: i64,
@@ -832,8 +833,17 @@ pub fn memory_trim_to_bytes(
 }
 
 /// `memory_trim_to_bytes`, stopping once `out_of_time` answers true. It is
-/// asked after every row removed, so a call overruns by one row at most, and
-/// the rows removed before it stopped stay removed.
+/// asked after every row removed and every merge step, so a call overruns by
+/// one row or one step (and its commit), and the rows removed before it
+/// stopped stay removed.
+///
+/// FTS5 merge sign discipline: a negative `merge` merges every segment into
+/// one, and restarts from the first term whenever a segment was added since
+/// the last step; a positive `merge` continues a merge in progress even after
+/// new segments arrive. So the merge that drops removed rows' entries is
+/// started once, negative, right after they are removed, and every later step
+/// is positive. A merge cut short by the budget is then continued by the next
+/// call, though each memory write adds a segment first.
 fn trim_until(
     conn: &mut Connection,
     max_bytes: i64,
@@ -851,7 +861,7 @@ fn trim_until(
         // Rows already removed keep their FTS entries, and the pages holding
         // them, until the segments are merged: free that space before
         // counting it against the rows still kept.
-        if merge_memory_fts_step(conn)? {
+        if merge_memory_fts_step(conn, config::memory::TRIM_MERGE_STEP_PAGES)? {
             if out_of_time() {
                 log::warn!("Memory trim stopped while merging: {} bytes used, limit {}, removed {}", used, max_bytes, removed);
                 return Ok(MemoryTrimResult { removed, used_bytes: used, within_limit: false });
@@ -871,18 +881,20 @@ fn trim_until(
         let share = (count as i128 * excess + used as i128 - 1) / used as i128;
         let n = (share as i64).clamp(1, count);
         removed += remove_oldest_memory_rows(conn, n, out_of_time)?;
+        merge_memory_fts_step(conn, -config::memory::TRIM_MERGE_STEP_PAGES)?;
     }
 }
 
-/// One step of merging the FTS index's segments into one (about
-/// `TRIM_MERGE_STEP_PAGES` pages written); the merge drops removed rows'
-/// entries and frees their pages. Answers whether there was work to do: FTS5
-/// makes fewer than two changes when there is none.
-fn merge_memory_fts_step(conn: &Connection) -> anyhow::Result<bool> {
+/// One FTS5 `merge` step of about `pages.abs()` pages written: negative starts
+/// merging every segment into one, positive continues a merge in progress (see
+/// `trim_until`). The merge drops removed rows' entries and frees their pages.
+/// Answers whether there was work to do: FTS5 makes fewer than two changes
+/// when there is none.
+fn merge_memory_fts_step(conn: &Connection, pages: i64) -> anyhow::Result<bool> {
     let before = conn.total_changes();
     conn.execute(
         "INSERT INTO memory_fts(memory_fts, rank) VALUES('merge', ?1)",
-        params![-config::memory::TRIM_MERGE_STEP_PAGES],
+        params![pages],
     )?;
     Ok(conn.total_changes() - before >= 2)
 }
@@ -1195,6 +1207,13 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Merges the FTS index fully, as the trim does: started once, then continued.
+    fn merge_all(conn: &Connection) {
+        if merge_memory_fts_step(conn, -config::memory::TRIM_MERGE_STEP_PAGES).unwrap() {
+            while merge_memory_fts_step(conn, config::memory::TRIM_MERGE_STEP_PAGES).unwrap() {}
+        }
+    }
+
     /// Answers true from its `k`th question on.
     fn out_of_time_after(k: usize) -> impl FnMut() -> bool {
         let mut asked = 0;
@@ -1212,7 +1231,7 @@ mod tests {
         let limit = memory_used_bytes(&conn).unwrap() / 4;
         // Index merged first, so the trim's first question about time comes
         // just before it removes rows.
-        while merge_memory_fts_step(&conn).unwrap() {}
+        merge_all(&conn);
 
         // Time runs out after the 100th row of a pass that wanted far more:
         // the call stops there, over the limit, and those 100 rows (the
@@ -1232,7 +1251,7 @@ mod tests {
         assert_eq!(merging.removed, 0);
         assert_eq!(table_counts(&conn), [n as i64 - 100; 4]);
         // Out of time once rows are being removed: a call removes one and stops.
-        while merge_memory_fts_step(&conn).unwrap() {}
+        merge_all(&conn);
         let one = trim_until(&mut conn, limit, &mut out_of_time_after(2)).unwrap();
         assert_eq!(one.removed, 1);
         assert_eq!(kept_dates(&conn).first(), Some(&101));
@@ -1300,6 +1319,142 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+
+    /// Indexes one text-only exchange dated `i`, as one memory write does.
+    fn add_text(conn: &mut Connection, i: usize) {
+        let row = serde_json::json!({
+            "memId": format!("turn:{i}"), "role": "session",
+            "content": format!("[USER]: question {i}\n\n[AGENT]: answer {i} about the launch"),
+            "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": i as i64,
+        });
+        memory_index_batch(conn, &[row], None).unwrap();
+    }
+
+    /// Where a full merge takes longer than one call's budget, each call cut
+    /// short and each followed by a memory write (as `memoryIndexBatch` writes
+    /// before it trims), the calls still continue the merge and go on removing
+    /// the oldest rows; restarting the merge at every write would remove none.
+    #[test]
+    fn test_trims_cut_short_while_merging_keep_removing_the_oldest_across_writes() {
+        let (dir, mut conn) = temp_memory_db("merge-across-writes");
+        let (batches, per_batch) = (10, 200);
+        let n = batches * per_batch;
+        fill_text_only(&mut conn, batches, per_batch, 400);
+        let limit = memory_used_bytes(&conn).unwrap() / 20;
+
+        let (mut removed, mut cut_short_merging) = (0, 0);
+        for round in 0..30 {
+            let trim = trim_until(&mut conn, limit, &mut out_of_time_after(4)).unwrap();
+            if trim.removed == 0 && !trim.within_limit {
+                cut_short_merging += 1;
+            }
+            removed += trim.removed;
+            add_text(&mut conn, n + round);
+        }
+        // The budget really did cut merges short, and rows still went.
+        assert!(cut_short_merging > 0);
+        assert!(removed > 0, "no row removed in 30 calls");
+        let kept = table_counts(&conn)[0];
+        assert_eq!(&table_counts(&conn)[..2], &[kept; 2]);
+        let newest = (n + 29) as i64;
+        assert_eq!(kept_dates(&conn), ((newest + 1 - kept)..=newest).collect::<Vec<_>>());
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Out of time while merging, a call stops there, with the merge unfinished:
+    /// one call never runs a whole merge past its budget.
+    #[test]
+    fn test_trim_out_of_time_while_merging_stops_with_the_merge_unfinished() {
+        let (dir, mut conn) = temp_memory_db("merge-budget");
+        fill_text_only(&mut conn, 10, 200, 400);
+        let limit = memory_used_bytes(&conn).unwrap() / 20;
+        // A merge in progress, as one a call cut short leaves.
+        assert!(merge_memory_fts_step(&conn, -config::memory::TRIM_MERGE_STEP_PAGES).unwrap());
+
+        let trim = trim_until(&mut conn, limit, &mut out_of_time_after(1)).unwrap();
+
+        assert_eq!(trim.removed, 0);
+        assert!(!trim.within_limit);
+        assert!(merge_memory_fts_step(&conn, config::memory::TRIM_MERGE_STEP_PAGES).unwrap(), "the merge was finished past the budget");
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A trim aims below the limit, so the writes right after it don't each
+    /// trim again: memory can grow by a few percent of the limit first.
+    #[test]
+    fn test_the_writes_just_after_a_trim_remove_nothing() {
+        let (dir, mut conn) = temp_memory_db("aim");
+        let n = 2000;
+        fill_text_only(&mut conn, 10, n / 10, 400);
+        let limit = memory_used_bytes(&conn).unwrap() / 2;
+        assert!(memory_trim_to_bytes(&mut conn, limit, budget()).unwrap().within_limit);
+        let kept = table_counts(&conn)[0];
+        let grown_to = memory_used_bytes(&conn).unwrap() + limit * 3 / 100;
+
+        let mut i = n;
+        while memory_used_bytes(&conn).unwrap() < grown_to {
+            let words: Vec<String> = (0..400).map(|k| format!("x{i}y{k}")).collect();
+            let row = serde_json::json!({
+                "memId": format!("turn:{i}"), "role": "session",
+                "content": format!("[USER]: question {i}\n\n[AGENT]: {}", words.join(" ")),
+                "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": i as i64,
+            });
+            memory_index_batch(&mut conn, &[row], None).unwrap();
+            let trim = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap();
+            assert_eq!((trim.removed, trim.within_limit), (0, true), "after exchange {i}");
+            i += 1;
+        }
+        assert_eq!(table_counts(&conn)[0], kept + (i - n) as i64);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Keeps exchange `i` (dated `i`) with its vector row, as one index call.
+    fn add(conn: &mut Connection, i: usize) {
+        let row = serde_json::json!({
+            "memId": format!("turn:{i}"), "role": "session",
+            "content": format!("[USER]: question {i}\n\n[AGENT]: {}", "planning notes for the quarterly review meeting ".repeat(20)),
+            "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": i as i64,
+        });
+        memory_index_batch(conn, &[row], None).unwrap();
+        let id: i64 = conn.query_row("SELECT max(rowid) FROM memory_ids", [], |r| r.get(0)).unwrap();
+        let blob = crate::fts::db::f32_vec_to_blob(&vec![0.5f32; config::embedding::EMBEDDING_DIMS]);
+        conn.execute("INSERT INTO memory_vec (rowid, embedding) VALUES (?1, ?2)", params![id, blob]).unwrap();
+    }
+
+    /// At the limit, as each new exchange is kept and trimmed for, only the
+    /// oldest go and memory stays near the limit, never emptied. The vector
+    /// index frees its space a chunk at a time (sqlite-vec's 1,024 rows) and
+    /// adds only to its newest chunk, so exchanges kept in date order empty
+    /// the oldest chunk first: a trim removes at most a chunk's worth more
+    /// than the text alone would need.
+    #[test]
+    fn test_at_the_limit_each_new_exchange_removes_only_the_oldest() {
+        const CHUNK_ROWS: i64 = 1_024;
+        let (dir, mut conn) = temp_memory_db("steady");
+        let n = 3000;
+        fill(&mut conn, n, |i| i as i64);
+        let limit = memory_used_bytes(&conn).unwrap() * 9 / 10;
+        assert!(memory_trim_to_bytes(&mut conn, limit, budget()).unwrap().within_limit);
+        let fitted = table_counts(&conn)[0];
+        let mut fewest = fitted;
+
+        for i in n..n + CHUNK_ROWS as usize + 200 {
+            add(&mut conn, i);
+            let trim = memory_trim_to_bytes(&mut conn, limit, budget()).unwrap();
+            assert!(trim.within_limit, "{trim:?} after exchange {i}");
+            let kept = table_counts(&conn)[0];
+            assert_eq!(table_counts(&conn), [kept; 4]);
+            // The newest `kept`, the new one among them.
+            assert_eq!(kept_dates(&conn), ((i as i64 + 1 - kept)..=i as i64).collect::<Vec<_>>());
+            fewest = fewest.min(kept);
+        }
+        assert!(fewest >= fitted - CHUNK_ROWS, "kept as few as {fewest}; {fitted} fitted the limit");
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn test_trim_within_limit_removes_nothing() {

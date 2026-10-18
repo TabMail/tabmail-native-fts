@@ -40,6 +40,11 @@ fn real_main() -> anyhow::Result<()> {
     // `--log-dir <absolute path>`: the caller names the log folder. It is an
     // argument, not an init parameter, because logging starts before the first message.
     let args: Vec<String> = std::env::args().collect();
+    // `--log-dir=<path>` is not the documented form; refusing it keeps a slip
+    // from logging into the default folder.
+    if args.iter().any(|a| a.starts_with("--log-dir=")) {
+        anyhow::bail!("--log-dir takes its folder as the next argument");
+    }
     let log_dir = match args.iter().any(|a| a == "--log-dir") {
         true => Some(parse_absolute_dir(read_arg_value(&args, "--log-dir").as_deref(), "--log-dir")?),
         false => None,

@@ -111,6 +111,9 @@ pub mod memory {
     // continues it.
     pub const TRIM_TIME_BUDGET_MS: u64 = 20_000;
     // Pages one FTS merge step writes; the budget is checked between steps.
+    // The trim starts its merge once (negative) after removing rows and
+    // continues it with positive steps, so a merge cut short survives the
+    // next write's new segment.
     pub const TRIM_MERGE_STEP_PAGES: i64 = 256;
 }
 

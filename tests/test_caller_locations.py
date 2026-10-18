@@ -375,10 +375,14 @@ class TestCallerLocations(unittest.TestCase):
         # A rejected limit writes nothing.
         self.assertEqual(stats["result"]["docs"], 0)
 
-        proc = self._spawn(["--log-dir", "logs"])
-        proc.stdin.close()
-        self.assertNotEqual(proc.wait(timeout=30), 0)
-        proc.stdout.close()
+        before = _tree_hashes(self.home)
+        for args in (["--log-dir", "logs"], [f"--log-dir={self.caller / 'logs'}"]):
+            proc = self._spawn(args)
+            proc.stdin.close()
+            self.assertNotEqual(proc.wait(timeout=30), 0, args)
+            proc.stdout.close()
+        # Refused before logging starts: nothing written to the default log folder.
+        self.assertEqual(_tree_hashes(self.home), before)
 
 
 if __name__ == "__main__":
