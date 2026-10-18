@@ -800,6 +800,91 @@ pub fn memory_remove_batch(conn: &mut Connection, ids: &[Value]) -> anyhow::Resu
     Ok(removed)
 }
 
+/// Bytes the memory database uses: pages in use times the page size. Freed
+/// pages stay in the file (the freelist) and are reused, so this is the size
+/// the limit applies to, not the file length.
+pub fn memory_used_bytes(conn: &Connection) -> anyhow::Result<i64> {
+    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+    let freelist_count: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    Ok((page_count - freelist_count) * page_size)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryTrimResult {
+    pub removed: i64,
+    pub used_bytes: i64,
+    pub within_limit: bool,
+}
+
+/// Remove the oldest memory rows (by dateMs, then rowid) until the used size is
+/// at or below `max_bytes`. Each pass removes a share of the rows proportional
+/// to the excess, then re-measures. Stops when within the limit, when no rows
+/// are left, or when the time budget runs out (`within_limit` false; the next
+/// call continues).
+pub fn memory_trim_to_bytes(conn: &mut Connection, max_bytes: i64) -> anyhow::Result<MemoryTrimResult> {
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(config::memory::TRIM_TIME_BUDGET_MS);
+    let mut removed: i64 = 0;
+    loop {
+        let used = memory_used_bytes(conn)?;
+        if used <= max_bytes {
+            if removed > 0 {
+                log::info!("Memory trim: removed {} oldest entries, {} bytes used (limit {})", removed, used, max_bytes);
+            }
+            return Ok(MemoryTrimResult { removed, used_bytes: used, within_limit: true });
+        }
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM memory_meta", [], |r| r.get(0))?;
+        if count == 0 || std::time::Instant::now() >= deadline {
+            log::warn!(
+                "Memory trim stopped above the limit: {} bytes used, limit {}, {} entries left, removed {}",
+                used, max_bytes, count, removed
+            );
+            return Ok(MemoryTrimResult { removed, used_bytes: used, within_limit: false });
+        }
+        let target = max_bytes * config::memory::TRIM_TARGET_PERCENT / 100;
+        let excess = (used - target) as i128;
+        let share = (count as i128 * excess + used as i128 - 1) / used as i128;
+        let n = (share as i64).clamp(1, config::memory::TRIM_DELETE_BATCH_MAX_ROWS);
+        removed += remove_oldest_memory_rows(conn, n)?;
+    }
+}
+
+fn remove_oldest_memory_rows(conn: &mut Connection, n: i64) -> anyhow::Result<i64> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let row_ids: Vec<i64> = {
+        let mut stmt = tx.prepare("SELECT rowid FROM memory_meta ORDER BY dateMs ASC, rowid ASC LIMIT ?1")?;
+        let ids = stmt
+            .query_map(params![n], |r| r.get(0))?
+            .collect::<Result<Vec<i64>, _>>()?;
+        ids
+    };
+    for row_id in &row_ids {
+        tx.execute("DELETE FROM memory_fts WHERE rowid = ?1", params![row_id])?;
+        tx.execute("DELETE FROM memory_meta WHERE rowid = ?1", params![row_id])?;
+        tx.execute("DELETE FROM memory_vec WHERE rowid = ?1", params![row_id])?;
+        tx.execute("DELETE FROM memory_ids WHERE rowid = ?1", params![row_id])?;
+    }
+    tx.commit()?;
+    Ok(row_ids.len() as i64)
+}
+
+/// Compact the file when at least TRIM_VACUUM_MIN_FREE_PERCENT of its pages are
+/// free, so lowering the limit gives the disk space back. Returns whether it ran.
+pub fn memory_compact_if_mostly_free(conn: &Connection) -> anyhow::Result<bool> {
+    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+    let freelist_count: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+    if page_count == 0 || freelist_count * 100 < page_count * config::memory::TRIM_VACUUM_MIN_FREE_PERCENT {
+        return Ok(false);
+    }
+    log::info!("Memory compact: {} of {} pages free, running VACUUM", freelist_count, page_count);
+    conn.execute_batch("VACUUM")?;
+    // In WAL mode VACUUM writes the new copy through the WAL file; checkpoint and
+    // truncate it so the space comes back now rather than staying in `-wal`.
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+    Ok(true)
+}
+
 /// Start rebuilding memory vector embeddings: clear vec tables and return total count.
 /// Call this once, then call `rebuild_memory_embeddings_batch` repeatedly until done.
 pub fn rebuild_memory_embeddings_start(conn: &mut Connection) -> anyhow::Result<i64> {
@@ -992,6 +1077,139 @@ fn truncate_for_log(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh on-disk memory database (WAL, like the helper's) in its own temp folder.
+    fn temp_memory_db(name: &str) -> (PathBuf, Connection) {
+        // As main() does before opening any connection; registering twice is a no-op.
+        type ExtensionInit = unsafe extern "C" fn(
+            *mut rusqlite::ffi::sqlite3,
+            *mut *mut std::os::raw::c_char,
+            *const rusqlite::ffi::sqlite3_api_routines,
+        ) -> std::os::raw::c_int;
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<*const (), ExtensionInit>(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+        let dir = std::env::temp_dir().join(format!("tabmail-memory-trim-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (_path, conn) = open_or_create_memory_db(&dir).unwrap();
+        (dir, conn)
+    }
+
+    /// Index `n` exchanges whose dateMs follows `date_of(i)`, each with a vector row.
+    fn fill(conn: &mut Connection, n: usize, date_of: impl Fn(usize) -> i64) {
+        let filler = "planning notes for the quarterly review meeting ".repeat(20);
+        let rows: Vec<Value> = (0..n)
+            .map(|i| serde_json::json!({
+                "memId": format!("turn:{i}"), "role": "session",
+                "content": format!("[USER]: question {i}\n\n[AGENT]: {filler}"),
+                "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": date_of(i),
+            }))
+            .collect();
+        memory_index_batch(conn, &rows, None).unwrap();
+        let blob = crate::fts::db::f32_vec_to_blob(&vec![0.5f32; config::embedding::EMBEDDING_DIMS]);
+        let ids: Vec<i64> = conn
+            .prepare("SELECT rowid FROM memory_ids").unwrap()
+            .query_map([], |r| r.get(0)).unwrap()
+            .collect::<Result<_, _>>().unwrap();
+        for id in ids {
+            conn.execute("INSERT INTO memory_vec (rowid, embedding) VALUES (?1, ?2)", params![id, blob]).unwrap();
+        }
+    }
+
+    fn table_counts(conn: &Connection) -> [i64; 4] {
+        ["memory_fts", "memory_meta", "memory_vec", "memory_ids"].map(|t| {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0)).unwrap()
+        })
+    }
+
+    fn kept_dates(conn: &Connection) -> Vec<i64> {
+        conn.prepare("SELECT dateMs FROM memory_meta ORDER BY dateMs").unwrap()
+            .query_map([], |r| r.get(0)).unwrap()
+            .collect::<Result<_, _>>().unwrap()
+    }
+
+    #[test]
+    fn test_trim_brings_used_size_within_limit_keeping_the_newest() {
+        let (dir, mut conn) = temp_memory_db("limit");
+        // Dates run against rowid order, so "oldest" can only mean dateMs.
+        let n = 3000;
+        fill(&mut conn, n, |i| 1_000_000 - i as i64);
+        let before = memory_used_bytes(&conn).unwrap();
+        let limit = before / 2;
+
+        let trim = memory_trim_to_bytes(&mut conn, limit).unwrap();
+
+        assert!(trim.within_limit);
+        let used = memory_used_bytes(&conn).unwrap();
+        assert_eq!(trim.used_bytes, used);
+        assert!(used <= limit, "used {used} > limit {limit}");
+        let counts = table_counts(&conn);
+        let kept = counts[0];
+        assert_eq!(counts, [kept; 4], "FTS, meta, vector and id rows are removed together");
+        assert_eq!(trim.removed, n as i64 - kept);
+        // Kept rows are exactly the newest `kept` dates.
+        let expected: Vec<i64> = ((1_000_000 - kept + 1)..=1_000_000).collect();
+        assert_eq!(kept_dates(&conn), expected);
+        // Half the size should keep a fair share, not empty the memory.
+        assert!(kept * 100 >= n as i64 * 30, "kept only {kept} of {n}");
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_trim_within_limit_removes_nothing() {
+        let (dir, mut conn) = temp_memory_db("noop");
+        fill(&mut conn, 50, |i| i as i64);
+        let used = memory_used_bytes(&conn).unwrap();
+        let trim = memory_trim_to_bytes(&mut conn, used).unwrap();
+        assert_eq!(trim, MemoryTrimResult { removed: 0, used_bytes: used, within_limit: true });
+        assert_eq!(table_counts(&conn), [50; 4]);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_trim_below_the_empty_schema_removes_everything_and_reports_over_limit() {
+        let (dir, mut conn) = temp_memory_db("tiny");
+        fill(&mut conn, 20, |i| i as i64);
+        let trim = memory_trim_to_bytes(&mut conn, 1).unwrap();
+        assert!(!trim.within_limit);
+        assert_eq!(trim.removed, 20);
+        assert_eq!(table_counts(&conn), [0; 4]);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_compact_after_trim_shrinks_the_files() {
+        let (dir, mut conn) = temp_memory_db("compact");
+        fill(&mut conn, 3000, |i| i as i64);
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())).unwrap();
+        let disk = |d: &Path| -> u64 {
+            ["memory.db", "memory.db-wal"].iter()
+                .map(|f| std::fs::metadata(d.join(f)).map(|m| m.len()).unwrap_or(0)).sum()
+        };
+        let before = disk(&dir);
+        let limit = memory_used_bytes(&conn).unwrap() / 4;
+        assert!(memory_trim_to_bytes(&mut conn, limit).unwrap().within_limit);
+        assert!(memory_compact_if_mostly_free(&conn).unwrap());
+        let after = disk(&dir);
+        assert!(after as i64 <= limit, "files take {after} bytes after compacting, limit {limit} (was {before})");
+        let mismatched: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memory_ids i LEFT JOIN memory_meta m ON m.rowid = i.rowid WHERE m.rowid IS NULL",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(mismatched, 0, "VACUUM kept the id table's rowids aligned with the other tables");
+        let newest = memory_read_by_timestamp(&conn, 2999, 0).unwrap();
+        assert_eq!(newest.len(), 1);
+        assert!(newest[0]["content"].as_str().unwrap().contains("question 2999"));
+        // Nothing left to compact: a second call does not run VACUUM.
+        assert!(!memory_compact_if_mostly_free(&conn).unwrap());
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn test_memory_fts_tokenizer_rebuild_in_place() {

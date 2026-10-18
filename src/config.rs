@@ -96,6 +96,25 @@ pub mod embedding {
     pub const MODEL_DIR_REL: &str = ".tabmail/models/all-MiniLM-L6-v2";
 }
 
+pub mod memory {
+    // Memory size limit (client-supplied `maxBytes`). Size = pages in use
+    // ((page_count - freelist_count) * page_size): freed pages are reused, so
+    // the file itself only shrinks when `memoryTrim` compacts it.
+
+    // A trim removes oldest rows until the used size is at or below this
+    // percentage of the limit, so the next few batches do not each trim again.
+    pub const TRIM_TARGET_PERCENT: i64 = 95;
+    // Most rows removed in one delete transaction before re-measuring.
+    pub const TRIM_DELETE_BATCH_MAX_ROWS: i64 = 5_000;
+    // Wall-time budget for one trim, checked between delete transactions; well
+    // under the add-on's native RPC timeout (60 s). A trim cut short reports
+    // `withinLimit: false` and the next write or trim continues it.
+    pub const TRIM_TIME_BUDGET_MS: u64 = 20_000;
+    // `memoryTrim` compacts the file (VACUUM) when at least this percentage of
+    // its pages are free after trimming, so lowering the limit frees disk space.
+    pub const TRIM_VACUUM_MIN_FREE_PERCENT: i64 = 10;
+}
+
 pub mod hybrid {
     // Hybrid search weights: how much each engine contributes to final score.
     // Semantic dominant — the LLM crafts queries blind (doesn't know user's email vocabulary).

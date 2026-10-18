@@ -140,6 +140,10 @@ archives of any size.
 
 - **[Full ADR](Companion/Decisions/Active/adr-nf-007-move-or-remove-indexes-left-by-the-profile-guess.md)** — `init` with `profilePath` runs `adopt_or_remove_orphaned_indexes` over `guessed_profile_dirs` (`~/.tabmail` fallback + non-hidden profiles-directory children, the set `find_thunderbird_profile_dir` could return). Orphan = `<dir>/browser-extension-data/<addon id>/tabmail_fts` not this profile's own (canonicalized), no `<dir>/extensions/<addon id>.xpi`, no symlink on the way. MOVE FIRST (owner 2026-10-05 "move and fix"): if this profile has no `tabmail_fts`, rename the newest orphan (by `fts.db` mtime) in — index + `memory.db` chat memory carry over, add-on reconciliation repairs; then remove the rest; failed move (other volume) = remove, no copy (init RPC timeout); empty parents only; best effort, never fails init. Orphaned/stray/leftover old index after the multi-profile wrong-guess fix (Thunderbird ADR-025).
 
+## ADR-NF-008: The Caller Names the Log and Model Folders, and Sets a Memory Size Limit
+
+- **[Full ADR](Companion/Decisions/Active/adr-nf-008-caller-named-locations-and-memory-size-limit.md)** — client-agnostic (no client modes): `--log-dir <abs>` start-up arg (logging starts before any message; default `~/.tabmail/logs`), `init` `modelDir` (default `~/.tabmail/models/all-MiniLM-L6-v2`; invalid = error response, stays pre-init), so a bundled copy (TabMail Voice) never shares the model `.tmp` download race or log rotation with Thunderbird's installed helper. Memory size limit: optional `memoryIndexBatch` `maxBytes`, new writer `memoryTrim {maxBytes}` (+ VACUUM when mostly free), `memoryStats.usedBytes`; used size = (page_count - freelist_count) * page_size; oldest by dateMs removed from fts/meta/vec/ids together; 20 s budget, `withinLimit:false` continues next call; overshoot from FTS5 tombstones and sqlite-vec 1024-row chunks accepted.
+
 ---
 
 ## Template for New Decisions

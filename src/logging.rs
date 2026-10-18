@@ -2,15 +2,23 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use flexi_logger::{Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
 
 use crate::config;
 
-pub fn init_logging() -> anyhow::Result<()> {
-    let log_dir = tabmail_log_dir()?;
+/// Starts file logging in `log_dir_override` (the `--log-dir` argument) when
+/// given, else in ~/.tabmail/logs.
+pub fn init_logging(log_dir_override: Option<&Path>) -> anyhow::Result<()> {
+    let log_dir = match log_dir_override {
+        Some(dir) => {
+            std::fs::create_dir_all(dir).with_context(|| format!("failed creating log dir {}", dir.display()))?;
+            dir.to_path_buf()
+        }
+        None => tabmail_log_dir()?,
+    };
 
     // Match python: file logs at DEBUG, stderr at WARNING+.
     // flexi_logger doesn't do per-sink levels cleanly, so we:

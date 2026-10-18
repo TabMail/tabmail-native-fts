@@ -122,6 +122,17 @@ The memory database enables:
 
 Each Thunderbird profile gets its own isolated FTS and memory databases.
 
+**Size limit.** A client can bound the memory database: `memoryIndexBatch` takes an
+optional `maxBytes`, and `memoryTrim { maxBytes }` applies a lowered limit and gives
+the freed disk space back. The oldest entries are removed first. `memoryStats`
+reports `usedBytes`, the size the limit counts (pages in use). Without `maxBytes`
+there is no limit.
+
+**Caller-named locations.** A client that ships its own copy of the helper can keep
+every file apart from Thunderbird's: the database folder is `init` `profilePath`,
+the model folder is `init` `modelDir`, and the log folder is the `--log-dir`
+start-up argument (all absolute paths). See ADR-NF-008 in `DECISIONS.md`.
+
 `fts.db` keeps the historical `msgId` primary key for compatibility and stores
 opaque folder identities in the additive `message_folder_membership` relation.
 Helpers advertising
@@ -155,7 +166,7 @@ in `missing` and otherwise ignored.
 
 ## Logs
 
-Logs are written to: `~/.tabmail/logs/fts_helper.log`
+Logs are written to: `~/.tabmail/logs/fts_helper.log` (or the folder given with `--log-dir <absolute path>`)
 
 - Logs automatically rotate at **10MB**
 - Keeps **5 backup files**

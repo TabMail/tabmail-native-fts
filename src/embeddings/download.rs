@@ -16,25 +16,29 @@ use sha2::{Digest, Sha256};
 
 use crate::config;
 
-/// Returns the local model directory path (~/.tabmail/models/all-MiniLM-L6-v2/).
-pub fn model_dir() -> anyhow::Result<PathBuf> {
+/// Returns the model directory: the caller's `modelDir` when given, else
+/// ~/.tabmail/models/all-MiniLM-L6-v2/.
+pub fn model_dir(dir_override: Option<&Path>) -> anyhow::Result<PathBuf> {
+    if let Some(dir) = dir_override {
+        return Ok(dir.to_path_buf());
+    }
     let home = dirs_home()?;
     Ok(home.join(config::embedding::MODEL_DIR_REL))
 }
 
-/// Check if all required model files exist locally.
-pub fn model_files_exist() -> anyhow::Result<bool> {
-    let dir = model_dir()?;
-    Ok(dir.join("model.safetensors").exists()
+/// Check if all required model files exist in `dir`.
+fn model_files_exist(dir: &Path) -> bool {
+    dir.join("model.safetensors").exists()
         && dir.join("tokenizer.json").exists()
-        && dir.join("config.json").exists())
+        && dir.join("config.json").exists()
 }
 
-/// Download all model files if not already cached. Returns the model directory path.
-pub fn ensure_model_files() -> anyhow::Result<PathBuf> {
-    let dir = model_dir()?;
+/// Download all model files into the model directory (see `model_dir`) if not
+/// already cached. Returns the model directory path.
+pub fn ensure_model_files(dir_override: Option<&Path>) -> anyhow::Result<PathBuf> {
+    let dir = model_dir(dir_override)?;
 
-    if model_files_exist()? {
+    if model_files_exist(&dir) {
         log::info!("Model files already cached at {}", dir.display());
         return Ok(dir);
     }
