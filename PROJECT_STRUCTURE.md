@@ -65,7 +65,7 @@ main thread (stdin reader + dispatcher)
     │   └── reads through its read-only connections, kept in Arc<Mutex> so the writer can close them on a clear (ADR-NF-009)
     │
     └── writer thread (write: indexBatch, membership adoption, removeBatch, clear)
-        └── owns its read-write connections, the last to close at exit
+        └── owns its read-write connections
         └── on clear/memoryClear locks the reader's connection, closes it, deletes + recreates the files, reopens it (ADR-NF-009)
         └── while idle, converts stale year shards one at a time (ADR-NF-005)
 

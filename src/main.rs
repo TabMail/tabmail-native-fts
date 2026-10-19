@@ -350,8 +350,8 @@ fn run_multi_threaded(
 
     // Shutdown: drop senders so threads exit their recv() loops
     drop(reader_tx);
-    let _ = reader_handle.join();
     drop(writer_tx);
+    let _ = reader_handle.join();
     let _ = writer_handle.join();
 
     log::info!("=== TabMail FTS Helper Stopped ===");
@@ -368,6 +368,30 @@ fn lock_conn(conn: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
     conn.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Whether `conn` is the in-memory stand-in a clear puts in a connection's place while it
+/// replaces the files, rather than a connection to the database: SQLite names no file for an
+/// in-memory database.
+fn is_stand_in(conn: &Connection) -> bool {
+    conn.path().map_or(true, str::is_empty)
+}
+
+/// Opens the database again in place of a stand-in that a failed clear left (`open` failed, the
+/// files couldn't be opened), so the first request after the fault ends is served from the
+/// database. It never deletes anything: rows written since stay. Failing, it is tried again at
+/// the next request.
+fn reopen_stand_in(conn: &mut Connection, what: &str, open: impl FnOnce() -> anyhow::Result<Connection>) {
+    if !is_stand_in(conn) {
+        return;
+    }
+    match open() {
+        Ok(new_conn) => {
+            log::info!("Reopened the {what} connection a failed clear left closed");
+            *conn = new_conn;
+        }
+        Err(e) => log::error!("Failed to reopen the {what} connection a failed clear left closed: {:?}", e),
+    }
+}
+
 fn reader_thread_main(
     rx: mpsc::Receiver<ThreadMessage>,
     email_conn: Arc<Mutex<Connection>>,
@@ -382,8 +406,10 @@ fn reader_thread_main(
 
     while let Ok(msg) = rx.recv() {
         // A clear holds one of these while it replaces the files, so a read waits for it.
-        let email_conn = lock_conn(&email_conn);
-        let memory_conn = lock_conn(&memory_conn);
+        let mut email_conn = lock_conn(&email_conn);
+        let mut memory_conn = lock_conn(&memory_conn);
+        reopen_stand_in(&mut email_conn, "reader's email", || crate::fts::db::open_read_only_connection(&email_db_path));
+        reopen_stand_in(&mut memory_conn, "reader's memory", || memory_db::open_read_only_memory_connection(&memory_db_path));
 
         let engine_ref = engine.as_deref();
         let resp = handle_read_request(
@@ -651,9 +677,12 @@ fn writer_thread_main(
     let mut shards_left = true;
     loop {
         let next = next_write_request(&rx, || {
-            convert_one_shard_when_idle(&mut email_conn, &mut attempted_shards, &mut shards_left)
+            // Nothing to convert in a failed clear's stand-in; the next request reopens it.
+            !is_stand_in(&email_conn) && convert_one_shard_when_idle(&mut email_conn, &mut attempted_shards, &mut shards_left)
         });
         let Some(msg) = next else { break };
+        reopen_stand_in(&mut email_conn, "writer's email", || crate::fts::db::open_writer_connection(&email_db_path));
+        reopen_stand_in(&mut memory_conn, "writer's memory", || memory_db::open_memory_writer_connection(&memory_db_path));
         let engine_ref = engine.as_deref();
         let resp = handle_write_request(
             &mut email_conn,
@@ -673,7 +702,7 @@ fn writer_thread_main(
     }
 
     log::info!("[writer] Thread stopped (channel closed)");
-    // The reader's connections close before the writer's, so the writer's close is the last.
+    // Its copies of the reader's connections go before its own connections.
     drop(reader_email_conn);
     drop(reader_memory_conn);
     drop(email_conn);
@@ -788,13 +817,15 @@ fn handle_write_request(
             // file handle can be closed first, since Windows refuses to delete an open file.
             let mut reader_conn = lock_conn(reader_email_conn);
             drop(std::mem::replace(&mut *reader_conn, Connection::open_in_memory()?));
-            // Swap connection with a temporary in-memory one, clear + rebuild, swap back
+            // Clear known years first, so a clear that fails after deleting the files leaves none
+            // the new database lacks: shards are created lazily during the next indexing (a shard
+            // that is still there is only verified again).
+            known_years.clear();
+            // Swap connection with a temporary in-memory one, clear + rebuild, swap back. A clear
+            // that fails on the way leaves a stand-in, which the next request opens again.
             let old_conn = std::mem::replace(email_conn, Connection::open_in_memory()?);
             let (new_conn, deleted) = crate::fts::db::clear_rebuild_standalone(email_db_path, old_conn)?;
             *email_conn = new_conn;
-            // Clear known years — shards will be recreated lazily during next indexing (a shard
-            // that is still there is only verified again)
-            known_years.clear();
             *reader_conn = crate::fts::db::open_read_only_connection(email_db_path)?;
             // Files not deleted: every row is still there, so say so rather than answer ok.
             deleted.context("clear")?;
@@ -872,7 +903,8 @@ fn handle_write_request(
             Ok(serde_json::json!({ "id": msg_id, "result": { "ok": true, "count": removed } }))
         }
         "memoryClear" => {
-            // As in clear: hold and close the reader's connection before deleting the files.
+            // As in clear: hold and close the reader's connection before deleting the files. A
+            // failure on the way leaves a stand-in, which the next request opens again.
             let mut reader_conn = lock_conn(reader_memory_conn);
             drop(std::mem::replace(&mut *reader_conn, Connection::open_in_memory()?));
             let old_conn = std::mem::replace(memory_conn, Connection::open_in_memory()?);
@@ -2315,5 +2347,36 @@ mod tests {
         assert_eq!(resp["id"], "test-1");
         let err = resp["error"].as_str().unwrap();
         assert!(err.contains("Unknown reader method"), "got: {err}");
+    }
+
+    /// A failed clear's in-memory stand-in is opened again once the database can be, and a
+    /// connection to the database is never replaced.
+    #[test]
+    fn a_stand_in_is_reopened_once_its_database_opens_again() {
+        let dir = std::env::temp_dir().join(format!("tabmail-fts-stand-in-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("x.db");
+        Connection::open(&db).unwrap().execute_batch("CREATE TABLE kept (v TEXT); INSERT INTO kept VALUES ('row');").unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        assert!(is_stand_in(&conn));
+        reopen_stand_in(&mut conn, "test", || anyhow::bail!("the file cannot be opened yet"));
+        assert!(is_stand_in(&conn), "a failed open left something other than the stand-in");
+
+        reopen_stand_in(&mut conn, "test", || Ok(Connection::open(&db)?));
+        assert!(!is_stand_in(&conn));
+        let kept: String = conn.query_row("SELECT v FROM kept", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, "row");
+
+        let mut opened = false;
+        reopen_stand_in(&mut conn, "test", || {
+            opened = true;
+            Ok(Connection::open_in_memory()?)
+        });
+        assert!(!opened, "a connection to the database was opened again");
+        assert!(!is_stand_in(&conn));
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

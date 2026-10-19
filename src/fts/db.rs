@@ -1470,11 +1470,19 @@ pub fn clear_rebuild_standalone(db_path: &Path, conn: Connection) -> anyhow::Res
     let deleted = delete_database_files(db_path);
 
     log::info!("Recreating database...");
-    let new_conn = Connection::open(db_path)?;
-    ensure_fts5_available(&new_conn)?;
-    init_database(&new_conn)?;
+    let new_conn = open_writer_connection(db_path)?;
     log::info!("Database recreated and initialized successfully (FTS shards will be created lazily)");
     Ok((new_conn, deleted))
+}
+
+/// The writer's connection to the email database at `db_path`, created empty when the file is
+/// not there: what a clear opens after deleting the files, and what the writer opens again when
+/// a clear failed before it could.
+pub fn open_writer_connection(db_path: &Path) -> anyhow::Result<Connection> {
+    let conn = Connection::open(db_path)?;
+    ensure_fts5_available(&conn)?;
+    init_database(&conn)?;
+    Ok(conn)
 }
 
 /// Delete a database's write-ahead log, its shared-memory file, then the database itself.

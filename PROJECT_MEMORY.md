@@ -18,12 +18,12 @@ Native messaging host for full-text search + semantic search. Communicates with 
 **Phase B (post-init, multi-threaded):**
 - **Main thread**: reads stdin, dispatches to reader or writer channel via `classify_method()`
 - **Reader thread**: read-only ops (search, stats, filter) — its read-only connections are shared with the writer through `Arc<Mutex>`, so a clear can close them (ADR-NF-009)
-- **Writer thread**: write ops (indexBatch, removeBatch, clear) — owns its read-write connections, which close last at exit so SQLite removes the `-wal`/`-shm`
+- **Writer thread**: write ops (indexBatch, removeBatch, clear) — owns its own read-write `rusqlite::Connection`s
 
 ### Shared Resources
 - `EmbeddingEngine` and `SynonymLookup` shared via `Arc`
 - Responses written through `Arc<Mutex<Stdout>>`
-- `clear`/`memoryClear` in writer locks the reader's connection (`Mutex`), closes it so Windows can delete the files, recreates, reopens; a failed delete is an error reply, rows kept (ADR-NF-009)
+- `clear`/`memoryClear` in writer locks the reader's connection (`Mutex`), closes it so Windows can delete the files, recreates, reopens; a failed delete is an error reply, rows kept; a clear that could not reopen leaves an in-memory stand-in that each thread opens again at its next request (`reopen_stand_in`) (ADR-NF-009)
 - `memoryTrim` / `memoryIndexBatch{maxBytes}` trim in the writer: FTS5 `merge` steps reclaim removed rows' segment space before more rows go (started once negative after removing, continued positive so a write between calls never restarts it); budget asked per row and per step; no VACUUM, so the file keeps its largest size; caller with `modelDir` skips the orphan clean-up (ADR-NF-008)
 - No new crate dependencies — uses `std::sync::{mpsc, Arc, Mutex}`
 

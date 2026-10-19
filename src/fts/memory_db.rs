@@ -1047,11 +1047,19 @@ pub fn memory_clear_rebuild_standalone(db_path: &Path, conn: Connection) -> anyh
     let deleted = super::db::delete_database_files(db_path);
 
     log::info!("Recreating memory database...");
-    let new_conn = Connection::open(db_path)?;
-    super::db::ensure_fts5_available(&new_conn)?;
-    init_memory_database(&new_conn)?;
+    let new_conn = open_memory_writer_connection(db_path)?;
     log::info!("Memory database recreated and initialized successfully");
     Ok((new_conn, deleted))
+}
+
+/// The writer's connection to the memory database at `db_path`, created empty when the file is
+/// not there: what memoryClear opens after deleting the files, and what the writer opens again
+/// when a memoryClear failed before it could.
+pub fn open_memory_writer_connection(db_path: &Path) -> anyhow::Result<Connection> {
+    let conn = Connection::open(db_path)?;
+    super::db::ensure_fts5_available(&conn)?;
+    init_memory_database(&conn)?;
+    Ok(conn)
 }
 
 /// Read memory entries around a given timestamp (±tolerance_ms)

@@ -34,12 +34,15 @@ connection open the whole time and reopened it at its next request (an `AtomicBo
    the file and the OS error go to the local log, not over the wire). Both connections are reopened
    on the file still there, every row kept and searchable, and writes go on; for `clear`,
    `known_years` is emptied either way (a shard still there is only verified again).
-5. At a clean exit the writer's connections close last, after the reader's (the reader's are dropped
-   first), and the reader finishes before the writer is told to stop, so SQLite's last close
-   checkpoints and removes each `-wal` and `-shm`: a read-only connection cannot checkpoint, and
-   sharing the reader's connections must not make it the last to close. This is new: the base left
-   the memory logs after an idle exit, and every log when reads were still queued at exit.
-6. Wire protocol, schema, pragmas and the delete-and-recreate approach are unchanged.
+5. A clear that fails after closing a connection (the files could not be opened again) leaves an
+   in-memory stand-in in its place. The reader before each read, and the writer before each write,
+   open the database again in place of a stand-in, so service resumes once the files can be opened,
+   without another clear or a restart; nothing is deleted then, so rows written since stay.
+   `known_years` is emptied before the clear closes anything.
+6. Exit is unchanged: the main thread drops its copies of the reader's connections once the threads
+   start (sharing them must not keep them open until it returns), and both threads are told to stop
+   together, as before.
+7. Wire protocol, schema, pragmas and the delete-and-recreate approach are unchanged.
 
 ## Rejected
 
@@ -64,8 +67,13 @@ connection open the whole time and reopened it at its next request (an `AtomicBo
 ## Verification
 
 - `tests/test_multithreaded.py`: a clear that cannot delete answers an error and keeps serving, then
-  succeeds once it can (email and memory; red on the previous code: answered `ok`); a clear with the
+  succeeds once it can (email and memory; red on the previous code: answered `ok`); a clear that
+  cannot open the files again answers an error, and once they can be opened the next write and reads
+  are served from the database, every row kept and later rows stored, with no other clear and none
+  after a restart lost (email and memory; red with either thread's reopen removed); a clear with the
   reader's connection open leaves no cleared text in any file and none after a restart (email and
   memory; red on Windows only); reads pipelined around clears never fail.
+- `src/main.rs` unit test: a stand-in is opened again once its database can be, and a connection to
+  the database is never replaced.
 - Differential run of Thunderbird 1.9.1's request shapes (1,161 requests) against the previous
   build: identical answers.

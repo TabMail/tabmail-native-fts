@@ -595,54 +595,59 @@ class TestMultiThreadedDispatch(unittest.TestCase):
     def test_memory_clear_that_cannot_delete_answers_an_error_and_keeps_serving(self):
         self._check_clear_that_cannot_delete_answers_an_error_and_keeps_serving("memory")
 
-    def test_a_clean_exit_leaves_no_log_files(self):
-        """Once the helper stops, each database is whole in its own file, with no -wal or -shm left."""
+    def _check_clear_that_cannot_reopen_recovers_once_it_can(self, kind):
+        """A clear that can neither delete nor open the files again answers an error; once they can be
+        opened, the next requests are served from the database again, with no other clear and no
+        restart: every row kept, and rows written after it stored and read back."""
+        if os.name == "nt":
+            self.skipTest("a read-only folder and an unreadable file stand in for the fault on macOS and Linux")
+        index_method, clear_method, path_key, docs_method, search_method = self.CLEAR_CASES[kind]
+        secret = "quarterly dentist reminder zebra"
+        rows = self._clear_rows(kind, secret)
         proc = self._start_process()
+        folder = db_path = None
         try:
             self.assertIn("result", self._rpc(proc, "hello", {"addonVersion": "1.3.0"}))
-            init = self._rpc(proc, "init", {"profilePath": self.temp_dir})["result"]
-            for kind in ("email", "memory"):
-                index_method, _, _, _, search_method = self.CLEAR_CASES[kind]
-                rows = self._clear_rows(kind, "harbour invoice walrus")
-                self.assertEqual(self._rpc(proc, index_method, {"rows": rows})["result"]["count"], len(rows))
-                found = self._rpc(proc, search_method, {"q": "harbour invoice walrus", "limit": 10, "ignoreDate": True})
-                self.assertTrue(found.get("result"), found)
-            db_paths = [Path(init["dbPath"]), Path(init["memoryDbPath"])]
-            logs = [Path(f"{db}{suffix}") for db in db_paths for suffix in ("-wal", "-shm")]
-            self.assertTrue(any(log.exists() for log in logs), "the log files were never written")
-        finally:
-            self._stop_process(proc)
-        self.assertEqual([log.name for log in logs if log.exists()], [])
+            db_path = Path(self._rpc(proc, "init", {"profilePath": self.temp_dir})["result"][path_key])
+            folder = db_path.parent
+            self.assertEqual(self._rpc(proc, index_method, {"rows": rows})["result"]["count"], len(rows))
 
-    def test_an_exit_with_reads_still_queued_leaves_no_log_files(self):
-        """Input closing while reads are still queued: the reader finishes after an idle writer would
-        have, yet every read is answered and no -wal or -shm is left, since the writer still closes last."""
-        proc = self._start_process()
-        reads = 300
-        try:
-            self.assertIn("result", self._rpc(proc, "hello", {"addonVersion": "1.3.0"}))
-            init = self._rpc(proc, "init", {"profilePath": self.temp_dir})["result"]
-            for kind in ("email", "memory"):
-                index_method = self.CLEAR_CASES[kind][0]
-                rows = self._clear_rows(kind, "harbour invoice walrus")
-                self.assertEqual(self._rpc(proc, index_method, {"rows": rows})["result"]["count"], len(rows))
-            db_paths = [Path(init["dbPath"]), Path(init["memoryDbPath"])]
-            logs = [Path(f"{db}{suffix}") for db in db_paths for suffix in ("-wal", "-shm")]
-            self.assertTrue(any(log.exists() for log in logs), "the log files were never written")
-            for i in range(reads):
-                _send_message(proc, {"id": f"q{i}", "method": "search",
-                                     "params": {"q": "harbour", "limit": 50, "ignoreDate": True}})
-            # The helper exits on its own once input closes; wait well past _stop_process's kill.
-            proc.stdin.close()
-            proc.wait(timeout=300)
-            answered = 0
-            while _frames(proc).get(timeout=30) is not None:
-                answered += 1
+            os.chmod(folder, 0o500)
+            os.chmod(db_path, 0o000)
+            failed = self._rpc(proc, clear_method)
+            self.assertIn("error", failed, f"a clear that could not reopen answered {failed}")
+            # The fault is at the open: while the file cannot be opened, neither can a read.
+            self.assertIn("error", self._rpc(proc, docs_method))
+
+            os.chmod(db_path, 0o600)
+            os.chmod(folder, 0o700)
+            # A write first, then reads: each thread opens the database again at its next request.
+            later_secret = "lighthouse ferry quokka"
+            later = self._clear_rows(kind, later_secret, prefix="later", filler=False)
+            self.assertEqual(self._rpc(proc, index_method, {"rows": later}).get("result", {}).get("count"), len(later))
+            self.assertEqual(self._rpc(proc, docs_method).get("result", {}).get("docs"), len(rows) + len(later))
+            kept = self._rpc(proc, search_method, {"q": secret, "limit": 10, "ignoreDate": True}).get("result")
+            # The email search marks the matched words, so its rows are known by id.
+            self.assertIn(secret if kind == "memory" else rows[0]["msgId"], json.dumps(kept))
+            if kind == "memory":
+                written = self._rpc(proc, search_method, {"q": later_secret, "limit": 10, "ignoreDate": True}).get("result")
+            else:
+                # Read back by id: the hybrid ranking can leave a few fresh rows out of a search.
+                written = self._rpc(proc, "getMessageByMsgId", {"msgId": later[0]["msgId"]}).get("result")
+            self.assertIn(later_secret, json.dumps(written))
         finally:
+            if db_path is not None and db_path.exists():
+                os.chmod(db_path, 0o600)
+            if folder is not None:
+                os.chmod(folder, 0o700)
             self._stop_process(proc)
-        self.assertEqual(proc.returncode, 0)
-        self.assertEqual(answered, reads)
-        self.assertEqual([log.name for log in logs if log.exists()], [])
+        self.assertEqual(self._docs_after_restart(docs_method), len(rows) + len(later))
+
+    def test_clear_that_cannot_reopen_recovers_once_it_can(self):
+        self._check_clear_that_cannot_reopen_recovers_once_it_can("email")
+
+    def test_memory_clear_that_cannot_reopen_recovers_once_it_can(self):
+        self._check_clear_that_cannot_reopen_recovers_once_it_can("memory")
 
     def test_reads_sent_around_a_clear_never_fail(self):
         """Reads pipelined before and after clear / memoryClear answer the old or the cleared state, never an error."""
