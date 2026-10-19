@@ -876,7 +876,20 @@ struct MessageMeta {
     has_attachments: bool,
 }
 
-// Column-scope prefixes used in FTS5 queries after alias translation.
+/// Fields a mail search may scope to (`from:alice`): typed name → shard column. Each column
+/// is in `COLUMN_SCOPE_PREFIXES`, so a scoped hybrid search filters its vector candidates.
+const QUERY_COLUMNS: &[(&str, &str)] = &[
+    ("subject", "subject"),
+    ("from", "from_"),
+    ("from_", "from_"),
+    ("to", "to_"),
+    ("to_", "to_"),
+    ("cc", "cc"),
+    ("bcc", "bcc"),
+    ("body", "body"),
+];
+
+// Column-scope prefixes in the FTS5 queries `build_fts_match` writes.
 const COLUMN_SCOPE_PREFIXES: &[&str] = &["from_:", "to_:", "subject:", "cc:", "bcc:", "body:"];
 
 /// Check if a processed FTS5 query contains column-scoped terms.
@@ -1034,7 +1047,7 @@ fn search_rows(
     let candidate_limit = limit * config::hybrid::CANDIDATE_MULTIPLIER;
 
     // --- FTS5 candidates (across all year shards) ---
-    let fts_query = build_fts_match(Some(query), true, synonyms);
+    let fts_query = build_fts_match(Some(query), QUERY_COLUMNS, true, synonyms);
     log::info!(
         "Hybrid search: \"{}\" -> FTS \"{}\"",
         query,
@@ -1160,7 +1173,7 @@ fn search_fts_only(
     limit: i64,
     known_years: &HashSet<i32>,
 ) -> anyhow::Result<Vec<Value>> {
-    let fts_query = build_fts_match(Some(query), true, synonyms);
+    let fts_query = build_fts_match(Some(query), QUERY_COLUMNS, true, synonyms);
     log::info!(
         "Query transformation (with synonyms): \"{}\" -> \"{}\"",
         query,
@@ -2505,6 +2518,79 @@ mod tests {
         assert_eq!(n, 1, "address part must match after rebuild");
     }
 
+    // --- Query text reaches FTS5 as text ---
+
+    /// Ids of the messages an FTS-only search for `q` finds; panics if the search fails.
+    fn search_ok(conn: &Connection, q: &str, known_years: &HashSet<i32>) -> Vec<String> {
+        let params = serde_json::json!({"ignoreDate": true});
+        search(conn, q, &params, &SynonymLookup::new(), None, known_years)
+            .unwrap_or_else(|e| panic!("search for {q:?} failed: {e:?}"))
+            .iter()
+            .map(|r| r["uniqueId"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Whatever a user or model types, search never fails, and every word is searched as
+    /// text (non-ASCII intact). Only the documented fields scope to a column.
+    #[test]
+    fn test_search_reads_any_query_text_as_text() {
+        let (conn, mut known_years) = setup_test_db();
+        let a_week_ago = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        insert_test_message_full(
+            &conn, &mut known_years, "acc:/:one",
+            "Budget plan for the café",
+            "alice@example.com", "team@example.com",
+            "R&D notes: 50% off the launch, and the meeting with bob@example.com",
+            a_week_ago,
+        );
+        let one = vec!["acc:/:one".to_string()];
+        let none: Vec<String> = vec![];
+
+        // Characters FTS5 would read as syntax, and FTS5 operator words.
+        for q in [
+            "50% off", "hello!", "a/b", "#launch", "$100", "budget, plan", "invoice OR", "NOT budget",
+            "budget NOT", "(budget", "budget)", "AND", "NEAR", "OR budget", "\"unclosed", "\"\"",
+            "x^y", "budget -plan", "{budget}", "budget AND", "re:budget", "__FQ0__", "_",
+        ] {
+            search_ok(&conn, q, &known_years);
+        }
+
+        // Words are searched as typed, punctuation inside them included.
+        assert_eq!(search_ok(&conn, "café", &known_years), one, "non-ASCII word");
+        assert_eq!(search_ok(&conn, "cafe", &known_years), one, "without its accent");
+        assert_eq!(search_ok(&conn, "50% off", &known_years), one);
+        assert_eq!(search_ok(&conn, "R&D", &known_years), one);
+        assert_eq!(search_ok(&conn, "budget, plan", &known_years), one);
+        assert_eq!(search_ok(&conn, "(budget", &known_years), one);
+        // A name before a colon that is not a field is text: "note" matches "notes".
+        assert_eq!(search_ok(&conn, "note: launch", &known_years), one);
+        // A phrase beside a word that has synonyms.
+        assert_eq!(search_ok(&conn, "meeting \"budget plan\"", &known_years), one);
+        assert_eq!(search_ok(&conn, "\"budget plan\" meeting", &known_years), one);
+
+        // The documented fields still scope, whatever their case, with or without a space
+        // after the colon: bob@example.com is in the body, not the sender.
+        assert_eq!(search_ok(&conn, "from:alice@example.com", &known_years), one);
+        assert_eq!(search_ok(&conn, "from: \"alice@example.com\"", &known_years), one);
+        assert_eq!(search_ok(&conn, "from:\"alice@example.com\" launch", &known_years), one);
+        assert_eq!(search_ok(&conn, "from:bob@example.com", &known_years), none);
+        assert_eq!(search_ok(&conn, "Subject:budget", &known_years), one);
+        assert_eq!(search_ok(&conn, "subject:launch", &known_years), none);
+        assert_eq!(search_ok(&conn, "to:team", &known_years), one);
+        assert_eq!(search_ok(&conn, "body:launch", &known_years), one);
+    }
+
+    /// A scoped hybrid search finds its column terms in the query built for it, for every field.
+    #[test]
+    fn test_every_query_field_reaches_the_column_scope_filter() {
+        let synonyms = SynonymLookup::new();
+        for (typed, col) in QUERY_COLUMNS {
+            let built = build_fts_match(Some(&format!("{typed}:\"a@example.com\" meeting")), QUERY_COLUMNS, true, &synonyms);
+            assert!(query_has_column_scope(&built), "{built}");
+            assert_eq!(extract_column_scope_filter(&built), format!("{col}:\"a@example.com\""), "{built}");
+        }
+    }
+
     #[test]
     fn test_extract_column_scope_filter_quoted_prefix_star() {
         // build_fts_match emits field:"value"* for special-char values — the
@@ -2519,8 +2605,8 @@ mod tests {
         // "dmarc-helper" → phrase [dmarc, helper*]. The trailing star keeps
         // mid-typing partials (incomplete last fragment) matching.
         let synonyms = SynonymLookup::new();
-        assert_eq!(build_fts_match(Some("dmarc-helper"), true, &synonyms), r#""dmarc-helper"*"#);
-        assert_eq!(build_fts_match(Some("user@example.com"), true, &synonyms), r#""user@example.com"*"#);
+        assert_eq!(build_fts_match(Some("dmarc-helper"), QUERY_COLUMNS, true, &synonyms), r#""dmarc-helper"*"#);
+        assert_eq!(build_fts_match(Some("user@example.com"), QUERY_COLUMNS, true, &synonyms), r#""user@example.com"*"#);
     }
 
     #[test]

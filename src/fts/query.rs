@@ -4,324 +4,180 @@
 
 use crate::fts::synonyms::SynonymLookup;
 
-// FTS5 query builder with email-specific syntax handling.
-pub fn build_fts_match(q: Option<&str>, use_synonyms: bool, synonyms: &SynonymLookup) -> String {
+/// Builds the FTS5 MATCH expression for a search query a user typed or a model wrote.
+///
+/// Every word and every `"quoted phrase"` reaches FTS5 as a string, so nothing typed is read
+/// as FTS5 syntax: operator words, parentheses and punctuation are searched as text, and
+/// non-ASCII text is kept whole. `name:word`, `name:"phrase"` and `name: word` scope to a
+/// column only when `columns` names it (typed name, case-insensitive → table column); any
+/// other `x:` is text. The synonym groups added here are the only operators in the result.
+pub fn build_fts_match(
+    q: Option<&str>,
+    columns: &[(&str, &str)],
+    use_synonyms: bool,
+    synonyms: &SynonymLookup,
+) -> String {
     let Some(q) = q else { return String::new() };
-    let q = q.trim();
-    if q.is_empty() {
-        return String::new();
-    }
+    let items = scan(q);
 
-    // First translate field aliases in raw query (from: -> from_:, to: -> to_:).
-    let mut q = translate_aliases(q);
+    // A word with synonyms becomes an OR group; FTS5 then needs an explicit AND between all
+    // terms, and no word gets an automatic prefix star (as before).
+    let has_or_groups = use_synonyms
+        && items.iter().enumerate().any(|(i, item)| {
+            matches!(item, Item::Word(w) if scoped_column(w, columns).is_none()
+                && !follows_bare_field(&items, i, columns)
+                && prepare_word(w).is_some_and(|(core, star)| expands(&core, star, synonyms)))
+        });
 
-    // Extract field:"quoted value" segments before splitting by quotes.
-    let mut field_quoted_matches: Vec<(String, String)> = vec![];
-    q = extract_field_quoted(&q, &mut field_quoted_matches);
-
-    // Split by quotes to preserve quoted phrases.
-    let parts: Vec<&str> = q.split('"').collect();
     let mut out: Vec<String> = vec![];
-
-    for (idx, part) in parts.iter().enumerate() {
-        let is_quoted = idx % 2 == 1;
-        if is_quoted {
-            out.push(format!("\"{}\"", part));
-            continue;
-        }
-
-        let tokens: Vec<&str> = part.split_whitespace().filter(|t| !t.is_empty()).collect();
-        let mut mapped: Vec<String> = vec![];
-
-        let will_have_or_groups = if use_synonyms {
-            tokens.iter().any(|tok| will_expand_to_or_group(tok, synonyms))
-        } else {
-            false
+    let mut i = 0usize;
+    while i < items.len() {
+        let item = items[i];
+        i += 1;
+        let term = match item {
+            Item::Phrase(p) => phrase(p),
+            Item::Word(w) => match scoped_column(w, columns) {
+                // name:"phrase" and name: word take the next item as the value.
+                Some((col, "")) => {
+                    let value = items.get(i).copied();
+                    i += 1;
+                    match value {
+                        Some(Item::Phrase(p)) => phrase(p).map(|v| format!("{col}:{v}")),
+                        Some(Item::Word(w)) => word(w, false, has_or_groups, synonyms).map(|v| format!("{col}:{v}")),
+                        None => None,
+                    }
+                }
+                Some((col, value)) => word(value, false, has_or_groups, synonyms).map(|v| format!("{col}:{v}")),
+                None => word(w, use_synonyms, has_or_groups, synonyms),
+            },
         };
+        out.extend(term);
+    }
 
-        for tok in tokens {
-            if let Some((field, val)) = placeholder_field_quoted(tok, &field_quoted_matches) {
-                mapped.push(format!("{field}:\"{val}\""));
-                continue;
-            }
+    out.join(if has_or_groups { " AND " } else { " " })
+}
 
-            if is_pure_punctuation(tok) {
-                continue;
-            }
+#[derive(Clone, Copy)]
+enum Item<'a> {
+    /// Text between double quotes (an unclosed quote runs to the end).
+    Phrase(&'a str),
+    /// A run of characters without whitespace or double quotes.
+    Word(&'a str),
+}
 
-            let (field, mut value) = split_field(tok);
-
-            // If value already quoted, preserve as-is (no wildcarding / synonym expansion).
-            if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
-                let mut fv = String::new();
-                if let Some(f) = field {
-                    fv.push_str(f);
-                    fv.push(':');
-                }
-                fv.push_str(value);
-                mapped.push(fv);
-                continue;
-            }
-
-            // Remove trailing punctuation like '?' or '/' before optional wildcard.
-            let has_wildcard = value.ends_with('*');
-            if has_wildcard {
-                value = &value[..value.len() - 1];
-            }
-            let core = trim_trailing_slash_question(value);
-
-            // Remove apostrophes for FTS5 compatibility.
-            let mut escaped_core = core.replace('\'', "");
-
-            // Handle naked wildcard "*": convert to "." (python uses "." so then adds "*" back).
-            if escaped_core.is_empty() && has_wildcard {
-                escaped_core.push('.');
-            }
-
-            let needs_quote = has_special_chars_requiring_quotes(&escaped_core);
-
-            let final_token = if needs_quote {
-                // Quoted phrase-prefix: with no tokenchars (ADR-024) the
-                // tokenizer treats - _ . @ like any other separator, so
-                // "dmarc-supp" becomes the phrase [dmarc, supp*] — adjacency-
-                // matching partial AND full addresses mid-typing. Without the
-                // trailing star, a partial's last fragment would need to be a
-                // complete token and mid-typing queries would return nothing.
-                format!("\"{}\"*", escaped_core.replace('"', "\"\""))
-            } else {
-                // Auto-add wildcard for tokens >= 4 chars, but avoid if OR groups exist.
-                if !has_wildcard
-                    && escaped_core.len() >= 4
-                    && !will_have_or_groups
-                {
-                    format!("{escaped_core}*")
-                } else if has_wildcard {
-                    format!("{escaped_core}*")
-                } else {
-                    escaped_core
-                }
-            };
-
-            if let Some(f) = field {
-                mapped.push(format!("{f}:{final_token}"));
-            } else if use_synonyms && !has_wildcard && !needs_quote && !final_token.is_empty() {
-                let expanded = synonyms.expand(&final_token);
-                if expanded != final_token {
-                    mapped.push(expanded);
-                } else {
-                    mapped.push(final_token);
-                }
-            } else {
-                mapped.push(final_token);
-            }
+fn scan(q: &str) -> Vec<Item<'_>> {
+    let mut items = vec![];
+    let mut rest = q;
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return items;
         }
-
-        if !mapped.is_empty() {
-            let has_or_groups = mapped.iter().any(|t| t.contains("(") && t.contains(" OR "));
-            if has_or_groups {
-                out.push(mapped.join(" AND "));
-            } else {
-                out.push(mapped.join(" "));
-            }
+        if let Some(after) = rest.strip_prefix('"') {
+            let end = after.find('"').unwrap_or(after.len());
+            items.push(Item::Phrase(&after[..end]));
+            rest = after.get(end + 1..).unwrap_or("");
+        } else {
+            let end = rest.find(|c: char| c.is_whitespace() || c == '"').unwrap_or(rest.len());
+            items.push(Item::Word(&rest[..end]));
+            rest = &rest[end..];
         }
     }
-
-    out.join(" ").trim().to_string()
 }
 
-fn translate_aliases(q: &str) -> String {
-    // Equivalent to Python regex: r'\b(from|to)\s*:' -> from_:/to_:
-    // We'll do a small manual scanner to avoid regex deps.
-    let mut out = String::with_capacity(q.len());
-    let bytes = q.as_bytes();
-    let mut i = 0usize;
-
-    while i < bytes.len() {
-        // check word boundary for "from" or "to" then optional spaces then ':'
-        if starts_word_at(bytes, i, b"from") {
-            let end = i + 4;
-            let mut j = end;
-            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            if j < bytes.len() && bytes[j] == b':' {
-                out.push_str("from_:");
-                i = j + 1;
-                continue;
-            }
-        }
-        if starts_word_at(bytes, i, b"to") {
-            let end = i + 2;
-            let mut j = end;
-            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            if j < bytes.len() && bytes[j] == b':' {
-                out.push_str("to_:");
-                i = j + 1;
-                continue;
-            }
-        }
-
-        out.push(bytes[i] as char);
-        i += 1;
-    }
-
-    out
+/// `(table column, value)` when `w` is `name:value` with `name` one of `columns`.
+fn scoped_column<'a>(w: &'a str, columns: &[(&str, &'a str)]) -> Option<(&'a str, &'a str)> {
+    let (name, value) = w.split_once(':')?;
+    columns
+        .iter()
+        .find(|(typed, _)| typed.eq_ignore_ascii_case(name))
+        .map(|(_, col)| (*col, value))
 }
 
-fn starts_word_at(haystack: &[u8], i: usize, needle: &[u8]) -> bool {
-    if i + needle.len() > haystack.len() {
-        return false;
-    }
-    // word boundary: previous is not alnum/_ and current starts with needle (case-insensitive)
-    if i > 0 {
-        let prev = haystack[i - 1];
-        if (prev as char).is_ascii_alphanumeric() || prev == b'_' {
-            return false;
-        }
-    }
-    for (k, nb) in needle.iter().enumerate() {
-        let hb = haystack[i + k];
-        if hb.to_ascii_lowercase() != nb.to_ascii_lowercase() {
-            return false;
-        }
-    }
-    true
+/// Whether item `i` is the value of a bare `name:` before it.
+fn follows_bare_field(items: &[Item], i: usize, columns: &[(&str, &str)]) -> bool {
+    i > 0 && matches!(items[i - 1], Item::Word(w) if matches!(scoped_column(w, columns), Some((_, ""))))
 }
 
-fn extract_field_quoted(q: &str, store: &mut Vec<(String, String)>) -> String {
-    // Pattern: field_name:"quoted value" where field is [A-Za-z_][A-Za-z0-9_]*
-    // We'll do a simple scan, not a full regex engine.
-    let mut out = String::with_capacity(q.len());
-    let bytes = q.as_bytes();
-    let mut i = 0usize;
-
-    while i < bytes.len() {
-        // parse identifier
-        if is_ident_start(bytes[i]) {
-            let start_ident = i;
-            let mut j = i + 1;
-            while j < bytes.len() && is_ident_char(bytes[j]) {
-                j += 1;
-            }
-            if j < bytes.len() && bytes[j] == b':' && (j + 1) < bytes.len() && bytes[j + 1] == b'"' {
-                // find closing quote
-                let mut k = j + 2;
-                while k < bytes.len() && bytes[k] != b'"' {
-                    k += 1;
-                }
-                if k < bytes.len() && bytes[k] == b'"' {
-                    let field = String::from_utf8_lossy(&bytes[start_ident..j]).to_string();
-                    let val = String::from_utf8_lossy(&bytes[(j + 2)..k]).to_string();
-                    let placeholder = format!("__FQ{}__", store.len());
-                    store.push((field, val));
-                    out.push_str(&placeholder);
-                    i = k + 1;
-                    continue;
-                }
-            }
-        }
-
-        out.push(bytes[i] as char);
-        i += 1;
-    }
-
-    out
+/// Whether text has anything a tokenizer would index (a term with none matches nothing).
+fn has_text(s: &str) -> bool {
+    s.chars().any(char::is_alphanumeric)
 }
 
-fn is_ident_start(b: u8) -> bool {
-    (b as char).is_ascii_alphabetic() || b == b'_'
+fn phrase(p: &str) -> Option<String> {
+    has_text(p).then(|| format!("\"{p}\""))
 }
 
-fn is_ident_char(b: u8) -> bool {
-    (b as char).is_ascii_alphanumeric() || b == b'_'
+/// A word's searched text and whether the user ended it with `*`: one trailing `*`, then
+/// trailing `/` and `?`, are removed, and apostrophes are dropped.
+fn prepare_word(w: &str) -> Option<(String, bool)> {
+    let (w, star) = match w.strip_suffix('*') {
+        Some(rest) => (rest, true),
+        None => (w, false),
+    };
+    let core = w.trim_end_matches(['/', '?']).replace('\'', "");
+    has_text(&core).then_some((core, star))
 }
 
-fn placeholder_field_quoted<'a>(tok: &'a str, store: &'a [(String, String)]) -> Option<(&'a str, &'a str)> {
-    if let Some(idx) = parse_placeholder(tok) {
-        if idx < store.len() {
-            let (field, val) = &store[idx];
-            return Some((field.as_str(), val.as_str()));
-        }
-    }
-    None
+/// Only a plain word the user did not star expands to its synonyms.
+fn expands(core: &str, star: bool, synonyms: &SynonymLookup) -> bool {
+    !star && !has_punctuation(core) && synonyms.expand(core) != core
 }
 
-fn parse_placeholder(tok: &str) -> Option<usize> {
-    // "__FQ{n}__"
-    if !tok.starts_with("__FQ") || !tok.ends_with("__") {
-        return None;
-    }
-    let inner = &tok[4..tok.len() - 2];
-    inner.parse::<usize>().ok()
+fn has_punctuation(core: &str) -> bool {
+    core.chars().any(|c| !c.is_alphanumeric() && c != '_')
 }
 
-fn is_pure_punctuation(tok: &str) -> bool {
-    tok.chars().all(|c| !c.is_alphanumeric() && c != '_')
+fn word(w: &str, use_synonyms: bool, has_or_groups: bool, synonyms: &SynonymLookup) -> Option<String> {
+    let (core, star) = prepare_word(w)?;
+    if use_synonyms && expands(&core, star, synonyms) {
+        return Some(synonyms.expand(&core));
+    }
+    // A word with punctuation is a phrase of its parts ("dmarc-supp" → [dmarc, supp]); the star
+    // keeps a partial address matching while it is typed. Plain words of 4+ bytes get one too,
+    // unless synonym groups are present.
+    let prefix = star || has_punctuation(&core) || (core.len() >= 4 && !has_or_groups);
+    Some(format!("\"{core}\"{}", if prefix { "*" } else { "" }))
 }
 
-fn split_field(tok: &str) -> (Option<&str>, &str) {
-    if let Some(pos) = tok.find(':') {
-        let (field, rest) = tok.split_at(pos);
-        let rest = &rest[1..];
-        if !field.is_empty() && field.chars().next().unwrap().is_ascii_alphabetic() || field.starts_with('_') {
-            return (Some(field), rest);
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const COLUMNS: &[(&str, &str)] = &[("from", "from_"), ("subject", "subject")];
+
+    fn build(q: &str, columns: &[(&str, &str)]) -> String {
+        build_fts_match(Some(q), columns, true, &SynonymLookup::new())
     }
-    (None, tok)
+
+    #[test]
+    fn words_and_phrases_are_strings() {
+        assert_eq!(build("café", &[]), r#""café"*"#);
+        assert_eq!(build("50% off", &[]), r#""50%"* "off""#);
+        assert_eq!(build("NOT (budget", &[]), r#""NOT" "(budget"*"#);
+        assert_eq!(build(r#"say "hi there"#, &[]), r#""say" "hi there""#);
+        assert_eq!(build("it's gone?", &[]), r#""its" "gone"*"#);
+        assert_eq!(build("budg*", &[]), r#""budg"*"#);
+        assert_eq!(build(r#"-- "" _ ?"#, &[]), "");
+    }
+
+    #[test]
+    fn only_named_columns_scope() {
+        assert_eq!(build("From:alice", COLUMNS), r#"from_:"alice"*"#);
+        assert_eq!(build(r#"from: "a b" x"#, COLUMNS), r#"from_:"a b" "x""#);
+        assert_eq!(build("subject: budget", COLUMNS), r#"subject:"budget"*"#);
+        assert_eq!(build("subject:", COLUMNS), "");
+        assert_eq!(build("note:launch", COLUMNS), r#""note:launch"*"#);
+        assert_eq!(build("from:alice", &[]), r#""from:alice"*"#);
+    }
+
+    #[test]
+    fn synonym_groups_are_joined_with_and() {
+        let q = build(r#"meeting "budget plan" from:alice"#, COLUMNS);
+        assert!(q.starts_with('(') && q.contains(" OR meeting OR "), "{q}");
+        // With groups present no word gets an automatic star.
+        assert!(q.ends_with(r#") AND "budget plan" AND from_:"alice""#), "{q}");
+        // A field's value is never expanded, and does not cause groups.
+        assert_eq!(build("subject:meeting zebra", COLUMNS), r#"subject:"meeting"* "zebra"*"#);
+    }
 }
-
-fn trim_trailing_slash_question(s: &str) -> String {
-    let mut end = s.len();
-    while end > 0 {
-        let c = s.as_bytes()[end - 1];
-        if c == b'/' || c == b'?' {
-            end -= 1;
-            continue;
-        }
-        break;
-    }
-    s[..end].to_string()
-}
-
-fn has_special_chars_requiring_quotes(s: &str) -> bool {
-    s.chars().any(|c| matches!(c, '-' | '@' | ':' | '+' | '.'))
-}
-
-fn will_expand_to_or_group(tok: &str, synonyms: &SynonymLookup) -> bool {
-    // Skip placeholders / pure punctuation.
-    if parse_placeholder(tok).is_some() || is_pure_punctuation(tok) {
-        return false;
-    }
-
-    let (field, mut value) = split_field(tok);
-    if field.is_some() {
-        return false;
-    }
-
-    // If already quoted, no.
-    if value.starts_with('"') && value.ends_with('"') {
-        return false;
-    }
-
-    let has_wildcard = value.ends_with('*');
-    if has_wildcard {
-        value = &value[..value.len() - 1];
-    }
-    let core = trim_trailing_slash_question(value);
-    let escaped = core.replace('\'', "");
-    if escaped.is_empty() {
-        return false;
-    }
-
-    let needs_quote = has_special_chars_requiring_quotes(&escaped);
-    if has_wildcard || needs_quote {
-        return false;
-    }
-
-    let expanded = synonyms.expand(&escaped);
-    expanded != escaped
-}
-
-

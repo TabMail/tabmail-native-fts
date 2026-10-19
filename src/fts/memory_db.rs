@@ -480,7 +480,7 @@ fn memory_search_rows(
     let candidate_limit = limit * config::hybrid::CANDIDATE_MULTIPLIER;
 
     // --- FTS5 candidates ---
-    let fts_query = build_fts_match(Some(query), true, synonyms);
+    let fts_query = build_fts_match(Some(query), &[], true, synonyms);
     log::info!(
         "Memory hybrid search: \"{}\" -> FTS \"{}\"",
         query,
@@ -651,7 +651,7 @@ fn memory_search_fts_only(
     ignore_date: bool,
     limit: i64,
 ) -> anyhow::Result<Vec<Value>> {
-    let fts_query = build_fts_match(Some(query), true, synonyms);
+    let fts_query = build_fts_match(Some(query), &[], true, synonyms);
     log::info!(
         "Memory query transformation (with synonyms): \"{}\" -> \"{}\"",
         query,
@@ -1470,6 +1470,37 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+
+    /// Whatever a user types in the chat history search or a model asks memory, search never
+    /// fails and every word is text: memory has no fields, so `from:` is a word too.
+    #[test]
+    fn memory_search_reads_any_query_text_as_text() {
+        let (dir, mut conn) = temp_memory_db("query-text");
+        let row = serde_json::json!({
+            "memId": "turn:1", "role": "session",
+            "content": "[USER]: from: alice@example.com, the café plan\n\n[AGENT]: R&D is 50% off",
+            "sessionId": "persistent_chat", "turnIndex": 0,
+            "dateMs": chrono::Utc::now().timestamp_millis(),
+        });
+        memory_index_batch(&mut conn, &[row], None).unwrap();
+        let synonyms = SynonymLookup::new();
+        let params = serde_json::json!({"ignoreDate": true});
+        let found = |q: &str| -> usize {
+            memory_search(&conn, q, &params, &synonyms, None)
+                .unwrap_or_else(|e| panic!("memory search for {q:?} failed: {e:?}"))
+                .len()
+        };
+        for q in ["50% off", "a/b", "#plan", "NOT plan", "(plan", "plan OR", "\"unclosed", "x^y", "subject:plan"] {
+            found(q);
+        }
+        assert_eq!(found("from: alice"), 1, "from: is text in memory");
+        assert_eq!(found("from:alice@example.com"), 1);
+        assert_eq!(found("café"), 1, "non-ASCII word");
+        assert_eq!(found("R&D"), 1);
+        assert_eq!(found("50% off"), 1);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Indexes one text-only exchange dated `i`, as one memory write does.
     fn add_text(conn: &mut Connection, i: usize) {
