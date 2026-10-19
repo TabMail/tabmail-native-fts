@@ -32,9 +32,10 @@ Keep candle-core 0.8.4 and move it to Zip 9, in a copy in `vendor/candle-core` u
 **Remove the copy** (and the patch entry) once Native FTS moves to a candle release that depends on
 Zip 9 or later.
 
-**Builders:** pass `--remap-path-prefix=$HOME=~` in `RUSTFLAGS` for a shipped build. Without it a
-binary carries the builder's home folder (its user name) in every dependency's source path; Cargo's
-`trim-paths` profile setting, which would do this from `Cargo.toml`, is not stable yet.
+**Builders:** a shipped build made on someone's own computer passes `--remap-path-prefix=$HOME=~` in
+`RUSTFLAGS`. Without it the binary carries that home folder (the user name) in every dependency's
+source path. A CI runner's home names no one, so CI builds need nothing. Cargo's `trim-paths` profile
+setting, which would do this from `Cargo.toml`, is not stable yet.
 
 ## Verification
 
