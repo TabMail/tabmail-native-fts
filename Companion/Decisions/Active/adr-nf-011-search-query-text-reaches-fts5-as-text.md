@@ -56,3 +56,5 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
   `db::tests::test_every_query_field_reaches_the_column_scope_filter` ties the field list to the
   hybrid filter.
 - `role:` / `content:` no longer scope in memory search (undocumented, unused).
+- Both behaviour changes (`from :` with a space before the colon no longer scopes; memory search has
+  no fields) were approved by the owner on 2026-10-18.
