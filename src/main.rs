@@ -15,8 +15,7 @@ mod update_signature;
 use std::collections::HashSet;
 use std::io::{stdin, stdout, Stdin, Stdout};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{bail, Context};
 use rusqlite::Connection;
@@ -207,16 +206,13 @@ fn run_multi_threaded(
     let engine: Option<Arc<EmbeddingEngine>> = state.embedding_engine.map(Arc::new);
     let synonyms = Arc::new(state.synonyms);
 
-    // Open read-only connections for reader thread
-    let reader_email_conn = crate::fts::db::open_read_only_connection(&email_db_path)?;
-    let reader_memory_conn = memory_db::open_read_only_memory_connection(&memory_db_path)?;
+    // Read-only connections for the reader thread. The writer locks one for the whole of a
+    // clear, to close it before the files are deleted and open it again after.
+    let reader_email_conn = Arc::new(Mutex::new(crate::fts::db::open_read_only_connection(&email_db_path)?));
+    let reader_memory_conn = Arc::new(Mutex::new(memory_db::open_read_only_memory_connection(&memory_db_path)?));
 
     // Shared stdout for writing responses from both threads
     let shared_stdout: Arc<Mutex<Stdout>> = Arc::new(Mutex::new(out_stream));
-
-    // AtomicBool flags: writer signals reader to reopen after clear/memoryClear
-    let email_reopen = Arc::new(AtomicBool::new(false));
-    let memory_reopen = Arc::new(AtomicBool::new(false));
 
     // Channels: main → reader, main → writer
     let (reader_tx, reader_rx) = mpsc::channel::<ThreadMessage>();
@@ -229,23 +225,21 @@ fn run_multi_threaded(
         let synonyms = Arc::clone(&synonyms);
         let email_path = email_db_path.clone();
         let memory_path = memory_db_path.clone();
-        let email_reopen = Arc::clone(&email_reopen);
-        let memory_reopen = Arc::clone(&memory_reopen);
+        let email_conn = Arc::clone(&reader_email_conn);
+        let memory_conn = Arc::clone(&reader_memory_conn);
 
         std::thread::Builder::new()
             .name("fts-reader".to_string())
             .spawn(move || {
                 reader_thread_main(
                     reader_rx,
-                    reader_email_conn,
-                    reader_memory_conn,
+                    email_conn,
+                    memory_conn,
                     engine,
                     synonyms,
                     stdout,
                     email_path,
                     memory_path,
-                    email_reopen,
-                    memory_reopen,
                 );
             })?
     };
@@ -256,8 +250,8 @@ fn run_multi_threaded(
         let engine = engine.clone();
         let email_path = email_db_path.clone();
         let memory_path = memory_db_path.clone();
-        let email_reopen = Arc::clone(&email_reopen);
-        let memory_reopen = Arc::clone(&memory_reopen);
+        let reader_email_conn = Arc::clone(&reader_email_conn);
+        let reader_memory_conn = Arc::clone(&reader_memory_conn);
 
         std::thread::Builder::new()
             .name("fts-writer".to_string())
@@ -271,12 +265,15 @@ fn run_multi_threaded(
                     stdout,
                     email_path,
                     memory_path,
-                    email_reopen,
-                    memory_reopen,
+                    reader_email_conn,
+                    reader_memory_conn,
                 );
             })?
     };
 
+    // Only the threads hold the reader's connections from here on.
+    drop(reader_email_conn);
+    drop(reader_memory_conn);
     log::info!("Multi-threaded mode active: reader + writer threads spawned");
 
     // Main thread: stdin dispatch loop
@@ -365,36 +362,56 @@ fn run_multi_threaded(
 // Reader thread
 // ============================================================================
 
+/// A connection shared by the reader and the writer's clear. A panic while it was held
+/// leaves the connection itself usable, so the lock is taken regardless.
+fn lock_conn(conn: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
+    conn.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Whether `conn` is the in-memory stand-in a clear puts in a connection's place while it
+/// replaces the files, rather than a connection to the database: SQLite names an in-memory
+/// database with an empty name. A name rusqlite can't give (one not in UTF-8, as on Linux under a
+/// folder whose name isn't) is a database's.
+fn is_stand_in(conn: &Connection) -> bool {
+    matches!(conn.path(), Some(""))
+}
+
+/// Opens the database again in place of a stand-in that a failed clear left (`open` failed, the
+/// files couldn't be opened), so the first request after the fault ends is served from the
+/// database. It never deletes anything: rows written since stay. Failing, it is tried again at
+/// the next request. When the clear deleted the files but couldn't create them, only the writer's
+/// open creates the database: reads fail until the next write.
+fn reopen_stand_in(conn: &mut Connection, what: &str, open: impl FnOnce() -> anyhow::Result<Connection>) {
+    if !is_stand_in(conn) {
+        return;
+    }
+    match open() {
+        Ok(new_conn) => {
+            log::info!("Reopened the {what} connection a failed clear left closed");
+            *conn = new_conn;
+        }
+        Err(e) => log::error!("Failed to reopen the {what} connection a failed clear left closed: {:?}", e),
+    }
+}
+
 fn reader_thread_main(
     rx: mpsc::Receiver<ThreadMessage>,
-    mut email_conn: Connection,
-    mut memory_conn: Connection,
+    email_conn: Arc<Mutex<Connection>>,
+    memory_conn: Arc<Mutex<Connection>>,
     engine: Option<Arc<EmbeddingEngine>>,
     synonyms: Arc<SynonymLookup>,
     stdout: Arc<Mutex<Stdout>>,
     email_db_path: PathBuf,
     memory_db_path: PathBuf,
-    email_reopen: Arc<AtomicBool>,
-    memory_reopen: Arc<AtomicBool>,
 ) {
     log::info!("[reader] Thread started");
 
     while let Ok(msg) = rx.recv() {
-        // Check if writer signaled us to reopen after clear
-        if email_reopen.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-            log::info!("[reader] Reopening email read-only connection after clear");
-            match crate::fts::db::open_read_only_connection(&email_db_path) {
-                Ok(new_conn) => email_conn = new_conn,
-                Err(e) => log::error!("[reader] Failed to reopen email conn: {:?}", e),
-            }
-        }
-        if memory_reopen.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-            log::info!("[reader] Reopening memory read-only connection after clear");
-            match memory_db::open_read_only_memory_connection(&memory_db_path) {
-                Ok(new_conn) => memory_conn = new_conn,
-                Err(e) => log::error!("[reader] Failed to reopen memory conn: {:?}", e),
-            }
-        }
+        // A clear holds one of these while it replaces the files, so a read waits for it.
+        let mut email_conn = lock_conn(&email_conn);
+        let mut memory_conn = lock_conn(&memory_conn);
+        reopen_stand_in(&mut email_conn, "reader's email", || crate::fts::db::open_read_only_connection(&email_db_path));
+        reopen_stand_in(&mut memory_conn, "reader's memory", || memory_db::open_read_only_memory_connection(&memory_db_path));
 
         let engine_ref = engine.as_deref();
         let resp = handle_read_request(
@@ -409,6 +426,8 @@ fn reader_thread_main(
             &msg.params,
         );
 
+        drop(memory_conn);
+        drop(email_conn);
         write_response(&stdout, &msg.id, resp);
     }
 
@@ -651,8 +670,8 @@ fn writer_thread_main(
     stdout: Arc<Mutex<Stdout>>,
     email_db_path: PathBuf,
     memory_db_path: PathBuf,
-    email_reopen: Arc<AtomicBool>,
-    memory_reopen: Arc<AtomicBool>,
+    reader_email_conn: Arc<Mutex<Connection>>,
+    reader_memory_conn: Arc<Mutex<Connection>>,
 ) {
     log::info!("[writer] Thread started");
 
@@ -660,9 +679,12 @@ fn writer_thread_main(
     let mut shards_left = true;
     loop {
         let next = next_write_request(&rx, || {
-            convert_one_shard_when_idle(&mut email_conn, &mut attempted_shards, &mut shards_left)
+            // Nothing to convert in a failed clear's stand-in; the next request reopens it.
+            !is_stand_in(&email_conn) && convert_one_shard_when_idle(&mut email_conn, &mut attempted_shards, &mut shards_left)
         });
         let Some(msg) = next else { break };
+        reopen_stand_in(&mut email_conn, "writer's email", || crate::fts::db::open_writer_connection(&email_db_path));
+        reopen_stand_in(&mut memory_conn, "writer's memory", || memory_db::open_memory_writer_connection(&memory_db_path));
         let engine_ref = engine.as_deref();
         let resp = handle_write_request(
             &mut email_conn,
@@ -671,8 +693,8 @@ fn writer_thread_main(
             &email_db_path,
             &memory_db_path,
             engine_ref,
-            &email_reopen,
-            &memory_reopen,
+            &reader_email_conn,
+            &reader_memory_conn,
             &msg.method,
             &msg.id,
             &msg.params,
@@ -682,6 +704,11 @@ fn writer_thread_main(
     }
 
     log::info!("[writer] Thread stopped (channel closed)");
+    // Its copies of the reader's connections go before its own connections.
+    drop(reader_email_conn);
+    drop(reader_memory_conn);
+    drop(email_conn);
+    drop(memory_conn);
 }
 
 /// One idle step of the shard migration: converts the next stale shard and
@@ -731,14 +758,17 @@ fn handle_write_request(
     email_db_path: &Path,
     memory_db_path: &Path,
     engine: Option<&EmbeddingEngine>,
-    email_reopen: &AtomicBool,
-    memory_reopen: &AtomicBool,
+    reader_email_conn: &Mutex<Connection>,
+    reader_memory_conn: &Mutex<Connection>,
     method: &str,
     msg_id: &str,
     params: &Value,
 ) -> anyhow::Result<Value> {
     match method {
         "indexBatch" => {
+            // Not into a failed clear's stand-in: the shards it would create there are remembered
+            // as made, and the database would lack them once it opens again.
+            anyhow::ensure!(!is_stand_in(email_conn), "the database could not be opened after a failed clear");
             let rows = params
                 .get("rows")
                 .and_then(|v| v.as_array())
@@ -788,14 +818,22 @@ fn handle_write_request(
             Ok(serde_json::json!({ "id": msg_id, "result": { "ok": true } }))
         }
         "clear" => {
-            // Swap connection with a temporary in-memory one, clear + rebuild, swap back
-            let old_conn = std::mem::replace(email_conn, Connection::open_in_memory()?);
-            let new_conn = crate::fts::db::clear_rebuild_standalone(email_db_path, old_conn)?;
-            *email_conn = new_conn;
-            // Clear known years — shards will be recreated lazily during next indexing
+            // Hold the reader's connection for the whole clear: a read waits, and the reader's
+            // file handle can be closed first, since Windows refuses to delete an open file.
+            let mut reader_conn = lock_conn(reader_email_conn);
+            drop(std::mem::replace(&mut *reader_conn, Connection::open_in_memory()?));
+            // Clear known years first, so a clear that fails after deleting the files leaves none
+            // the new database lacks: shards are created lazily during the next indexing (a shard
+            // that is still there is only verified again).
             known_years.clear();
-            // Signal reader to reopen its read-only connection
-            email_reopen.store(true, Ordering::SeqCst);
+            // Swap connection with a temporary in-memory one, clear + rebuild, swap back. A clear
+            // that fails on the way leaves a stand-in, which the next request opens again.
+            let old_conn = std::mem::replace(email_conn, Connection::open_in_memory()?);
+            let (new_conn, deleted) = crate::fts::db::clear_rebuild_standalone(email_db_path, old_conn)?;
+            *email_conn = new_conn;
+            *reader_conn = crate::fts::db::open_read_only_connection(email_db_path)?;
+            // Files not deleted: every row is still there, so say so rather than answer ok.
+            deleted.context("clear")?;
             Ok(serde_json::json!({ "id": msg_id, "result": { "ok": true } }))
         }
         "rebuildEmbeddingsStart" => {
@@ -870,10 +908,15 @@ fn handle_write_request(
             Ok(serde_json::json!({ "id": msg_id, "result": { "ok": true, "count": removed } }))
         }
         "memoryClear" => {
+            // As in clear: hold and close the reader's connection before deleting the files. A
+            // failure on the way leaves a stand-in, which the next request opens again.
+            let mut reader_conn = lock_conn(reader_memory_conn);
+            drop(std::mem::replace(&mut *reader_conn, Connection::open_in_memory()?));
             let old_conn = std::mem::replace(memory_conn, Connection::open_in_memory()?);
-            let new_conn = memory_db::memory_clear_rebuild_standalone(memory_db_path, old_conn)?;
+            let (new_conn, deleted) = memory_db::memory_clear_rebuild_standalone(memory_db_path, old_conn)?;
             *memory_conn = new_conn;
-            memory_reopen.store(true, Ordering::SeqCst);
+            *reader_conn = memory_db::open_read_only_memory_connection(memory_db_path)?;
+            deleted.context("memoryClear")?;
             Ok(serde_json::json!({ "id": msg_id, "result": { "ok": true } }))
         }
         _ => Ok(serde_json::json!({ "id": msg_id, "error": format!("Unknown writer method: {method}") })),
@@ -1792,8 +1835,8 @@ mod tests {
         params: Value,
     ) -> anyhow::Result<Value> {
         let mut known_years = HashSet::new();
-        let email_reopen = AtomicBool::new(false);
-        let memory_reopen = AtomicBool::new(false);
+        let reader_email = Mutex::new(Connection::open_in_memory().unwrap());
+        let reader_memory = Mutex::new(Connection::open_in_memory().unwrap());
         handle_write_request(
             email,
             memory,
@@ -1801,8 +1844,8 @@ mod tests {
             Path::new("/nonexistent/email.db"),
             Path::new("/nonexistent/memory.db"),
             None,
-            &email_reopen,
-            &memory_reopen,
+            &reader_email,
+            &reader_memory,
             method,
             "test-write-1",
             &params,
@@ -2309,5 +2352,255 @@ mod tests {
         assert_eq!(resp["id"], "test-1");
         let err = resp["error"].as_str().unwrap();
         assert!(err.contains("Unknown reader method"), "got: {err}");
+    }
+
+    /// A failed clear's in-memory stand-in is opened again once the database can be, and a
+    /// connection to the database is never replaced.
+    #[test]
+    fn a_stand_in_is_reopened_once_its_database_opens_again() {
+        let dir = std::env::temp_dir().join(format!("tabmail-fts-stand-in-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("x.db");
+        Connection::open(&db).unwrap().execute_batch("CREATE TABLE kept (v TEXT); INSERT INTO kept VALUES ('row');").unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        assert!(is_stand_in(&conn));
+        reopen_stand_in(&mut conn, "test", || anyhow::bail!("the file cannot be opened yet"));
+        assert!(is_stand_in(&conn), "a failed open left something other than the stand-in");
+
+        reopen_stand_in(&mut conn, "test", || Ok(Connection::open(&db)?));
+        assert!(!is_stand_in(&conn));
+        let kept: String = conn.query_row("SELECT v FROM kept", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, "row");
+
+        let mut opened = false;
+        reopen_stand_in(&mut conn, "test", || {
+            opened = true;
+            Ok(Connection::open_in_memory()?)
+        });
+        assert!(!opened, "a connection to the database was opened again");
+        assert!(!is_stand_in(&conn));
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A clear that deleted the files but could not create the database again (here its folder is
+    /// gone) answers an error, and so does a write while it still can't be. Once the database can
+    /// be created, that write stores its rows, dated in a year the cleared database had a shard for.
+    #[test]
+    fn writes_go_on_after_a_clear_that_deleted_the_files_but_could_not_create_them() {
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+        let dir = std::env::temp_dir().join(format!("tabmail-fts-recreate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (db, memory_db) = (dir.join("fts.db"), dir.join("memory.db"));
+        // Any year works; the date is relative to now.
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let date_ms = now_ms - 400 * 24 * 3600 * 1000;
+        let row = |id: &str| serde_json::json!({"msgId": id, "subject": "s", "body": "b", "dateMs": date_ms, "hasAttachments": false});
+
+        let mut email = Connection::open_in_memory().unwrap();
+        crate::fts::db::init_database(&email).unwrap();
+        let mut known_years = HashSet::new();
+        crate::fts::db::index_batch(&mut email, &[row("old")], None, &mut known_years).unwrap();
+        assert!(!known_years.is_empty());
+        let mut memory = Connection::open_in_memory().unwrap();
+        let reader_email = Mutex::new(Connection::open_in_memory().unwrap());
+        let reader_memory = Mutex::new(Connection::open_in_memory().unwrap());
+
+        let cleared = handle_write_request(&mut email, &mut memory, &mut known_years, &db, &memory_db, None,
+            &reader_email, &reader_memory, "clear", "c", &serde_json::json!({}));
+        assert!(cleared.is_err(), "a clear that could not create the database answered {cleared:?}");
+        reopen_stand_in(&mut email, "test", || crate::fts::db::open_writer_connection(&db));
+        let refused = handle_write_request(&mut email, &mut memory, &mut known_years, &db, &memory_db, None,
+            &reader_email, &reader_memory, "indexBatch", "r", &serde_json::json!({"rows": [row("new")]}));
+        assert!(refused.is_err(), "a write with no database to go to answered {refused:?}");
+
+        std::fs::create_dir_all(&dir).unwrap();
+        reopen_stand_in(&mut email, "test", || crate::fts::db::open_writer_connection(&db));
+        let written = handle_write_request(&mut email, &mut memory, &mut known_years, &db, &memory_db, None,
+            &reader_email, &reader_memory, "indexBatch", "w", &serde_json::json!({"rows": [row("new")]}));
+        assert_eq!(written.expect("write after the fault ended")["result"]["count"], 1);
+        drop(email);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A VFS for tests: the default one, except that the name SQLite reports for a file under a
+    /// folder named with `MARK` has the byte 0xFF in place of the mark's last character, as
+    /// SQLite reports a name under a folder whose name is not UTF-8 (on Linux; macOS refuses
+    /// such names). Files are opened, found and deleted under their real names.
+    mod non_utf8_name_vfs {
+        use rusqlite::ffi;
+        use std::ffi::{c_char, c_int, CStr};
+        use std::sync::atomic::{AtomicPtr, Ordering};
+        use std::sync::Once;
+
+        pub const NAME: &str = "non-utf8-name";
+        pub const MARK: &[u8] = b"non-utf8-name~";
+        static DEFAULT: AtomicPtr<ffi::sqlite3_vfs> = AtomicPtr::new(std::ptr::null_mut());
+        static REGISTER: Once = Once::new();
+
+        fn default() -> *mut ffi::sqlite3_vfs {
+            DEFAULT.load(Ordering::SeqCst)
+        }
+
+        /// `name` as it is on disk: 0xFF back to the mark's last character.
+        unsafe fn real(name: *const c_char) -> *const c_char {
+            if name.is_null() || !CStr::from_ptr(name).to_bytes().contains(&0xFF) {
+                return name;
+            }
+            let mut bytes: Vec<u8> = CStr::from_ptr(name).to_bytes().iter().map(|&b| if b == 0xFF { MARK[MARK.len() - 1] } else { b }).collect();
+            // SQLite reads parameters after a database name's terminator.
+            bytes.extend_from_slice(&[0, 0, 0, 0]);
+            Box::leak(bytes.into_boxed_slice()).as_ptr() as *const c_char
+        }
+
+        unsafe extern "C" fn open(_: *mut ffi::sqlite3_vfs, name: ffi::sqlite3_filename, file: *mut ffi::sqlite3_file, flags: c_int, out: *mut c_int) -> c_int {
+            ((*default()).xOpen.unwrap())(default(), real(name), file, flags, out)
+        }
+        unsafe extern "C" fn delete(_: *mut ffi::sqlite3_vfs, name: *const c_char, sync: c_int) -> c_int {
+            ((*default()).xDelete.unwrap())(default(), real(name), sync)
+        }
+        unsafe extern "C" fn access(_: *mut ffi::sqlite3_vfs, name: *const c_char, flags: c_int, out: *mut c_int) -> c_int {
+            ((*default()).xAccess.unwrap())(default(), real(name), flags, out)
+        }
+        unsafe extern "C" fn full_pathname(_: *mut ffi::sqlite3_vfs, name: *const c_char, size: c_int, out: *mut c_char) -> c_int {
+            let rc = ((*default()).xFullPathname.unwrap())(default(), real(name), size, out);
+            let len = CStr::from_ptr(out).to_bytes().len();
+            let full = std::slice::from_raw_parts_mut(out as *mut u8, len);
+            if let Some(at) = full.windows(MARK.len()).position(|w| w == MARK) {
+                full[at + MARK.len() - 1] = 0xFF;
+            }
+            rc
+        }
+
+        /// Registers it by `NAME`, not as the default: other tests' opens are untouched.
+        pub fn register() {
+            REGISTER.call_once(|| unsafe {
+                let unix = ffi::sqlite3_vfs_find(std::ptr::null());
+                assert!(!unix.is_null());
+                DEFAULT.store(unix, Ordering::SeqCst);
+                let mut vfs: ffi::sqlite3_vfs = *unix;
+                vfs.zName = c"non-utf8-name".as_ptr();
+                vfs.pNext = std::ptr::null_mut();
+                vfs.xOpen = Some(open);
+                vfs.xDelete = Some(delete);
+                vfs.xAccess = Some(access);
+                vfs.xFullPathname = Some(full_pathname);
+                assert_eq!(ffi::sqlite3_vfs_register(Box::leak(Box::new(vfs)), 0), 0);
+            });
+        }
+    }
+
+    /// A database whose name SQLite reports in bytes that aren't UTF-8 is a database, not a failed
+    /// clear's stand-in: a mail write goes in, and its connections are never opened again.
+    #[test]
+    fn a_database_whose_name_is_not_utf8_is_never_taken_for_a_stand_in() {
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+        non_utf8_name_vfs::register();
+        let dir = std::env::temp_dir().join(format!("{}{}", std::str::from_utf8(non_utf8_name_vfs::MARK).unwrap(), std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (db, memory_db) = (dir.join("fts.db"), dir.join("memory.db"));
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+        let mut email = Connection::open_with_flags_and_vfs(&db, flags, non_utf8_name_vfs::NAME).unwrap();
+        crate::fts::db::init_database(&email).unwrap();
+        // The fixture reaches the state: a database file on disk whose name rusqlite can't give.
+        assert!(db.exists());
+        assert_eq!(email.path(), None);
+        assert!(!is_stand_in(&email));
+
+        let mut memory = memory_db::open_memory_writer_connection(&memory_db).unwrap();
+        let reader_email = Mutex::new(Connection::open_in_memory().unwrap());
+        let reader_memory = Mutex::new(Connection::open_in_memory().unwrap());
+        let mut known_years = HashSet::new();
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let rows = serde_json::json!({"rows": [{"msgId": "a", "subject": "s", "body": "b", "dateMs": now_ms, "hasAttachments": false}]});
+        let written = handle_write_request(&mut email, &mut memory, &mut known_years, &db, &memory_db, None,
+            &reader_email, &reader_memory, "indexBatch", "w", &rows);
+        assert_eq!(written.expect("a write to the database")["result"]["count"], 1);
+        let mut opened = false;
+        reopen_stand_in(&mut email, "test", || {
+            opened = true;
+            Ok(Connection::open_in_memory()?)
+        });
+        assert!(!opened, "the database's connection was opened again");
+        assert_eq!(crate::fts::db::db_count(&email).unwrap(), 1);
+        drop(email);
+        drop(memory);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// While a clear runs, a read never finds the reader's connection closed: a reader taking its
+    /// connections as `reader_thread_main` does (email, then memory), as often as it can, never
+    /// meets a stand-in during a `clear` or a `memoryClear` that answers ok.
+    #[test]
+    fn no_read_finds_the_connection_closed_while_a_clear_runs() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+        let dir = std::env::temp_dir().join(format!("tabmail-fts-clear-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (db, memory_db) = (dir.join("fts.db"), dir.join("memory.db"));
+        let mut email = crate::fts::db::open_writer_connection(&db).unwrap();
+        let mut memory = memory_db::open_memory_writer_connection(&memory_db).unwrap();
+        let reader_email = Arc::new(Mutex::new(crate::fts::db::open_read_only_connection(&db).unwrap()));
+        let reader_memory = Arc::new(Mutex::new(memory_db::open_read_only_memory_connection(&memory_db).unwrap()));
+        let mut known_years = HashSet::new();
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        for method in ["memoryClear", "clear"] {
+            for round in 0..10 {
+                let rows: Vec<Value> = (0..50i64)
+                    .map(|i| serde_json::json!({"msgId": format!("{method}-{round}-{i}"), "subject": "s", "body": "b",
+                        "dateMs": now_ms - i * 86_400_000, "hasAttachments": false}))
+                    .collect();
+                crate::fts::db::index_batch(&mut email, &rows, None, &mut known_years).unwrap();
+                let (stop, reads) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU64::new(0)));
+                let reader = {
+                    let (reader_email, reader_memory, stop, reads) = (Arc::clone(&reader_email), Arc::clone(&reader_memory), Arc::clone(&stop), Arc::clone(&reads));
+                    std::thread::spawn(move || {
+                        let mut closed = 0u64;
+                        while !stop.load(Ordering::SeqCst) {
+                            {
+                                let email = lock_conn(&reader_email);
+                                let memory = lock_conn(&reader_memory);
+                                reads.fetch_add(1, Ordering::SeqCst);
+                                if is_stand_in(&email) || is_stand_in(&memory) {
+                                    closed += 1;
+                                }
+                            }
+                            std::thread::yield_now();
+                        }
+                        closed
+                    })
+                };
+                // The reader is running before the clear starts.
+                while reads.load(Ordering::SeqCst) == 0 {
+                    std::thread::yield_now();
+                }
+                let answered = handle_write_request(&mut email, &mut memory, &mut known_years, &db, &memory_db, None,
+                    &reader_email, &reader_memory, method, "c", &serde_json::json!({}));
+                stop.store(true, Ordering::SeqCst);
+                let closed = reader.join().unwrap();
+                let reads = reads.load(Ordering::SeqCst);
+                assert!(answered.is_ok(), "{method}: {answered:?}");
+                assert_eq!(closed, 0, "{method}, round {round}: {closed} of {reads} reads found the connection closed");
+            }
+        }
+        drop(email);
+        drop(memory);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

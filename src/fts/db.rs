@@ -1457,30 +1457,46 @@ pub fn rebuild_embeddings_batch(
 }
 
 /// Clear and rebuild the email FTS database.
-/// Takes ownership of the connection to close it, returns a new connection after rebuild.
-/// Caller must signal the reader thread to reopen its read-only connection and clear known_years.
-pub fn clear_rebuild_standalone(db_path: &Path, conn: Connection) -> anyhow::Result<Connection> {
+/// Takes ownership of the writer's connection to close it. The caller must have closed every
+/// other connection to the file first (the reader's): Windows refuses to delete an open file.
+/// Returns the writer's new connection and whether the files were deleted. When they were not,
+/// the new connection is to the old database with every row still in it. The caller empties
+/// known_years either way: a shard still there is only verified again.
+pub fn clear_rebuild_standalone(db_path: &Path, conn: Connection) -> anyhow::Result<(Connection, anyhow::Result<()>)> {
     log::info!("Clearing email FTS by deleting database file (rebuild from scratch)");
     drop(conn);
     log::info!("Database connection closed");
 
-    delete_file_if_exists(db_path)?;
-    delete_file_if_exists(&PathBuf::from(format!("{}-wal", db_path.display())))?;
-    delete_file_if_exists(&PathBuf::from(format!("{}-shm", db_path.display())))?;
+    let deleted = delete_database_files(db_path);
 
     log::info!("Recreating database...");
-    let new_conn = Connection::open(db_path)?;
-    ensure_fts5_available(&new_conn)?;
-    init_database(&new_conn)?;
+    let new_conn = open_writer_connection(db_path)?;
     log::info!("Database recreated and initialized successfully (FTS shards will be created lazily)");
-    Ok(new_conn)
+    Ok((new_conn, deleted))
 }
 
-fn delete_file_if_exists(p: &Path) -> anyhow::Result<()> {
-    if p.exists() {
-        match std::fs::remove_file(p) {
-            Ok(_) => log::info!("Deleted {}", p.display()),
-            Err(e) => log::warn!("Failed to delete {}: {}", p.display(), e),
+/// The writer's connection to the email database at `db_path`, created empty when the file is
+/// not there: what a clear opens after deleting the files, and what the writer opens again when
+/// a clear failed before it could.
+pub fn open_writer_connection(db_path: &Path) -> anyhow::Result<Connection> {
+    let conn = Connection::open(db_path)?;
+    ensure_fts5_available(&conn)?;
+    init_database(&conn)?;
+    Ok(conn)
+}
+
+/// Delete a database's write-ahead log, its shared-memory file, then the database itself.
+/// The database goes last, so a failure leaves it in place, and a new database is never
+/// opened next to an old log.
+pub(crate) fn delete_database_files(db_path: &Path) -> anyhow::Result<()> {
+    for p in [
+        PathBuf::from(format!("{}-wal", db_path.display())),
+        PathBuf::from(format!("{}-shm", db_path.display())),
+        db_path.to_path_buf(),
+    ] {
+        if p.exists() {
+            std::fs::remove_file(&p).with_context(|| format!("delete {}", p.display()))?;
+            log::info!("Deleted {}", p.display());
         }
     }
     Ok(())
@@ -4128,5 +4144,32 @@ mod tests {
         sorted.sort();
         assert_eq!(ids, sorted, "msgIds must be ascending");
         assert_eq!(page["done"], true);
+    }
+
+    /// Clear deletes the log files before the database and stops at the first it cannot delete,
+    /// so a failed clear never leaves a new database beside the old log, nor deletes the database
+    /// while its log is kept. A non-empty directory in a log file's place cannot be removed as a
+    /// file on any platform.
+    #[test]
+    fn delete_database_files_stops_before_the_database_when_a_log_file_cannot_go() {
+        for (suffix, kept_log) in [("-wal", None), ("-shm", Some("-wal"))] {
+            let dir = std::env::temp_dir().join(format!("tabmail-fts-delete-order-{}{suffix}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("x.db");
+            std::fs::write(&db, b"database").unwrap();
+            if let Some(log) = kept_log {
+                std::fs::write(dir.join(format!("x.db{log}")), b"log").unwrap();
+            }
+            let blocker = dir.join(format!("x.db{suffix}"));
+            std::fs::create_dir_all(blocker.join("inside")).unwrap();
+
+            assert!(delete_database_files(&db).is_err(), "{suffix}: a file that could not be deleted answered ok");
+            assert!(db.exists(), "{suffix}: the database was deleted although its log was kept");
+            if let Some(log) = kept_log {
+                assert!(!dir.join(format!("x.db{log}")).exists(), "{suffix}: the log before it was not deleted");
+            }
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 }

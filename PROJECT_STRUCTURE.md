@@ -62,11 +62,11 @@ main thread (stdin reader + dispatcher)
     ├── classify_method() → reader channel OR writer channel
     │
     ├── reader thread (read-only: search, stats, filter)
-    │   └── owns rusqlite::Connection (Connection is !Send)
+    │   └── reads through its read-only connections, kept in Arc<Mutex> so the writer can close them on a clear (ADR-NF-009)
     │
     └── writer thread (write: indexBatch, membership adoption, removeBatch, clear)
-        └── owns rusqlite::Connection
-        └── signals reader via AtomicBool on clear/memoryClear
+        └── owns its read-write connections
+        └── on clear/memoryClear locks the reader's connection, closes it, deletes + recreates the files, reopens it (ADR-NF-009)
         └── while idle, converts stale year shards one at a time (ADR-NF-005)
 
 Shared: EmbeddingEngine (Arc), SynonymLookup (Arc), Stdout (Arc<Mutex>)

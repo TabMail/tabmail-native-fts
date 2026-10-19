@@ -11,9 +11,9 @@
 **Decision:**
 1. Add integer `SCHEMA_VERSION` constant (starting at 1) that bumps only when DB schema, FTS5 tokenizer config, or embedding model actually changes.
 2. After `init`, split processing into three threads: main (stdin reader + dispatcher), reader (read-only DB ops), writer (write/destructive DB ops).
-3. `EmbeddingEngine` and `SynonymLookup` shared via `Arc`. Each thread opens its own `rusqlite::Connection` (Connection is `!Send`).
+3. `EmbeddingEngine` and `SynonymLookup` shared via `Arc`. Each thread opens its own `rusqlite::Connection` (Connection is `!Send`). *(Amended by ADR-NF-009: the reader's connections are shared with the writer through `Arc<Mutex>`, which `Connection` being `Send` allows.)*
 4. Responses written through `Arc<Mutex<Stdout>>`. Native messaging protocol correlates by `id` field, not by order.
-5. `clear`/`memoryClear` in writer signals reader via `AtomicBool` to reopen its connection.
+5. `clear`/`memoryClear` in writer signals reader via `AtomicBool` to reopen its connection. *(Amended by ADR-NF-009: the writer locks the reader's connection, closes it before deleting the files, and reopens it; the flags are gone.)*
 6. No new crate dependencies.
 
 **Rationale:**
@@ -24,7 +24,7 @@
 
 **Consequences:**
 - Reader connections cache ~64MB each, total memory increase ~128MB
-- Clear operations have a brief window where reader may fail
+- Clear operations have a brief window where reader may fail *(ADR-NF-009: reads now wait for a clear instead)*
 - Pre-init messages remain single-threaded
 - JS side needs no changes (already handles out-of-order responses)
 
@@ -143,6 +143,10 @@ archives of any size.
 ## ADR-NF-008: The Caller Names the Log and Model Folders, and Sets a Memory Size Limit
 
 - **[Full ADR](Companion/Decisions/Active/adr-nf-008-caller-named-locations-and-memory-size-limit.md)** — client-agnostic (no client modes): `--log-dir <abs>` start-up arg (logging starts before any message; default `~/.tabmail/logs`; `--log-dir=` form refused; `--log-level off|error|warn|info|debug`, default debug, `off` writes no log), `init` `modelDir` (default `~/.tabmail/models/all-MiniLM-L6-v2`; invalid = error response, stays pre-init), so a bundled copy (TabMail Voice) never shares the model `.tmp` download race or log rotation with Thunderbird's installed helper. Memory size limit (capability `memorySizeLimitV1`): optional `memoryIndexBatch` `maxBytes`, new writer `memoryTrim {maxBytes}` (no VACUUM: unbounded, removed in review), `memoryStats.usedBytes`; used size = (page_count - freelist_count) * page_size; oldest by dateMs then rowid removed from fts/meta/vec/ids together, each pass sized by estimated bytes (content length + `TRIM_ROW_OVERHEAD_BYTES`, scaled to used; row-count sizing over-removed when the oldest rows are largest); FTS5 `merge` steps reclaim removed rows' segment space before more rows go, started once negative after removing and continued positive so a write between calls never restarts it (secure-delete rejected: pages stay allocated); 20 s budget asked per row and per merge step, `withinLimit:false` continues next call; sqlite-vec 1024-row chunk overshoot recorded as accepted, owner decision pending. A caller naming `modelDir` never runs the ADR-NF-007 orphan clean-up.
+
+## ADR-NF-009: Clear Closes the Reader's Connection Before Deleting the Files, and Fails If It Cannot Delete
+
+- **[Full ADR](Companion/Decisions/Active/adr-nf-009-clear-closes-the-reader-before-deleting.md)** — Windows Clear All bug: the reader's open handle blocked deleting `fts.db` / `memory.db` (no `FILE_SHARE_DELETE`), the failure was a warning, every row stayed and `clear` / `memoryClear` answered ok. Now the reader's connections sit behind a `Mutex`; a clear locks one, closes the reader's handle, deletes `-wal`, `-shm`, then the database, recreates, reopens the reader, unlocks; reads wait. A failed delete is an error reply with both connections reopened and every row kept; a clear that cannot reopen leaves a stand-in each thread opens again at its next request (an `indexBatch` that still finds it answers an error, so no shard is cached that the database lacks; a stand-in is an empty name, never a missing one, which a non-UTF-8 path gives). `AtomicBool` reopen flags deleted. Rejected: in-place empty (reset/VACUUM or backup; changed every read), warning-to-error alone.
 
 ---
 

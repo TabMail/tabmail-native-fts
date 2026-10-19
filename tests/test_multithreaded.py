@@ -11,7 +11,8 @@ Tests verify:
   2. Reader thread handles search/stats/filterNewMessages correctly after init
   3. Writer thread handles indexBatch/removeBatch correctly after init
   4. Concurrent dispatch: interleaved read/write calls all return correct responses
-  5. Clear → reopen signaling: writer clears DB, reader sees empty results
+  5. Clear: writer deletes and recreates the DB files, reader sees empty results;
+     a clear that can't delete the files answers an error
   6. Memory operations work through the same dispatch
 
 Run:
@@ -24,11 +25,13 @@ Run:
 
 import json
 import os
+import queue
 import shutil
 import sqlite3
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -41,20 +44,37 @@ def _send_message(proc, message):
     proc.stdin.flush()
 
 
-def _read_message(proc, timeout_seconds=30):
+def _frames(proc):
+    """The helper's replies, read by a thread of their own: `select` takes no pipe on Windows."""
+    frames = getattr(proc, "_frames", None)
+    if frames is None:
+        frames = proc._frames = queue.Queue()
+
+        def pump():
+            try:
+                while True:
+                    raw_length = proc.stdout.read(4)
+                    if len(raw_length) < 4:
+                        break
+                    frames.put(proc.stdout.read(struct.unpack("=I", raw_length)[0]))
+            except (OSError, ValueError):
+                pass
+            frames.put(None)
+
+        threading.Thread(target=pump, daemon=True).start()
+    return frames
+
+
+def _read_message(proc, timeout_seconds=120):
     """Read a native messaging response. Raises on timeout or EOF."""
-    import select
-
-    # Use select for timeout on Unix
-    ready, _, _ = select.select([proc.stdout], [], [], timeout_seconds)
-    if not ready:
+    frames = _frames(proc)
+    try:
+        message_bytes = frames.get(timeout=timeout_seconds)
+    except queue.Empty:
         raise TimeoutError(f"No response within {timeout_seconds}s")
-
-    raw_length = proc.stdout.read(4)
-    if not raw_length:
+    if message_bytes is None:
+        frames.put(None)
         raise EOFError("Process closed stdout (EOF)")
-    message_length = struct.unpack("=I", raw_length)[0]
-    message_bytes = proc.stdout.read(message_length)
     return json.loads(message_bytes.decode("utf-8"))
 
 
@@ -319,8 +339,8 @@ class TestMultiThreadedDispatch(unittest.TestCase):
     # ------------------------------------------------------------------
     # Test 4: Clear → reader reopens connection
     # ------------------------------------------------------------------
-    def test_clear_reopen_signaling(self):
-        """After clear (writer), reader thread reopens its connection and sees empty DB."""
+    def test_reads_after_a_clear_see_the_empty_database(self):
+        """After clear (writer), the reader sees the empty database."""
         proc = self._start_process()
         try:
             self._hello_and_init(proc)
@@ -423,7 +443,7 @@ class TestMultiThreadedDispatch(unittest.TestCase):
     # Test 5: Memory clear → reader reopens memory connection
     # ------------------------------------------------------------------
     def test_memory_clear_reopen(self):
-        """memoryClear signals reader to reopen its memory connection."""
+        """After memoryClear, the reader sees the empty memory database."""
         proc = self._start_process()
         try:
             self._hello_and_init(proc)
@@ -464,8 +484,288 @@ class TestMultiThreadedDispatch(unittest.TestCase):
             self._stop_process(proc)
 
     # ------------------------------------------------------------------
+    # Clear deletes the files, or says it could not
+    # ------------------------------------------------------------------
+    CLEAR_CASES = {
+        "email": ("indexBatch", "clear", "dbPath", "stats", "search"),
+        "memory": ("memoryIndexBatch", "memoryClear", "memoryDbPath", "memoryStats", "memorySearch"),
+    }
+
+    def _clear_rows(self, kind, secret, prefix="clear", filler=True):
+        now = int(time.time() * 1000)
+        if kind == "memory":
+            return [{"memId": f"{prefix}-{i}", "role": "user", "content": f"{secret} {i}", "sessionId": "clear-session",
+                     "dateMs": now - i * 60_000, "turnIndex": i} for i in range(3)]
+        return [{"msgId": f"{prefix}-mail-{i}", "folderId": "account:/ClearTest", "subject": f"Subject {i}",
+                 "from_": f"sender{i}@example.com", "to_": "team@example.com", "body": f"{secret} {i}",
+                 "dateMs": now - i * 60_000, "hasAttachments": False} for i in range(3)] + (_filler_rows(prefix) if filler else [])
+
+    def _rpc(self, proc, method, params=None):
+        self._seq = getattr(self, "_seq", 0) + 1
+        _send_message(proc, {"id": f"q{self._seq}", "method": method, "params": params or {}})
+        resp = _read_message(proc)
+        self.assertEqual(resp.get("id"), f"q{self._seq}")
+        return resp
+
+    def _secret_in_files(self, db_path, secret):
+        files = [f for f in db_path.parent.iterdir() if f.name.startswith(db_path.name)]
+        return any(secret.encode("utf-8") in f.read_bytes() for f in files)
+
+    def _docs_after_restart(self, docs_method):
+        proc = self._start_process()
+        try:
+            self._hello_and_init(proc)
+            return self._rpc(proc, docs_method)["result"]["docs"]
+        finally:
+            self._stop_process(proc)
+
+    def _check_clear_deletes_the_files_while_the_reader_has_them_open(self, kind):
+        index_method, clear_method, path_key, docs_method, search_method = self.CLEAR_CASES[kind]
+        secret = "harbour invoice walrus"
+        rows = self._clear_rows(kind, secret)
+        proc = self._start_process()
+        try:
+            self.assertIn("result", self._rpc(proc, "hello", {"addonVersion": "1.3.0"}))
+            db_path = Path(self._rpc(proc, "init", {"profilePath": self.temp_dir})["result"][path_key])
+            self.assertEqual(self._rpc(proc, index_method, {"rows": rows})["result"]["count"], len(rows))
+            # The reader has read the files, so its connection holds them open.
+            found = self._rpc(proc, search_method, {"q": secret, "limit": 10, "ignoreDate": True})
+            self.assertTrue(found.get("result"), found)
+
+            self.assertEqual(self._rpc(proc, clear_method).get("result"), {"ok": True})
+            self.assertEqual(self._rpc(proc, docs_method)["result"]["docs"], 0)
+            self.assertEqual(self._rpc(proc, search_method, {"q": secret, "limit": 10, "ignoreDate": True}).get("result"), [])
+        finally:
+            self._stop_process(proc)
+        self.assertFalse(self._secret_in_files(db_path, secret), "cleared text is still in the database files")
+        self.assertEqual(self._docs_after_restart(docs_method), 0)
+
+    def test_clear_deletes_the_files_while_the_reader_has_them_open(self):
+        """On Windows an open connection stops a file from being deleted; clear must not leave the reader's open."""
+        self._check_clear_deletes_the_files_while_the_reader_has_them_open("email")
+
+    def test_memory_clear_deletes_the_files_while_the_reader_has_them_open(self):
+        self._check_clear_deletes_the_files_while_the_reader_has_them_open("memory")
+
+    def _check_clear_that_cannot_delete_answers_an_error_and_keeps_serving(self, kind):
+        if os.name == "nt":
+            self.skipTest("a read-only folder stands in for an undeletable file on macOS and Linux")
+        index_method, clear_method, path_key, docs_method, search_method = self.CLEAR_CASES[kind]
+        secret = "quarterly dentist reminder zebra"
+        rows = self._clear_rows(kind, secret)
+        proc = self._start_process()
+        folder = None
+        try:
+            self.assertIn("result", self._rpc(proc, "hello", {"addonVersion": "1.3.0"}))
+            db_path = Path(self._rpc(proc, "init", {"profilePath": self.temp_dir})["result"][path_key])
+            folder = db_path.parent
+            self.assertEqual(self._rpc(proc, index_method, {"rows": rows})["result"]["count"], len(rows))
+
+            os.chmod(folder, 0o500)
+            failed = self._rpc(proc, clear_method)
+            self.assertIn("error", failed, f"a clear that deleted nothing answered {failed}")
+            self.assertEqual(self._rpc(proc, docs_method)["result"]["docs"], len(rows))
+            kept = self._rpc(proc, search_method, {"q": secret, "limit": 10, "ignoreDate": True})
+            self.assertTrue(kept.get("result"), kept)
+            # Writes still go on after it (the folder is still read-only; the files are not).
+            later_secret = "lighthouse ferry quokka"
+            later = self._clear_rows(kind, later_secret, prefix="later", filler=False)
+            self.assertEqual(self._rpc(proc, index_method, {"rows": later})["result"]["count"], len(later))
+            self.assertEqual(self._rpc(proc, docs_method)["result"]["docs"], len(rows) + len(later))
+            if kind == "memory":
+                written = self._rpc(proc, search_method, {"q": later_secret, "limit": 10, "ignoreDate": True}).get("result")
+            else:
+                # Read back by id: the hybrid ranking can leave a few fresh rows out of a search.
+                written = self._rpc(proc, "getMessageByMsgId", {"msgId": later[0]["msgId"]}).get("result")
+            self.assertIn(later_secret, json.dumps(written))
+
+            os.chmod(folder, 0o700)
+            self.assertEqual(self._rpc(proc, clear_method).get("result"), {"ok": True})
+            self.assertEqual(self._rpc(proc, docs_method)["result"]["docs"], 0)
+        finally:
+            if folder is not None:
+                os.chmod(folder, 0o700)
+            self._stop_process(proc)
+        self.assertFalse(self._secret_in_files(db_path, secret), "cleared text is still in the database files")
+        self.assertEqual(self._docs_after_restart(docs_method), 0)
+
+    def test_clear_that_cannot_delete_answers_an_error_and_keeps_serving(self):
+        self._check_clear_that_cannot_delete_answers_an_error_and_keeps_serving("email")
+
+    def test_memory_clear_that_cannot_delete_answers_an_error_and_keeps_serving(self):
+        self._check_clear_that_cannot_delete_answers_an_error_and_keeps_serving("memory")
+
+    def _check_clear_that_cannot_reopen_recovers_once_it_can(self, kind):
+        """A clear that can neither delete nor open the files again answers an error, and so does a
+        write while they still can't be opened; once they can be, the next requests are served from
+        the database again, with no other clear and no restart: every row kept, and the write sent
+        again stored and read back, its rows in a year the database had none for included."""
+        if os.name == "nt":
+            self.skipTest("a read-only folder and an unreadable file stand in for the fault on macOS and Linux")
+        index_method, clear_method, path_key, docs_method, search_method = self.CLEAR_CASES[kind]
+        secret = "quarterly dentist reminder zebra"
+        rows = self._clear_rows(kind, secret)
+        proc = self._start_process()
+        folder = db_path = None
+        try:
+            self.assertIn("result", self._rpc(proc, "hello", {"addonVersion": "1.3.0"}))
+            db_path = Path(self._rpc(proc, "init", {"profilePath": self.temp_dir})["result"][path_key])
+            folder = db_path.parent
+            self.assertEqual(self._rpc(proc, index_method, {"rows": rows})["result"]["count"], len(rows))
+
+            os.chmod(folder, 0o500)
+            os.chmod(db_path, 0o000)
+            failed = self._rpc(proc, clear_method)
+            self.assertIn("error", failed, f"a clear that could not reopen answered {failed}")
+            # The fault is at the open: while the file cannot be opened, neither can a read or a write.
+            self.assertIn("error", self._rpc(proc, docs_method))
+            later_secret = "lighthouse ferry quokka"
+            later = self._clear_rows(kind, later_secret, prefix="later", filler=False)
+            if kind == "email":
+                # Dated in a year the database has no rows for (twenty years back from now).
+                later[0]["dateMs"] -= 20 * 366 * 24 * 3600 * 1000
+            self.assertIn("error", self._rpc(proc, index_method, {"rows": later}))
+
+            os.chmod(db_path, 0o600)
+            os.chmod(folder, 0o700)
+            # The same write first, then reads: each thread opens the database again at its next
+            # request.
+            self.assertEqual(self._rpc(proc, index_method, {"rows": later}).get("result", {}).get("count"), len(later))
+            self.assertEqual(self._rpc(proc, docs_method).get("result", {}).get("docs"), len(rows) + len(later))
+            kept = self._rpc(proc, search_method, {"q": secret, "limit": 10, "ignoreDate": True}).get("result")
+            # The email search marks the matched words, so its rows are known by id.
+            self.assertIn(secret if kind == "memory" else rows[0]["msgId"], json.dumps(kept))
+            if kind == "memory":
+                written = self._rpc(proc, search_method, {"q": later_secret, "limit": 10, "ignoreDate": True}).get("result")
+            else:
+                # Read back by id: the hybrid ranking can leave a few fresh rows out of a search.
+                written = self._rpc(proc, "getMessageByMsgId", {"msgId": later[0]["msgId"]}).get("result")
+            self.assertIn(later_secret, json.dumps(written))
+        finally:
+            if db_path is not None and db_path.exists():
+                os.chmod(db_path, 0o600)
+            if folder is not None:
+                os.chmod(folder, 0o700)
+            self._stop_process(proc)
+        self.assertEqual(self._docs_after_restart(docs_method), len(rows) + len(later))
+
+    def test_clear_that_cannot_reopen_recovers_once_it_can(self):
+        self._check_clear_that_cannot_reopen_recovers_once_it_can("email")
+
+    def test_memory_clear_that_cannot_reopen_recovers_once_it_can(self):
+        self._check_clear_that_cannot_reopen_recovers_once_it_can("memory")
+
+    def test_reads_sent_around_a_clear_never_fail(self):
+        """Reads pipelined before and after clear / memoryClear each answer once, never an error, with
+        either the state before the clear or the cleared one; both clears answer ok."""
+        proc = self._start_process()
+        try:
+            self._hello_and_init(proc)
+            now = int(time.time() * 1000)
+            year_ms = 366 * 24 * 3600 * 1000
+            for r in range(5):
+                rows = [
+                    {"msgId": f"r{r}-{y}-{i}", "folderId": "account:/ClearTest", "subject": f"Subject {i}",
+                     "from_": "sender@example.com", "to_": "team@example.com", "body": f"walrus {i}",
+                     "dateMs": now - y * year_ms, "hasAttachments": False}
+                    for y in range(1, 9) for i in range(20)
+                ]
+                _send_message(proc, {"id": f"i{r}", "method": "indexBatch", "params": {"rows": rows}})
+                self.assertIn("result", _read_message(proc))
+                mem = [{"memId": f"r{r}-m{i}", "role": "user", "content": f"zebra {i}", "sessionId": "s",
+                        "dateMs": now - i, "turnIndex": i} for i in range(50)]
+                _send_message(proc, {"id": f"m{r}", "method": "memoryIndexBatch", "params": {"rows": mem}})
+                self.assertIn("result", _read_message(proc))
+
+                # This round's rows, and the reads' answers to them, before the clear.
+                states = {"stats": (len(rows), 0), "memoryStats": (len(mem), 0)}
+                reads = [("stats", None), ("search", {"q": "walrus 3", "limit": 5, "ignoreDate": True}),
+                         ("memoryStats", None), ("memorySearch", {"q": "zebra"})]
+                for m, prm in reads:
+                    result = self._rpc(proc, m, prm)["result"]
+                    if m in states:
+                        self.assertEqual(result["docs"], states[m][0], m)
+                    else:
+                        self.assertTrue(result, f"{m} found none of this round's rows")
+
+                sent = {}
+                def send(method, params=None):
+                    message_id = f"r{r}-{len(sent)}"
+                    sent[message_id] = method
+                    _send_message(proc, {"id": message_id, "method": method, "params": params or {}})
+                for _ in range(5):
+                    for m, prm in reads:
+                        send(m, prm)
+                send("clear")
+                send("memoryClear")
+                for _ in range(100):
+                    for m, prm in reads:
+                        send(m, prm)
+                answered = []
+                for _ in sent:
+                    resp = _read_message(proc)
+                    answered.append(resp.get("id"))
+                    method = sent.get(resp.get("id"))
+                    self.assertNotIn("error", resp, method)
+                    result = resp["result"]
+                    if method in ("clear", "memoryClear"):
+                        self.assertEqual(result, {"ok": True})
+                    elif method in states:
+                        self.assertIn(result["docs"], states[method], method)
+                    else:
+                        key = "uniqueId" if method == "search" else "memId"
+                        self.assertTrue(all(hit[key].startswith(f"r{r}-") for hit in result), f"{method} answered {result}")
+                self.assertEqual(sorted(answered), sorted(sent))
+                # Cleared.
+                for m in states:
+                    self.assertEqual(self._rpc(proc, m)["result"]["docs"], 0, m)
+        finally:
+            self._stop_process(proc)
+
+    # ------------------------------------------------------------------
     # Test 6: Unknown method returns error
     # ------------------------------------------------------------------
+    def test_an_exit_while_writes_are_queued_leaves_no_log_files(self):
+        """Thunderbird closing the port (quit, add-on update) while indexing: the helper answers what
+        it was sent and exits, and its last close of each database removes that database's -wal and
+        -shm, as before the reader's connections were shared for a clear. A read-only connection
+        closing last can't checkpoint, so it leaves both logs behind."""
+        now = int(time.time() * 1000)
+        day = 86_400_000
+        proc = self._start_process()
+        try:
+            self._hello_and_init(proc)
+            self.assertIn("result", self._rpc(proc, "indexBatch", {"rows": _filler_rows("exit")}))
+            memory = [{"memId": f"exit-turn-{i}", "role": "user", "content": f"Exit question {i}", "sessionId": "exit-session",
+                       "dateMs": now - i * day, "turnIndex": i} for i in range(10)]
+            self.assertIn("result", self._rpc(proc, "memoryIndexBatch", {"rows": memory}))
+            self.assertIn("result", self._rpc(proc, "search", {"q": "Sandwich", "limit": 10, "ignoreDate": True}))
+
+            # Enough writes that the writer is still busy when stdin closes.
+            queued = []
+            for batch in range(5):
+                rows = [{"msgId": f"exit-queued-{batch}-{i}", "subject": f"Queued {batch} {i}", "from_": "sender@example.com",
+                         "to_": "team@example.com", "body": "Queued message text " * 20, "dateMs": now - i * day,
+                         "hasAttachments": False} for i in range(200)]
+                queued.append(f"exit-queued-{batch}")
+                _send_message(proc, {"id": queued[-1], "method": "indexBatch", "params": {"rows": rows}})
+            proc.stdin.close()
+
+            answered = []
+            while True:
+                try:
+                    answered.append(_read_message(proc))
+                except EOFError:
+                    break
+            self.assertEqual(proc.wait(timeout=120), 0)
+        finally:
+            self._stop_process(proc)
+        self.assertEqual(sorted(reply["id"] for reply in answered), queued)
+        self.assertTrue(all("result" in reply for reply in answered), answered)
+        folder = Path(self.temp_dir) / "tabmail_fts"
+        self.assertTrue((folder / "fts.db").exists() and (folder / "memory.db").exists())
+        self.assertEqual(sorted(f.name for f in folder.iterdir() if f.name.endswith(("-wal", "-shm"))), [])
+
     def test_unknown_method_returns_error(self):
         """Unknown methods return an error response (main thread handles this)."""
         proc = self._start_process()

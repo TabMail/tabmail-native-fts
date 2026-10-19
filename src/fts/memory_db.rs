@@ -1035,23 +1035,31 @@ pub fn rebuild_memory_embeddings_batch(
 }
 
 /// Clear and rebuild memory database.
-/// Takes ownership of the connection, returns a new one after rebuild.
-/// Caller must signal the reader thread to reopen its read-only connection.
-pub fn memory_clear_rebuild_standalone(db_path: &Path, conn: Connection) -> anyhow::Result<Connection> {
+/// Takes ownership of the writer's connection to close it. The caller must have closed every
+/// other connection to the file first (the reader's): Windows refuses to delete an open file.
+/// Returns the writer's new connection and whether the files were deleted. When they were not,
+/// the new connection is to the old database with every row still in it.
+pub fn memory_clear_rebuild_standalone(db_path: &Path, conn: Connection) -> anyhow::Result<(Connection, anyhow::Result<()>)> {
     log::info!("Clearing memory database by deleting database file (rebuild from scratch)");
     drop(conn);
     log::info!("Memory database connection closed");
 
-    delete_file_if_exists(db_path)?;
-    delete_file_if_exists(&PathBuf::from(format!("{}-wal", db_path.display())))?;
-    delete_file_if_exists(&PathBuf::from(format!("{}-shm", db_path.display())))?;
+    let deleted = super::db::delete_database_files(db_path);
 
     log::info!("Recreating memory database...");
-    let new_conn = Connection::open(db_path)?;
-    super::db::ensure_fts5_available(&new_conn)?;
-    init_memory_database(&new_conn)?;
+    let new_conn = open_memory_writer_connection(db_path)?;
     log::info!("Memory database recreated and initialized successfully");
-    Ok(new_conn)
+    Ok((new_conn, deleted))
+}
+
+/// The writer's connection to the memory database at `db_path`, created empty when the file is
+/// not there: what memoryClear opens after deleting the files, and what the writer opens again
+/// when a memoryClear failed before it could.
+pub fn open_memory_writer_connection(db_path: &Path) -> anyhow::Result<Connection> {
+    let conn = Connection::open(db_path)?;
+    super::db::ensure_fts5_available(&conn)?;
+    init_memory_database(&conn)?;
+    Ok(conn)
 }
 
 /// Read memory entries around a given timestamp (±tolerance_ms)
@@ -1139,16 +1147,6 @@ pub fn memory_debug_sample(conn: &Connection) -> anyhow::Result<Vec<Value>> {
         }));
     }
     Ok(out)
-}
-
-fn delete_file_if_exists(p: &Path) -> anyhow::Result<()> {
-    if p.exists() {
-        match std::fs::remove_file(p) {
-            Ok(_) => log::info!("Deleted {}", p.display()),
-            Err(e) => log::warn!("Failed to delete {}: {}", p.display(), e),
-        }
-    }
-    Ok(())
 }
 
 fn truncate_for_log(s: &str) -> String {
