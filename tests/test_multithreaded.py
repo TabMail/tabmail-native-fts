@@ -725,6 +725,47 @@ class TestMultiThreadedDispatch(unittest.TestCase):
     # ------------------------------------------------------------------
     # Test 6: Unknown method returns error
     # ------------------------------------------------------------------
+    def test_an_exit_while_writes_are_queued_leaves_no_log_files(self):
+        """Thunderbird closing the port (quit, add-on update) while indexing: the helper answers what
+        it was sent and exits, and its last close of each database removes that database's -wal and
+        -shm, as before the reader's connections were shared for a clear. A read-only connection
+        closing last can't checkpoint, so it leaves both logs behind."""
+        now = int(time.time() * 1000)
+        day = 86_400_000
+        proc = self._start_process()
+        try:
+            self._hello_and_init(proc)
+            self.assertIn("result", self._rpc(proc, "indexBatch", {"rows": _filler_rows("exit")}))
+            memory = [{"memId": f"exit-turn-{i}", "role": "user", "content": f"Exit question {i}", "sessionId": "exit-session",
+                       "dateMs": now - i * day, "turnIndex": i} for i in range(10)]
+            self.assertIn("result", self._rpc(proc, "memoryIndexBatch", {"rows": memory}))
+            self.assertIn("result", self._rpc(proc, "search", {"q": "Sandwich", "limit": 10, "ignoreDate": True}))
+
+            # Enough writes that the writer is still busy when stdin closes.
+            queued = []
+            for batch in range(5):
+                rows = [{"msgId": f"exit-queued-{batch}-{i}", "subject": f"Queued {batch} {i}", "from_": "sender@example.com",
+                         "to_": "team@example.com", "body": "Queued message text " * 20, "dateMs": now - i * day,
+                         "hasAttachments": False} for i in range(200)]
+                queued.append(f"exit-queued-{batch}")
+                _send_message(proc, {"id": queued[-1], "method": "indexBatch", "params": {"rows": rows}})
+            proc.stdin.close()
+
+            answered = []
+            while True:
+                try:
+                    answered.append(_read_message(proc))
+                except EOFError:
+                    break
+            self.assertEqual(proc.wait(timeout=120), 0)
+        finally:
+            self._stop_process(proc)
+        self.assertEqual(sorted(reply["id"] for reply in answered), queued)
+        self.assertTrue(all("result" in reply for reply in answered), answered)
+        folder = Path(self.temp_dir) / "tabmail_fts"
+        self.assertTrue((folder / "fts.db").exists() and (folder / "memory.db").exists())
+        self.assertEqual(sorted(f.name for f in folder.iterdir() if f.name.endswith(("-wal", "-shm"))), [])
+
     def test_unknown_method_returns_error(self):
         """Unknown methods return an error response (main thread handles this)."""
         proc = self._start_process()

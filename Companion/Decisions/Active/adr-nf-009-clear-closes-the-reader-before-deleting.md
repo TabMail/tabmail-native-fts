@@ -89,7 +89,10 @@ connection open the whole time and reopened it at its next request (an `AtomicBo
   reader's connection open leaves no cleared text in any file and none after a restart (email and
   memory; red on Windows only); reads pipelined around clears each answer once, never an error, with
   the state before the clear or the cleared one, and both clears answer ok (red with stats
-  answering a wrong count once cleared).
+  answering a wrong count once cleared); an exit while writes are queued answers every request and
+  leaves no `-wal` or `-shm` next to either database (red with the main thread keeping its copies
+  of the reader's connections, and with the writer closing its own connections before its copies of
+  the reader's: a read-only connection closing last can't checkpoint).
 - `src/main.rs` unit tests: a stand-in is opened again once its database can be, and a connection to
   the database is never replaced; a clear that deleted the files but could not create the database
   answers an error, and so does a write while it still can't be; once it can be created that write
