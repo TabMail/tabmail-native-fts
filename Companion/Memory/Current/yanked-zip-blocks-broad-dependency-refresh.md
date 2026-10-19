@@ -7,3 +7,5 @@ RustSec then published [RUSTSEC-2026-0367](https://rustsec.org/advisories/RUSTSE
 No archive-extraction calls were found in TabMail's native source or Candle 0.8.4. The embedding engine loads safetensors; Candle's Zip readers serve its unused pickle/NumPy loaders. This is a reachability assessment, not an advisory exemption: retain the findings in audit reports and recheck if model-loading paths change.
 
 The independent Rustls 0.23.46 security update changes only its lockfile version and checksum and clears RUSTSEC-2026-0346 through 0349. All 106 native unit tests pass before and after that update.
+
+**2026-10-19, resolved by ADR-NF-010:** candle-core 0.8.4 is vendored in `vendor/candle-core` and moved to Zip 9.0.5, so `cargo audit` reports no vulnerabilities; the Paste unmaintained warning remains. Native FTS 0.11.7 (released 2026-10-19 for the Windows Clear All fix) still carries Zip 1.1.4, unreachable as above; the next release carries the vendored copy. See [ADR-NF-010](../../Decisions/Active/adr-nf-010-vendored-candle-core-on-zip-9.md).

@@ -148,6 +148,10 @@ archives of any size.
 
 - **[Full ADR](Companion/Decisions/Active/adr-nf-009-clear-closes-the-reader-before-deleting.md)** — Windows Clear All bug: the reader's open handle blocked deleting `fts.db` / `memory.db` (no `FILE_SHARE_DELETE`), the failure was a warning, every row stayed and `clear` / `memoryClear` answered ok. Now the reader's connections sit behind a `Mutex`; a clear locks one, closes the reader's handle, deletes `-wal`, `-shm`, then the database, recreates, reopens the reader, unlocks; reads wait. A failed delete is an error reply with both connections reopened and every row kept; a clear that cannot reopen leaves a stand-in each thread opens again at its next request (an `indexBatch` that still finds it answers an error, so no shard is cached that the database lacks; a stand-in is an empty name, never a missing one, which a non-UTF-8 path gives). `AtomicBool` reopen flags deleted. Rejected: in-place empty (reset/VACUUM or backup; changed every read), warning-to-error alone.
 
+## ADR-NF-010: Candle-core 0.8.4 Is Vendored and Moved to Zip 9
+
+- **[Full ADR](Companion/Decisions/Active/adr-nf-010-vendored-candle-core-on-zip-9.md)** — `cargo audit` RUSTSEC-2026-0367/0368/0369 (Zip < 9 archive extraction: permission bits, symlinks) reached the helper only through candle-core 0.8.4's `zip ^1.1.1` (unreachable: no `.npz`/`.pth` loading, safetensors only). No candle release uses Zip 9 (0.11 = Zip 8, and a new engine), so `vendor/candle-core` (crates.io 0.8.4, LICENSE kept, `TABMAIL-PATCHES.md`, per-file notices) is used via `[patch.crates-io]` with zip 9.0.5, entry `name()` `Result` passed on (upstream huggingface/candle#4041), elided lifetimes written out; its own Cargo.lock left out (dependency scanners). Remove once a candle release with Zip >= 9 is adopted. Builders on their own computer: `RUSTFLAGS=--remap-path-prefix=$HOME=~` (home folder / user name in binary paths; CI runners need none; `trim-paths` unstable). Paste unmaintained warning (gemm, compile time) remains.
+
 ---
 
 ## Template for New Decisions

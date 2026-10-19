@@ -97,4 +97,4 @@ Native messaging host for full-text search + semantic search. Communicates with 
 - FTS5 `CREATE VIRTUAL TABLE` is auto-commit — must be called outside explicit transactions
 - FTS5 shadow tables (`messages_fts_2024_content`, `_data`, etc.) also appear in `sqlite_master` — `load_known_years` uses `.parse::<i32>()` filter to ignore them
 
-- 2026-10-16: Candle’s Zip major constraint leaves three new extraction advisories open; Zip 1.x was un-yanked after the initial resolver failure. Targeted Rustls 0.23.46 clears its four advisories. See [Candle/Zip maintenance and security constraint](Companion/Memory/Current/yanked-zip-blocks-broad-dependency-refresh.md).
+- 2026-10-16: Candle’s Zip major constraint leaves three new extraction advisories open; Zip 1.x was un-yanked after the initial resolver failure. Targeted Rustls 0.23.46 clears its four advisories. See [Candle/Zip maintenance and security constraint](Companion/Memory/Current/yanked-zip-blocks-broad-dependency-refresh.md). 2026-10-19: resolved by vendoring candle-core 0.8.4 on Zip 9 (ADR-NF-010, `vendor/candle-core`, `[patch.crates-io]`); audit clean but Paste; 0.11.7 still has Zip 1.1.4.
