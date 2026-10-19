@@ -614,6 +614,36 @@ class TestMultiThreadedDispatch(unittest.TestCase):
             self._stop_process(proc)
         self.assertEqual([log.name for log in logs if log.exists()], [])
 
+    def test_an_exit_with_reads_still_queued_leaves_no_log_files(self):
+        """Input closing while reads are still queued: the reader finishes after an idle writer would
+        have, yet every read is answered and no -wal or -shm is left, since the writer still closes last."""
+        proc = self._start_process()
+        reads = 300
+        try:
+            self.assertIn("result", self._rpc(proc, "hello", {"addonVersion": "1.3.0"}))
+            init = self._rpc(proc, "init", {"profilePath": self.temp_dir})["result"]
+            for kind in ("email", "memory"):
+                index_method = self.CLEAR_CASES[kind][0]
+                rows = self._clear_rows(kind, "harbour invoice walrus")
+                self.assertEqual(self._rpc(proc, index_method, {"rows": rows})["result"]["count"], len(rows))
+            db_paths = [Path(init["dbPath"]), Path(init["memoryDbPath"])]
+            logs = [Path(f"{db}{suffix}") for db in db_paths for suffix in ("-wal", "-shm")]
+            self.assertTrue(any(log.exists() for log in logs), "the log files were never written")
+            for i in range(reads):
+                _send_message(proc, {"id": f"q{i}", "method": "search",
+                                     "params": {"q": "harbour", "limit": 50, "ignoreDate": True}})
+            # The helper exits on its own once input closes; wait well past _stop_process's kill.
+            proc.stdin.close()
+            proc.wait(timeout=300)
+            answered = 0
+            while _frames(proc).get(timeout=30) is not None:
+                answered += 1
+        finally:
+            self._stop_process(proc)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(answered, reads)
+        self.assertEqual([log.name for log in logs if log.exists()], [])
+
     def test_reads_sent_around_a_clear_never_fail(self):
         """Reads pipelined before and after clear / memoryClear answer the old or the cleared state, never an error."""
         proc = self._start_process()

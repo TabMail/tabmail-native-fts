@@ -35,9 +35,10 @@ connection open the whole time and reopened it at its next request (an `AtomicBo
    on the file still there, every row kept and searchable, and writes go on; for `clear`,
    `known_years` is emptied either way (a shard still there is only verified again).
 5. At a clean exit the writer's connections close last, after the reader's (the reader's are dropped
-   first), so SQLite's last close checkpoints and removes each `-wal` and `-shm` as before: a
-   read-only connection cannot checkpoint, and sharing the reader's connections must not make it the
-   last to close.
+   first), and the reader finishes before the writer is told to stop, so SQLite's last close
+   checkpoints and removes each `-wal` and `-shm`: a read-only connection cannot checkpoint, and
+   sharing the reader's connections must not make it the last to close. This is new: the base left
+   the memory logs after an idle exit, and every log when reads were still queued at exit.
 6. Wire protocol, schema, pragmas and the delete-and-recreate approach are unchanged.
 
 ## Rejected

@@ -1460,8 +1460,8 @@ pub fn rebuild_embeddings_batch(
 /// Takes ownership of the writer's connection to close it. The caller must have closed every
 /// other connection to the file first (the reader's): Windows refuses to delete an open file.
 /// Returns the writer's new connection and whether the files were deleted. When they were not,
-/// the new connection is to the old database with every row still in it, and the caller must
-/// keep known_years.
+/// the new connection is to the old database with every row still in it. The caller empties
+/// known_years either way: a shard still there is only verified again.
 pub fn clear_rebuild_standalone(db_path: &Path, conn: Connection) -> anyhow::Result<(Connection, anyhow::Result<()>)> {
     log::info!("Clearing email FTS by deleting database file (rebuild from scratch)");
     drop(conn);
