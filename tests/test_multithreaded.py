@@ -339,7 +339,7 @@ class TestMultiThreadedDispatch(unittest.TestCase):
     # ------------------------------------------------------------------
     # Test 4: Clear → reader reopens connection
     # ------------------------------------------------------------------
-    def test_clear_reopen_signaling(self):
+    def test_reads_after_a_clear_see_the_empty_database(self):
         """After clear (writer), the reader sees the empty database."""
         proc = self._start_process()
         try:

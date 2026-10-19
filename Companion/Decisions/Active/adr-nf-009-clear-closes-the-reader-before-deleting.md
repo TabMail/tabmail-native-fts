@@ -37,8 +37,11 @@ connection open the whole time and reopened it at its next request (an `AtomicBo
 5. A clear that fails after closing a connection (the files could not be opened again) leaves an
    in-memory stand-in in its place. The reader before each read, and the writer before each write,
    open the database again in place of a stand-in, so service resumes once the files can be opened,
-   without another clear or a restart; nothing is deleted then, so rows written since stay.
-   `known_years` is emptied before the clear closes anything.
+   without another clear or a restart; nothing is deleted then, so rows written since stay. A
+   clear that deleted the files but could not create the database again leaves nothing to open:
+   reads answer errors until the next write (the writer creates it), a retried clear or a restart.
+   `known_years` is emptied before the clear closes anything, so that next write creates every
+   shard it needs (unit test `writes_go_on_after_a_clear_that_deleted_the_files_but_could_not_create_them`).
 6. Exit is unchanged: the main thread drops its copies of the reader's connections once the threads
    start (sharing them must not keep them open until it returns), and both threads are told to stop
    together, as before.
@@ -73,7 +76,9 @@ connection open the whole time and reopened it at its next request (an `AtomicBo
   after a restart lost (email and memory; red with either thread's reopen removed); a clear with the
   reader's connection open leaves no cleared text in any file and none after a restart (email and
   memory; red on Windows only); reads pipelined around clears never fail.
-- `src/main.rs` unit test: a stand-in is opened again once its database can be, and a connection to
-  the database is never replaced.
+- `src/main.rs` unit tests: a stand-in is opened again once its database can be, and a connection to
+  the database is never replaced; a clear that deleted the files but could not create the database
+  answers an error, and once it can be created the next write stores rows dated in a year the
+  cleared database had a shard for (red with `known_years` emptied after the rebuild instead).
 - Differential run of Thunderbird 1.9.1's request shapes (1,161 requests) against the previous
   build: identical answers.

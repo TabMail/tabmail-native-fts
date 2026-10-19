@@ -144,6 +144,10 @@ archives of any size.
 
 - **[Full ADR](Companion/Decisions/Active/adr-nf-008-caller-named-locations-and-memory-size-limit.md)** — client-agnostic (no client modes): `--log-dir <abs>` start-up arg (logging starts before any message; default `~/.tabmail/logs`; `--log-dir=` form refused; `--log-level off|error|warn|info|debug`, default debug, `off` writes no log), `init` `modelDir` (default `~/.tabmail/models/all-MiniLM-L6-v2`; invalid = error response, stays pre-init), so a bundled copy (TabMail Voice) never shares the model `.tmp` download race or log rotation with Thunderbird's installed helper. Memory size limit (capability `memorySizeLimitV1`): optional `memoryIndexBatch` `maxBytes`, new writer `memoryTrim {maxBytes}` (no VACUUM: unbounded, removed in review), `memoryStats.usedBytes`; used size = (page_count - freelist_count) * page_size; oldest by dateMs then rowid removed from fts/meta/vec/ids together, each pass sized by estimated bytes (content length + `TRIM_ROW_OVERHEAD_BYTES`, scaled to used; row-count sizing over-removed when the oldest rows are largest); FTS5 `merge` steps reclaim removed rows' segment space before more rows go, started once negative after removing and continued positive so a write between calls never restarts it (secure-delete rejected: pages stay allocated); 20 s budget asked per row and per merge step, `withinLimit:false` continues next call; sqlite-vec 1024-row chunk overshoot recorded as accepted, owner decision pending. A caller naming `modelDir` never runs the ADR-NF-007 orphan clean-up.
 
+## ADR-NF-009: Clear Closes the Reader's Connection Before Deleting the Files, and Fails If It Cannot Delete
+
+- **[Full ADR](Companion/Decisions/Active/adr-nf-009-clear-closes-the-reader-before-deleting.md)** — Windows Clear All bug: the reader's open handle blocked deleting `fts.db` / `memory.db` (no `FILE_SHARE_DELETE`), the failure was a warning, every row stayed and `clear` / `memoryClear` answered ok. Now the reader's connections sit behind a `Mutex`; a clear locks one, closes the reader's handle, deletes `-wal`, `-shm`, then the database, recreates, reopens the reader, unlocks; reads wait. A failed delete is an error reply with both connections reopened and every row kept; a clear that cannot reopen leaves a stand-in each thread opens again at its next request. `AtomicBool` reopen flags deleted. Rejected: in-place empty (reset/VACUUM or backup; changed every read), warning-to-error alone.
+
 ---
 
 ## Template for New Decisions
@@ -160,9 +164,3 @@ archives of any size.
 **Consequences:**
 - [Trade-offs, both positive and negative]
 ```
-
----
-
-## ADR-NF-009: Clear Closes the Reader's Connection Before Deleting the Files, and Fails If It Cannot Delete
-
-- **[Full ADR](Companion/Decisions/Active/adr-nf-009-clear-closes-the-reader-before-deleting.md)** — Windows Clear All bug: the reader's open handle blocked deleting `fts.db` / `memory.db` (no `FILE_SHARE_DELETE`), the failure was a warning, every row stayed and `clear` / `memoryClear` answered ok. Now the reader's connections sit behind a `Mutex`; a clear locks one, closes the reader's handle, deletes `-wal`, `-shm`, then the database, recreates, reopens the reader, unlocks; reads wait. A failed delete is an error reply with both connections reopened and every row kept; a clear that cannot reopen leaves a stand-in each thread opens again at its next request. `AtomicBool` reopen flags deleted. Rejected: in-place empty (reset/VACUUM or backup; changed every read), warning-to-error alone.

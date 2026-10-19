@@ -378,7 +378,8 @@ fn is_stand_in(conn: &Connection) -> bool {
 /// Opens the database again in place of a stand-in that a failed clear left (`open` failed, the
 /// files couldn't be opened), so the first request after the fault ends is served from the
 /// database. It never deletes anything: rows written since stay. Failing, it is tried again at
-/// the next request.
+/// the next request. When the clear deleted the files but couldn't create them, only the writer's
+/// open creates the database: reads fail until the next write.
 fn reopen_stand_in(conn: &mut Connection, what: &str, open: impl FnOnce() -> anyhow::Result<Connection>) {
     if !is_stand_in(conn) {
         return;
@@ -2377,6 +2378,46 @@ mod tests {
         assert!(!opened, "a connection to the database was opened again");
         assert!(!is_stand_in(&conn));
         drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A clear that deleted the files but could not create the database again (here its folder is
+    /// gone) answers an error. Once the database can be created, the next write stores rows dated
+    /// in a year the cleared database had a shard for.
+    #[test]
+    fn writes_go_on_after_a_clear_that_deleted_the_files_but_could_not_create_them() {
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+        let dir = std::env::temp_dir().join(format!("tabmail-fts-recreate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (db, memory_db) = (dir.join("fts.db"), dir.join("memory.db"));
+        // Any year works; the date is relative to now.
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let date_ms = now_ms - 400 * 24 * 3600 * 1000;
+        let row = |id: &str| serde_json::json!({"msgId": id, "subject": "s", "body": "b", "dateMs": date_ms, "hasAttachments": false});
+
+        let mut email = Connection::open_in_memory().unwrap();
+        crate::fts::db::init_database(&email).unwrap();
+        let mut known_years = HashSet::new();
+        crate::fts::db::index_batch(&mut email, &[row("old")], None, &mut known_years).unwrap();
+        assert!(!known_years.is_empty());
+        let mut memory = Connection::open_in_memory().unwrap();
+        let reader_email = Mutex::new(Connection::open_in_memory().unwrap());
+        let reader_memory = Mutex::new(Connection::open_in_memory().unwrap());
+
+        let cleared = handle_write_request(&mut email, &mut memory, &mut known_years, &db, &memory_db, None,
+            &reader_email, &reader_memory, "clear", "c", &serde_json::json!({}));
+        assert!(cleared.is_err(), "a clear that could not create the database answered {cleared:?}");
+
+        std::fs::create_dir_all(&dir).unwrap();
+        reopen_stand_in(&mut email, "test", || crate::fts::db::open_writer_connection(&db));
+        let written = handle_write_request(&mut email, &mut memory, &mut known_years, &db, &memory_db, None,
+            &reader_email, &reader_memory, "indexBatch", "w", &serde_json::json!({"rows": [row("new")]}));
+        assert_eq!(written.expect("write after the fault ended")["result"]["count"], 1);
+        drop(email);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
