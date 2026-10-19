@@ -765,6 +765,9 @@ fn handle_write_request(
 ) -> anyhow::Result<Value> {
     match method {
         "indexBatch" => {
+            // Not into a failed clear's stand-in: the shards it would create there are remembered
+            // as made, and the database would lack them once it opens again.
+            anyhow::ensure!(!is_stand_in(email_conn), "the database could not be opened after a failed clear");
             let rows = params
                 .get("rows")
                 .and_then(|v| v.as_array())
@@ -2382,8 +2385,8 @@ mod tests {
     }
 
     /// A clear that deleted the files but could not create the database again (here its folder is
-    /// gone) answers an error. Once the database can be created, the next write stores rows dated
-    /// in a year the cleared database had a shard for.
+    /// gone) answers an error, and so does a write while it still can't be. Once the database can
+    /// be created, that write stores its rows, dated in a year the cleared database had a shard for.
     #[test]
     fn writes_go_on_after_a_clear_that_deleted_the_files_but_could_not_create_them() {
         unsafe {
@@ -2411,6 +2414,10 @@ mod tests {
         let cleared = handle_write_request(&mut email, &mut memory, &mut known_years, &db, &memory_db, None,
             &reader_email, &reader_memory, "clear", "c", &serde_json::json!({}));
         assert!(cleared.is_err(), "a clear that could not create the database answered {cleared:?}");
+        reopen_stand_in(&mut email, "test", || crate::fts::db::open_writer_connection(&db));
+        let refused = handle_write_request(&mut email, &mut memory, &mut known_years, &db, &memory_db, None,
+            &reader_email, &reader_memory, "indexBatch", "r", &serde_json::json!({"rows": [row("new")]}));
+        assert!(refused.is_err(), "a write with no database to go to answered {refused:?}");
 
         std::fs::create_dir_all(&dir).unwrap();
         reopen_stand_in(&mut email, "test", || crate::fts::db::open_writer_connection(&db));

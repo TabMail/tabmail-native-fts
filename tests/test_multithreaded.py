@@ -596,9 +596,10 @@ class TestMultiThreadedDispatch(unittest.TestCase):
         self._check_clear_that_cannot_delete_answers_an_error_and_keeps_serving("memory")
 
     def _check_clear_that_cannot_reopen_recovers_once_it_can(self, kind):
-        """A clear that can neither delete nor open the files again answers an error; once they can be
-        opened, the next requests are served from the database again, with no other clear and no
-        restart: every row kept, and rows written after it stored and read back."""
+        """A clear that can neither delete nor open the files again answers an error, and so does a
+        write while they still can't be opened; once they can be, the next requests are served from
+        the database again, with no other clear and no restart: every row kept, and the write sent
+        again stored and read back, its rows in a year the database had none for included."""
         if os.name == "nt":
             self.skipTest("a read-only folder and an unreadable file stand in for the fault on macOS and Linux")
         index_method, clear_method, path_key, docs_method, search_method = self.CLEAR_CASES[kind]
@@ -616,14 +617,19 @@ class TestMultiThreadedDispatch(unittest.TestCase):
             os.chmod(db_path, 0o000)
             failed = self._rpc(proc, clear_method)
             self.assertIn("error", failed, f"a clear that could not reopen answered {failed}")
-            # The fault is at the open: while the file cannot be opened, neither can a read.
+            # The fault is at the open: while the file cannot be opened, neither can a read or a write.
             self.assertIn("error", self._rpc(proc, docs_method))
+            later_secret = "lighthouse ferry quokka"
+            later = self._clear_rows(kind, later_secret, prefix="later", filler=False)
+            if kind == "email":
+                # Dated in a year the database has no rows for (twenty years back from now).
+                later[0]["dateMs"] -= 20 * 366 * 24 * 3600 * 1000
+            self.assertIn("error", self._rpc(proc, index_method, {"rows": later}))
 
             os.chmod(db_path, 0o600)
             os.chmod(folder, 0o700)
-            # A write first, then reads: each thread opens the database again at its next request.
-            later_secret = "lighthouse ferry quokka"
-            later = self._clear_rows(kind, later_secret, prefix="later", filler=False)
+            # The same write first, then reads: each thread opens the database again at its next
+            # request.
             self.assertEqual(self._rpc(proc, index_method, {"rows": later}).get("result", {}).get("count"), len(later))
             self.assertEqual(self._rpc(proc, docs_method).get("result", {}).get("docs"), len(rows) + len(later))
             kept = self._rpc(proc, search_method, {"q": secret, "limit": 10, "ignoreDate": True}).get("result")
@@ -650,13 +656,13 @@ class TestMultiThreadedDispatch(unittest.TestCase):
         self._check_clear_that_cannot_reopen_recovers_once_it_can("memory")
 
     def test_reads_sent_around_a_clear_never_fail(self):
-        """Reads pipelined before and after clear / memoryClear answer the old or the cleared state, never an error."""
+        """Reads pipelined before and after clear / memoryClear each answer once, never an error, with
+        either the state before the clear or the cleared one; both clears answer ok."""
         proc = self._start_process()
         try:
             self._hello_and_init(proc)
             now = int(time.time() * 1000)
             year_ms = 366 * 24 * 3600 * 1000
-            errors = []
             for r in range(5):
                 rows = [
                     {"msgId": f"r{r}-{y}-{i}", "folderId": "account:/ClearTest", "subject": f"Subject {i}",
@@ -671,12 +677,22 @@ class TestMultiThreadedDispatch(unittest.TestCase):
                 _send_message(proc, {"id": f"m{r}", "method": "memoryIndexBatch", "params": {"rows": mem}})
                 self.assertIn("result", _read_message(proc))
 
-                sent = []
-                def send(method, params=None):
-                    sent.append(f"r{r}-{len(sent)}")
-                    _send_message(proc, {"id": sent[-1], "method": method, "params": params or {}})
-                reads = [("stats", None), ("search", {"q": "walrus", "limit": 5, "ignoreDate": True}),
+                # This round's rows, and the reads' answers to them, before the clear.
+                states = {"stats": (len(rows), 0), "memoryStats": (len(mem), 0)}
+                reads = [("stats", None), ("search", {"q": "walrus 3", "limit": 5, "ignoreDate": True}),
                          ("memoryStats", None), ("memorySearch", {"q": "zebra"})]
+                for m, prm in reads:
+                    result = self._rpc(proc, m, prm)["result"]
+                    if m in states:
+                        self.assertEqual(result["docs"], states[m][0], m)
+                    else:
+                        self.assertTrue(result, f"{m} found none of this round's rows")
+
+                sent = {}
+                def send(method, params=None):
+                    message_id = f"r{r}-{len(sent)}"
+                    sent[message_id] = method
+                    _send_message(proc, {"id": message_id, "method": method, "params": params or {}})
                 for _ in range(5):
                     for m, prm in reads:
                         send(m, prm)
@@ -685,11 +701,24 @@ class TestMultiThreadedDispatch(unittest.TestCase):
                 for _ in range(100):
                     for m, prm in reads:
                         send(m, prm)
+                answered = []
                 for _ in sent:
                     resp = _read_message(proc)
-                    if "error" in resp:
-                        errors.append(resp["error"])
-            self.assertEqual(errors, [])
+                    answered.append(resp.get("id"))
+                    method = sent.get(resp.get("id"))
+                    self.assertNotIn("error", resp, method)
+                    result = resp["result"]
+                    if method in ("clear", "memoryClear"):
+                        self.assertEqual(result, {"ok": True})
+                    elif method in states:
+                        self.assertIn(result["docs"], states[method], method)
+                    else:
+                        key = "uniqueId" if method == "search" else "memId"
+                        self.assertTrue(all(hit[key].startswith(f"r{r}-") for hit in result), f"{method} answered {result}")
+                self.assertEqual(sorted(answered), sorted(sent))
+                # Cleared.
+                for m in states:
+                    self.assertEqual(self._rpc(proc, m)["result"]["docs"], 0, m)
         finally:
             self._stop_process(proc)
 
