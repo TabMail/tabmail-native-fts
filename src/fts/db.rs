@@ -4137,4 +4137,31 @@ mod tests {
         assert_eq!(ids, sorted, "msgIds must be ascending");
         assert_eq!(page["done"], true);
     }
+
+    /// Clear deletes the log files before the database and stops at the first it cannot delete,
+    /// so a failed clear never leaves a new database beside the old log, nor deletes the database
+    /// while its log is kept. A non-empty directory in a log file's place cannot be removed as a
+    /// file on any platform.
+    #[test]
+    fn delete_database_files_stops_before_the_database_when_a_log_file_cannot_go() {
+        for (suffix, kept_log) in [("-wal", None), ("-shm", Some("-wal"))] {
+            let dir = std::env::temp_dir().join(format!("tabmail-fts-delete-order-{}{suffix}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("x.db");
+            std::fs::write(&db, b"database").unwrap();
+            if let Some(log) = kept_log {
+                std::fs::write(dir.join(format!("x.db{log}")), b"log").unwrap();
+            }
+            let blocker = dir.join(format!("x.db{suffix}"));
+            std::fs::create_dir_all(blocker.join("inside")).unwrap();
+
+            assert!(delete_database_files(&db).is_err(), "{suffix}: a file that could not be deleted answered ok");
+            assert!(db.exists(), "{suffix}: the database was deleted although its log was kept");
+            if let Some(log) = kept_log {
+                assert!(!dir.join(format!("x.db{log}")).exists(), "{suffix}: the log before it was not deleted");
+            }
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
 }

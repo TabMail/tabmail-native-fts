@@ -271,6 +271,9 @@ fn run_multi_threaded(
             })?
     };
 
+    // Only the threads hold the reader's connections from here on.
+    drop(reader_email_conn);
+    drop(reader_memory_conn);
     log::info!("Multi-threaded mode active: reader + writer threads spawned");
 
     // Main thread: stdin dispatch loop
@@ -347,8 +350,8 @@ fn run_multi_threaded(
 
     // Shutdown: drop senders so threads exit their recv() loops
     drop(reader_tx);
-    drop(writer_tx);
     let _ = reader_handle.join();
+    drop(writer_tx);
     let _ = writer_handle.join();
 
     log::info!("=== TabMail FTS Helper Stopped ===");
@@ -670,6 +673,11 @@ fn writer_thread_main(
     }
 
     log::info!("[writer] Thread stopped (channel closed)");
+    // The reader's connections close before the writer's, so the writer's close is the last.
+    drop(reader_email_conn);
+    drop(reader_memory_conn);
+    drop(email_conn);
+    drop(memory_conn);
 }
 
 /// One idle step of the shard migration: converts the next stale shard and
@@ -784,11 +792,12 @@ fn handle_write_request(
             let old_conn = std::mem::replace(email_conn, Connection::open_in_memory()?);
             let (new_conn, deleted) = crate::fts::db::clear_rebuild_standalone(email_db_path, old_conn)?;
             *email_conn = new_conn;
+            // Clear known years — shards will be recreated lazily during next indexing (a shard
+            // that is still there is only verified again)
+            known_years.clear();
             *reader_conn = crate::fts::db::open_read_only_connection(email_db_path)?;
             // Files not deleted: every row is still there, so say so rather than answer ok.
             deleted.context("clear")?;
-            // Clear known years — shards will be recreated lazily during next indexing
-            known_years.clear();
             Ok(serde_json::json!({ "id": msg_id, "result": { "ok": true } }))
         }
         "rebuildEmbeddingsStart" => {

@@ -25,11 +25,13 @@ Run:
 
 import json
 import os
+import queue
 import shutil
 import sqlite3
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -42,20 +44,37 @@ def _send_message(proc, message):
     proc.stdin.flush()
 
 
-def _read_message(proc, timeout_seconds=30):
+def _frames(proc):
+    """The helper's replies, read by a thread of their own: `select` takes no pipe on Windows."""
+    frames = getattr(proc, "_frames", None)
+    if frames is None:
+        frames = proc._frames = queue.Queue()
+
+        def pump():
+            try:
+                while True:
+                    raw_length = proc.stdout.read(4)
+                    if len(raw_length) < 4:
+                        break
+                    frames.put(proc.stdout.read(struct.unpack("=I", raw_length)[0]))
+            except (OSError, ValueError):
+                pass
+            frames.put(None)
+
+        threading.Thread(target=pump, daemon=True).start()
+    return frames
+
+
+def _read_message(proc, timeout_seconds=120):
     """Read a native messaging response. Raises on timeout or EOF."""
-    import select
-
-    # Use select for timeout on Unix
-    ready, _, _ = select.select([proc.stdout], [], [], timeout_seconds)
-    if not ready:
+    frames = _frames(proc)
+    try:
+        message_bytes = frames.get(timeout=timeout_seconds)
+    except queue.Empty:
         raise TimeoutError(f"No response within {timeout_seconds}s")
-
-    raw_length = proc.stdout.read(4)
-    if not raw_length:
+    if message_bytes is None:
+        frames.put(None)
         raise EOFError("Process closed stdout (EOF)")
-    message_length = struct.unpack("=I", raw_length)[0]
-    message_bytes = proc.stdout.read(message_length)
     return json.loads(message_bytes.decode("utf-8"))
 
 
@@ -321,7 +340,7 @@ class TestMultiThreadedDispatch(unittest.TestCase):
     # Test 4: Clear → reader reopens connection
     # ------------------------------------------------------------------
     def test_clear_reopen_signaling(self):
-        """After clear (writer), reader thread reopens its connection and sees empty DB."""
+        """After clear (writer), the reader sees the empty database."""
         proc = self._start_process()
         try:
             self._hello_and_init(proc)
@@ -424,7 +443,7 @@ class TestMultiThreadedDispatch(unittest.TestCase):
     # Test 5: Memory clear → reader reopens memory connection
     # ------------------------------------------------------------------
     def test_memory_clear_reopen(self):
-        """memoryClear signals reader to reopen its memory connection."""
+        """After memoryClear, the reader sees the empty memory database."""
         proc = self._start_process()
         try:
             self._hello_and_init(proc)
@@ -472,14 +491,14 @@ class TestMultiThreadedDispatch(unittest.TestCase):
         "memory": ("memoryIndexBatch", "memoryClear", "memoryDbPath", "memoryStats", "memorySearch"),
     }
 
-    def _clear_rows(self, kind, secret):
+    def _clear_rows(self, kind, secret, prefix="clear", filler=True):
         now = int(time.time() * 1000)
         if kind == "memory":
-            return [{"memId": f"clear-{i}", "role": "user", "content": f"{secret} {i}", "sessionId": "clear-session",
+            return [{"memId": f"{prefix}-{i}", "role": "user", "content": f"{secret} {i}", "sessionId": "clear-session",
                      "dateMs": now - i * 60_000, "turnIndex": i} for i in range(3)]
-        return [{"msgId": f"clear-mail-{i}", "folderId": "account:/ClearTest", "subject": f"Subject {i}",
+        return [{"msgId": f"{prefix}-mail-{i}", "folderId": "account:/ClearTest", "subject": f"Subject {i}",
                  "from_": f"sender{i}@example.com", "to_": "team@example.com", "body": f"{secret} {i}",
-                 "dateMs": now - i * 60_000, "hasAttachments": False} for i in range(3)] + _filler_rows("clear")
+                 "dateMs": now - i * 60_000, "hasAttachments": False} for i in range(3)] + (_filler_rows(prefix) if filler else [])
 
     def _rpc(self, proc, method, params=None):
         self._seq = getattr(self, "_seq", 0) + 1
@@ -548,6 +567,17 @@ class TestMultiThreadedDispatch(unittest.TestCase):
             self.assertEqual(self._rpc(proc, docs_method)["result"]["docs"], len(rows))
             kept = self._rpc(proc, search_method, {"q": secret, "limit": 10, "ignoreDate": True})
             self.assertTrue(kept.get("result"), kept)
+            # Writes still go on after it (the folder is still read-only; the files are not).
+            later_secret = "lighthouse ferry quokka"
+            later = self._clear_rows(kind, later_secret, prefix="later", filler=False)
+            self.assertEqual(self._rpc(proc, index_method, {"rows": later})["result"]["count"], len(later))
+            self.assertEqual(self._rpc(proc, docs_method)["result"]["docs"], len(rows) + len(later))
+            if kind == "memory":
+                written = self._rpc(proc, search_method, {"q": later_secret, "limit": 10, "ignoreDate": True}).get("result")
+            else:
+                # Read back by id: the hybrid ranking can leave a few fresh rows out of a search.
+                written = self._rpc(proc, "getMessageByMsgId", {"msgId": later[0]["msgId"]}).get("result")
+            self.assertIn(later_secret, json.dumps(written))
 
             os.chmod(folder, 0o700)
             self.assertEqual(self._rpc(proc, clear_method).get("result"), {"ok": True})
@@ -564,6 +594,25 @@ class TestMultiThreadedDispatch(unittest.TestCase):
 
     def test_memory_clear_that_cannot_delete_answers_an_error_and_keeps_serving(self):
         self._check_clear_that_cannot_delete_answers_an_error_and_keeps_serving("memory")
+
+    def test_a_clean_exit_leaves_no_log_files(self):
+        """Once the helper stops, each database is whole in its own file, with no -wal or -shm left."""
+        proc = self._start_process()
+        try:
+            self.assertIn("result", self._rpc(proc, "hello", {"addonVersion": "1.3.0"}))
+            init = self._rpc(proc, "init", {"profilePath": self.temp_dir})["result"]
+            for kind in ("email", "memory"):
+                index_method, _, _, _, search_method = self.CLEAR_CASES[kind]
+                rows = self._clear_rows(kind, "harbour invoice walrus")
+                self.assertEqual(self._rpc(proc, index_method, {"rows": rows})["result"]["count"], len(rows))
+                found = self._rpc(proc, search_method, {"q": "harbour invoice walrus", "limit": 10, "ignoreDate": True})
+                self.assertTrue(found.get("result"), found)
+            db_paths = [Path(init["dbPath"]), Path(init["memoryDbPath"])]
+            logs = [Path(f"{db}{suffix}") for db in db_paths for suffix in ("-wal", "-shm")]
+            self.assertTrue(any(log.exists() for log in logs), "the log files were never written")
+        finally:
+            self._stop_process(proc)
+        self.assertEqual([log.name for log in logs if log.exists()], [])
 
     def test_reads_sent_around_a_clear_never_fail(self):
         """Reads pipelined before and after clear / memoryClear answer the old or the cleared state, never an error."""

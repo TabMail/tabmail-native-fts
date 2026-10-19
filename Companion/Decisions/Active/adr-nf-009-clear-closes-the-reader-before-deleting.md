@@ -30,9 +30,15 @@ connection open the whole time and reopened it at its next request (an `AtomicBo
    reopen flags are deleted.
 3. Files are deleted log first (`-wal`, `-shm`), the database last. A failure leaves the database in
    place, and a new database is never created next to an old log (SQLite would replay it).
-4. A delete that fails is an error reply (`clear: delete <path>: ...`). Both connections are reopened
-   on the file still there, every row kept and searchable; for `clear`, `known_years` is kept.
-5. Wire protocol, schema, pragmas and the delete-and-recreate approach are unchanged.
+4. A delete that fails is an error reply whose text is only the method (`clear` or `memoryClear`;
+   the file and the OS error go to the local log, not over the wire). Both connections are reopened
+   on the file still there, every row kept and searchable, and writes go on; for `clear`,
+   `known_years` is emptied either way (a shard still there is only verified again).
+5. At a clean exit the writer's connections close last, after the reader's (the reader's are dropped
+   first), so SQLite's last close checkpoints and removes each `-wal` and `-shm` as before: a
+   read-only connection cannot checkpoint, and sharing the reader's connections must not make it the
+   last to close.
+6. Wire protocol, schema, pragmas and the delete-and-recreate approach are unchanged.
 
 ## Rejected
 
@@ -45,10 +51,14 @@ connection open the whole time and reopened it at its next request (an `AtomicBo
 
 ## Consequences
 
-- A read waits while a clear runs (deleting and creating an empty database: milliseconds).
+- A read waits while a clear runs. The writer's close checkpoints the write-ahead log into the file
+  about to be deleted, so the wait grows with the log: about 0.4 s for a 547 MB log (the base answered
+  in milliseconds, its close not being the last), far below Thunderbird's 60 s request timeout.
 - A clear waits for a read in progress (a long search delays the clear, not the other way round).
-- An error reply rejects the request in Thunderbird 1.9.1: its FTS settings show "Clear failed: …";
-  clearing chat history logs a warning and goes on (unchanged; before, the same case answered ok).
+- An error reply rejects the request in Thunderbird 1.9.1: its FTS settings show "Clear failed:
+  clear". Clearing chat history logs the failed `memoryClear` as an error but still shows "Chat
+  history cleared" (the add-on does not show the reply's error; carried as TabMail/tabmail-thunderbird#146). The
+  helper itself never answers ok while keeping rows.
 
 ## Verification
 

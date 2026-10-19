@@ -11,7 +11,7 @@
 **Decision:**
 1. Add integer `SCHEMA_VERSION` constant (starting at 1) that bumps only when DB schema, FTS5 tokenizer config, or embedding model actually changes.
 2. After `init`, split processing into three threads: main (stdin reader + dispatcher), reader (read-only DB ops), writer (write/destructive DB ops).
-3. `EmbeddingEngine` and `SynonymLookup` shared via `Arc`. Each thread opens its own `rusqlite::Connection` (Connection is `!Send`).
+3. `EmbeddingEngine` and `SynonymLookup` shared via `Arc`. Each thread opens its own `rusqlite::Connection` (Connection is `!Send`). *(Amended by ADR-NF-009: the reader's connections are shared with the writer through `Arc<Mutex>`, which `Connection` being `Send` allows.)*
 4. Responses written through `Arc<Mutex<Stdout>>`. Native messaging protocol correlates by `id` field, not by order.
 5. `clear`/`memoryClear` in writer signals reader via `AtomicBool` to reopen its connection. *(Amended by ADR-NF-009: the writer locks the reader's connection, closes it before deleting the files, and reopens it; the flags are gone.)*
 6. No new crate dependencies.

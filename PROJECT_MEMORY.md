@@ -17,8 +17,8 @@ Native messaging host for full-text search + semantic search. Communicates with 
 
 **Phase B (post-init, multi-threaded):**
 - **Main thread**: reads stdin, dispatches to reader or writer channel via `classify_method()`
-- **Reader thread**: read-only ops (search, stats, filter) — owns its own `rusqlite::Connection`
-- **Writer thread**: write ops (indexBatch, removeBatch, clear) — owns its own `rusqlite::Connection`
+- **Reader thread**: read-only ops (search, stats, filter) — its read-only connections are shared with the writer through `Arc<Mutex>`, so a clear can close them (ADR-NF-009)
+- **Writer thread**: write ops (indexBatch, removeBatch, clear) — owns its read-write connections, which close last at exit so SQLite removes the `-wal`/`-shm`
 
 ### Shared Resources
 - `EmbeddingEngine` and `SynonymLookup` shared via `Arc`
