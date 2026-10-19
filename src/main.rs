@@ -369,10 +369,11 @@ fn lock_conn(conn: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
 }
 
 /// Whether `conn` is the in-memory stand-in a clear puts in a connection's place while it
-/// replaces the files, rather than a connection to the database: SQLite names no file for an
-/// in-memory database.
+/// replaces the files, rather than a connection to the database: SQLite names an in-memory
+/// database with an empty name. A name rusqlite can't give (one not in UTF-8, as on Linux under a
+/// folder whose name isn't) is a database's.
 fn is_stand_in(conn: &Connection) -> bool {
-    conn.path().map_or(true, str::is_empty)
+    matches!(conn.path(), Some(""))
 }
 
 /// Opens the database again in place of a stand-in that a failed clear left (`open` failed, the
@@ -2425,6 +2426,181 @@ mod tests {
             &reader_email, &reader_memory, "indexBatch", "w", &serde_json::json!({"rows": [row("new")]}));
         assert_eq!(written.expect("write after the fault ended")["result"]["count"], 1);
         drop(email);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A VFS for tests: the default one, except that the name SQLite reports for a file under a
+    /// folder named with `MARK` has the byte 0xFF in place of the mark's last character, as
+    /// SQLite reports a name under a folder whose name is not UTF-8 (on Linux; macOS refuses
+    /// such names). Files are opened, found and deleted under their real names.
+    mod non_utf8_name_vfs {
+        use rusqlite::ffi;
+        use std::ffi::{c_char, c_int, CStr};
+        use std::sync::atomic::{AtomicPtr, Ordering};
+        use std::sync::Once;
+
+        pub const NAME: &str = "non-utf8-name";
+        pub const MARK: &[u8] = b"non-utf8-name~";
+        static DEFAULT: AtomicPtr<ffi::sqlite3_vfs> = AtomicPtr::new(std::ptr::null_mut());
+        static REGISTER: Once = Once::new();
+
+        fn default() -> *mut ffi::sqlite3_vfs {
+            DEFAULT.load(Ordering::SeqCst)
+        }
+
+        /// `name` as it is on disk: 0xFF back to the mark's last character.
+        unsafe fn real(name: *const c_char) -> *const c_char {
+            if name.is_null() || !CStr::from_ptr(name).to_bytes().contains(&0xFF) {
+                return name;
+            }
+            let mut bytes: Vec<u8> = CStr::from_ptr(name).to_bytes().iter().map(|&b| if b == 0xFF { MARK[MARK.len() - 1] } else { b }).collect();
+            // SQLite reads parameters after a database name's terminator.
+            bytes.extend_from_slice(&[0, 0, 0, 0]);
+            Box::leak(bytes.into_boxed_slice()).as_ptr() as *const c_char
+        }
+
+        unsafe extern "C" fn open(_: *mut ffi::sqlite3_vfs, name: ffi::sqlite3_filename, file: *mut ffi::sqlite3_file, flags: c_int, out: *mut c_int) -> c_int {
+            ((*default()).xOpen.unwrap())(default(), real(name), file, flags, out)
+        }
+        unsafe extern "C" fn delete(_: *mut ffi::sqlite3_vfs, name: *const c_char, sync: c_int) -> c_int {
+            ((*default()).xDelete.unwrap())(default(), real(name), sync)
+        }
+        unsafe extern "C" fn access(_: *mut ffi::sqlite3_vfs, name: *const c_char, flags: c_int, out: *mut c_int) -> c_int {
+            ((*default()).xAccess.unwrap())(default(), real(name), flags, out)
+        }
+        unsafe extern "C" fn full_pathname(_: *mut ffi::sqlite3_vfs, name: *const c_char, size: c_int, out: *mut c_char) -> c_int {
+            let rc = ((*default()).xFullPathname.unwrap())(default(), real(name), size, out);
+            let len = CStr::from_ptr(out).to_bytes().len();
+            let full = std::slice::from_raw_parts_mut(out as *mut u8, len);
+            if let Some(at) = full.windows(MARK.len()).position(|w| w == MARK) {
+                full[at + MARK.len() - 1] = 0xFF;
+            }
+            rc
+        }
+
+        /// Registers it by `NAME`, not as the default: other tests' opens are untouched.
+        pub fn register() {
+            REGISTER.call_once(|| unsafe {
+                let unix = ffi::sqlite3_vfs_find(std::ptr::null());
+                assert!(!unix.is_null());
+                DEFAULT.store(unix, Ordering::SeqCst);
+                let mut vfs: ffi::sqlite3_vfs = *unix;
+                vfs.zName = c"non-utf8-name".as_ptr();
+                vfs.pNext = std::ptr::null_mut();
+                vfs.xOpen = Some(open);
+                vfs.xDelete = Some(delete);
+                vfs.xAccess = Some(access);
+                vfs.xFullPathname = Some(full_pathname);
+                assert_eq!(ffi::sqlite3_vfs_register(Box::leak(Box::new(vfs)), 0), 0);
+            });
+        }
+    }
+
+    /// A database whose name SQLite reports in bytes that aren't UTF-8 is a database, not a failed
+    /// clear's stand-in: a mail write goes in, and its connections are never opened again.
+    #[test]
+    fn a_database_whose_name_is_not_utf8_is_never_taken_for_a_stand_in() {
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+        non_utf8_name_vfs::register();
+        let dir = std::env::temp_dir().join(format!("{}{}", std::str::from_utf8(non_utf8_name_vfs::MARK).unwrap(), std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (db, memory_db) = (dir.join("fts.db"), dir.join("memory.db"));
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+        let mut email = Connection::open_with_flags_and_vfs(&db, flags, non_utf8_name_vfs::NAME).unwrap();
+        crate::fts::db::init_database(&email).unwrap();
+        // The fixture reaches the state: a database file on disk whose name rusqlite can't give.
+        assert!(db.exists());
+        assert_eq!(email.path(), None);
+        assert!(!is_stand_in(&email));
+
+        let mut memory = memory_db::open_memory_writer_connection(&memory_db).unwrap();
+        let reader_email = Mutex::new(Connection::open_in_memory().unwrap());
+        let reader_memory = Mutex::new(Connection::open_in_memory().unwrap());
+        let mut known_years = HashSet::new();
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let rows = serde_json::json!({"rows": [{"msgId": "a", "subject": "s", "body": "b", "dateMs": now_ms, "hasAttachments": false}]});
+        let written = handle_write_request(&mut email, &mut memory, &mut known_years, &db, &memory_db, None,
+            &reader_email, &reader_memory, "indexBatch", "w", &rows);
+        assert_eq!(written.expect("a write to the database")["result"]["count"], 1);
+        let mut opened = false;
+        reopen_stand_in(&mut email, "test", || {
+            opened = true;
+            Ok(Connection::open_in_memory()?)
+        });
+        assert!(!opened, "the database's connection was opened again");
+        assert_eq!(crate::fts::db::db_count(&email).unwrap(), 1);
+        drop(email);
+        drop(memory);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// While a clear runs, a read never finds the reader's connection closed: a reader taking its
+    /// connections as `reader_thread_main` does (email, then memory), as often as it can, never
+    /// meets a stand-in during a `clear` or a `memoryClear` that answers ok.
+    #[test]
+    fn no_read_finds_the_connection_closed_while_a_clear_runs() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+        let dir = std::env::temp_dir().join(format!("tabmail-fts-clear-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (db, memory_db) = (dir.join("fts.db"), dir.join("memory.db"));
+        let mut email = crate::fts::db::open_writer_connection(&db).unwrap();
+        let mut memory = memory_db::open_memory_writer_connection(&memory_db).unwrap();
+        let reader_email = Arc::new(Mutex::new(crate::fts::db::open_read_only_connection(&db).unwrap()));
+        let reader_memory = Arc::new(Mutex::new(memory_db::open_read_only_memory_connection(&memory_db).unwrap()));
+        let mut known_years = HashSet::new();
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        for method in ["memoryClear", "clear"] {
+            for round in 0..10 {
+                let rows: Vec<Value> = (0..50i64)
+                    .map(|i| serde_json::json!({"msgId": format!("{method}-{round}-{i}"), "subject": "s", "body": "b",
+                        "dateMs": now_ms - i * 86_400_000, "hasAttachments": false}))
+                    .collect();
+                crate::fts::db::index_batch(&mut email, &rows, None, &mut known_years).unwrap();
+                let (stop, reads) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU64::new(0)));
+                let reader = {
+                    let (reader_email, reader_memory, stop, reads) = (Arc::clone(&reader_email), Arc::clone(&reader_memory), Arc::clone(&stop), Arc::clone(&reads));
+                    std::thread::spawn(move || {
+                        let mut closed = 0u64;
+                        while !stop.load(Ordering::SeqCst) {
+                            {
+                                let email = lock_conn(&reader_email);
+                                let memory = lock_conn(&reader_memory);
+                                reads.fetch_add(1, Ordering::SeqCst);
+                                if is_stand_in(&email) || is_stand_in(&memory) {
+                                    closed += 1;
+                                }
+                            }
+                            std::thread::yield_now();
+                        }
+                        closed
+                    })
+                };
+                // The reader is running before the clear starts.
+                while reads.load(Ordering::SeqCst) == 0 {
+                    std::thread::yield_now();
+                }
+                let answered = handle_write_request(&mut email, &mut memory, &mut known_years, &db, &memory_db, None,
+                    &reader_email, &reader_memory, method, "c", &serde_json::json!({}));
+                stop.store(true, Ordering::SeqCst);
+                let closed = reader.join().unwrap();
+                let reads = reads.load(Ordering::SeqCst);
+                assert!(answered.is_ok(), "{method}: {answered:?}");
+                assert_eq!(closed, 0, "{method}, round {round}: {closed} of {reads} reads found the connection closed");
+            }
+        }
+        drop(email);
+        drop(memory);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

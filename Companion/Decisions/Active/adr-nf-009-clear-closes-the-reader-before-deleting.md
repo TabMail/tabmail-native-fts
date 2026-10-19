@@ -46,6 +46,12 @@ connection open the whole time and reopened it at its next request (an `AtomicBo
    error and writes nothing: run there, it would create year shards in the stand-in and remember
    them in `known_years`, and once the database opened again every write for those years would
    fail (`no such table`) until another clear or a restart.
+   A stand-in is recognised by its empty name (SQLite's name for an in-memory database), never by
+   a missing name: rusqlite gives no name for one that isn't UTF-8 (on Linux, a profile folder
+   whose name isn't), and such a database taken for a stand-in would be reopened before every
+   request and refused every write.
+   A clear holds the reader's lock for the whole clear, so no read ever finds a connection closed
+   or a stand-in while a clear that will succeed is running.
 6. Exit is unchanged: the main thread drops its copies of the reader's connections once the threads
    start (sharing them must not keep them open until it returns), and both threads are told to stop
    together, as before.
@@ -88,6 +94,9 @@ connection open the whole time and reopened it at its next request (an `AtomicBo
   the database is never replaced; a clear that deleted the files but could not create the database
   answers an error, and so does a write while it still can't be; once it can be created that write
   stores rows dated in a year the cleared database had a shard for (red with `known_years` emptied
-  after the rebuild instead, and with the `indexBatch` stand-in check removed).
+  after the rebuild instead, and with the `indexBatch` stand-in check removed); a database opened
+  under a name that isn't UTF-8 (a test VFS) is never taken for a stand-in and takes writes (red
+  with a missing name counted as a stand-in); reads sent while `clear` and `memoryClear` run never
+  find a closed connection or a stand-in (red with either clear releasing the reader's lock early).
 - Differential run of Thunderbird 1.9.1's request shapes (1,161 requests) against the previous
   build: identical answers.
