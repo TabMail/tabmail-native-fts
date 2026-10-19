@@ -34,17 +34,21 @@ Zip 9 or later.
 
 **Builders:** a shipped build made on someone's own computer passes `--remap-path-prefix=$HOME=~` in
 `RUSTFLAGS`. Without it the binary carries that home folder (the user name) in every dependency's
-source path. A CI runner's home names no one, so CI builds need nothing. Cargo's `trim-paths` profile
+source path. `RUSTFLAGS` replaces any `rustflags` set in a Cargo config, so a builder who keeps flags
+there adds them to it too; a checkout outside `$HOME` whose path names the user needs its own
+mapping. A CI runner's home names no one, so CI builds need nothing. Cargo's `trim-paths` profile
 setting, which would do this from `Cargo.toml`, is not stable yet.
 
 ## Verification
 
 - `cargo audit`: no vulnerabilities; one allowed warning, Paste unmaintained (RUSTSEC-2024-0436),
-  through candle's `gemm`, used at compile time only. It stays until candle drops it.
-- `cargo test --release --locked`: 132 passed. `tests/run_tests.py`: 44 ran, OK (2 platform skips).
-- The released 0.11.7 against this build on 1,161 recorded Thunderbird 1.9.1 requests: no content
-  differences.
-- With the remap, the macOS binary holds no home-folder path (350 before).
+  through candle's `gemm` and `tokenizers` 0.21, a macro crate used at compile time only. It stays
+  until both drop it.
+- `cargo test --release --locked`: 132 passed. `tests/run_tests.py`: 44 ran, OK (2 skips: tests that need a signing key absent here).
+- The released 0.11.7 against this build on 1,161 requests generated in the shapes Thunderbird 1.9.1
+  sends (not recorded from a user): no content differences.
+- With the remap, the macOS binary holds no home-folder path (the universal 0.11.7 held 741, about
+  350 in each architecture's slice).
 
 ## Rejected
 
