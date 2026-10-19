@@ -13,7 +13,7 @@
 2. After `init`, split processing into three threads: main (stdin reader + dispatcher), reader (read-only DB ops), writer (write/destructive DB ops).
 3. `EmbeddingEngine` and `SynonymLookup` shared via `Arc`. Each thread opens its own `rusqlite::Connection` (Connection is `!Send`).
 4. Responses written through `Arc<Mutex<Stdout>>`. Native messaging protocol correlates by `id` field, not by order.
-5. `clear`/`memoryClear` in writer signals reader via `AtomicBool` to reopen its connection.
+5. `clear`/`memoryClear` in writer signals reader via `AtomicBool` to reopen its connection. *(Amended by ADR-NF-009: the writer locks the reader's connection, closes it before deleting the files, and reopens it; the flags are gone.)*
 6. No new crate dependencies.
 
 **Rationale:**
@@ -24,7 +24,7 @@
 
 **Consequences:**
 - Reader connections cache ~64MB each, total memory increase ~128MB
-- Clear operations have a brief window where reader may fail
+- Clear operations have a brief window where reader may fail *(ADR-NF-009: reads now wait for a clear instead)*
 - Pre-init messages remain single-threaded
 - JS side needs no changes (already handles out-of-order responses)
 
@@ -160,3 +160,9 @@ archives of any size.
 **Consequences:**
 - [Trade-offs, both positive and negative]
 ```
+
+---
+
+## ADR-NF-009: Clear Closes the Reader's Connection Before Deleting the Files, and Fails If It Cannot Delete
+
+- **[Full ADR](Companion/Decisions/Active/adr-nf-009-clear-closes-the-reader-before-deleting.md)** — Windows Clear All bug: the reader's open handle blocked deleting `fts.db` / `memory.db` (no `FILE_SHARE_DELETE`), the failure was a warning, every row stayed and `clear` / `memoryClear` answered ok. Now the reader's connections sit behind a `Mutex`; a clear locks one, closes the reader's handle, deletes `-wal`, `-shm`, then the database, recreates, reopens the reader, unlocks; reads wait. A failed delete is an error reply with both connections reopened and every row kept. `AtomicBool` reopen flags deleted. Rejected: in-place empty (reset/VACUUM or backup; changed every read), warning-to-error alone.

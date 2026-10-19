@@ -15,8 +15,7 @@ mod update_signature;
 use std::collections::HashSet;
 use std::io::{stdin, stdout, Stdin, Stdout};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{bail, Context};
 use rusqlite::Connection;
@@ -207,16 +206,13 @@ fn run_multi_threaded(
     let engine: Option<Arc<EmbeddingEngine>> = state.embedding_engine.map(Arc::new);
     let synonyms = Arc::new(state.synonyms);
 
-    // Open read-only connections for reader thread
-    let reader_email_conn = crate::fts::db::open_read_only_connection(&email_db_path)?;
-    let reader_memory_conn = memory_db::open_read_only_memory_connection(&memory_db_path)?;
+    // Read-only connections for the reader thread. The writer locks one for the whole of a
+    // clear, to close it before the files are deleted and open it again after.
+    let reader_email_conn = Arc::new(Mutex::new(crate::fts::db::open_read_only_connection(&email_db_path)?));
+    let reader_memory_conn = Arc::new(Mutex::new(memory_db::open_read_only_memory_connection(&memory_db_path)?));
 
     // Shared stdout for writing responses from both threads
     let shared_stdout: Arc<Mutex<Stdout>> = Arc::new(Mutex::new(out_stream));
-
-    // AtomicBool flags: writer signals reader to reopen after clear/memoryClear
-    let email_reopen = Arc::new(AtomicBool::new(false));
-    let memory_reopen = Arc::new(AtomicBool::new(false));
 
     // Channels: main → reader, main → writer
     let (reader_tx, reader_rx) = mpsc::channel::<ThreadMessage>();
@@ -229,23 +225,21 @@ fn run_multi_threaded(
         let synonyms = Arc::clone(&synonyms);
         let email_path = email_db_path.clone();
         let memory_path = memory_db_path.clone();
-        let email_reopen = Arc::clone(&email_reopen);
-        let memory_reopen = Arc::clone(&memory_reopen);
+        let email_conn = Arc::clone(&reader_email_conn);
+        let memory_conn = Arc::clone(&reader_memory_conn);
 
         std::thread::Builder::new()
             .name("fts-reader".to_string())
             .spawn(move || {
                 reader_thread_main(
                     reader_rx,
-                    reader_email_conn,
-                    reader_memory_conn,
+                    email_conn,
+                    memory_conn,
                     engine,
                     synonyms,
                     stdout,
                     email_path,
                     memory_path,
-                    email_reopen,
-                    memory_reopen,
                 );
             })?
     };
@@ -256,8 +250,8 @@ fn run_multi_threaded(
         let engine = engine.clone();
         let email_path = email_db_path.clone();
         let memory_path = memory_db_path.clone();
-        let email_reopen = Arc::clone(&email_reopen);
-        let memory_reopen = Arc::clone(&memory_reopen);
+        let reader_email_conn = Arc::clone(&reader_email_conn);
+        let reader_memory_conn = Arc::clone(&reader_memory_conn);
 
         std::thread::Builder::new()
             .name("fts-writer".to_string())
@@ -271,8 +265,8 @@ fn run_multi_threaded(
                     stdout,
                     email_path,
                     memory_path,
-                    email_reopen,
-                    memory_reopen,
+                    reader_email_conn,
+                    reader_memory_conn,
                 );
             })?
     };
@@ -365,36 +359,28 @@ fn run_multi_threaded(
 // Reader thread
 // ============================================================================
 
+/// A connection shared by the reader and the writer's clear. A panic while it was held
+/// leaves the connection itself usable, so the lock is taken regardless.
+fn lock_conn(conn: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
+    conn.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 fn reader_thread_main(
     rx: mpsc::Receiver<ThreadMessage>,
-    mut email_conn: Connection,
-    mut memory_conn: Connection,
+    email_conn: Arc<Mutex<Connection>>,
+    memory_conn: Arc<Mutex<Connection>>,
     engine: Option<Arc<EmbeddingEngine>>,
     synonyms: Arc<SynonymLookup>,
     stdout: Arc<Mutex<Stdout>>,
     email_db_path: PathBuf,
     memory_db_path: PathBuf,
-    email_reopen: Arc<AtomicBool>,
-    memory_reopen: Arc<AtomicBool>,
 ) {
     log::info!("[reader] Thread started");
 
     while let Ok(msg) = rx.recv() {
-        // Check if writer signaled us to reopen after clear
-        if email_reopen.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-            log::info!("[reader] Reopening email read-only connection after clear");
-            match crate::fts::db::open_read_only_connection(&email_db_path) {
-                Ok(new_conn) => email_conn = new_conn,
-                Err(e) => log::error!("[reader] Failed to reopen email conn: {:?}", e),
-            }
-        }
-        if memory_reopen.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-            log::info!("[reader] Reopening memory read-only connection after clear");
-            match memory_db::open_read_only_memory_connection(&memory_db_path) {
-                Ok(new_conn) => memory_conn = new_conn,
-                Err(e) => log::error!("[reader] Failed to reopen memory conn: {:?}", e),
-            }
-        }
+        // A clear holds one of these while it replaces the files, so a read waits for it.
+        let email_conn = lock_conn(&email_conn);
+        let memory_conn = lock_conn(&memory_conn);
 
         let engine_ref = engine.as_deref();
         let resp = handle_read_request(
@@ -409,6 +395,8 @@ fn reader_thread_main(
             &msg.params,
         );
 
+        drop(memory_conn);
+        drop(email_conn);
         write_response(&stdout, &msg.id, resp);
     }
 
@@ -651,8 +639,8 @@ fn writer_thread_main(
     stdout: Arc<Mutex<Stdout>>,
     email_db_path: PathBuf,
     memory_db_path: PathBuf,
-    email_reopen: Arc<AtomicBool>,
-    memory_reopen: Arc<AtomicBool>,
+    reader_email_conn: Arc<Mutex<Connection>>,
+    reader_memory_conn: Arc<Mutex<Connection>>,
 ) {
     log::info!("[writer] Thread started");
 
@@ -671,8 +659,8 @@ fn writer_thread_main(
             &email_db_path,
             &memory_db_path,
             engine_ref,
-            &email_reopen,
-            &memory_reopen,
+            &reader_email_conn,
+            &reader_memory_conn,
             &msg.method,
             &msg.id,
             &msg.params,
@@ -731,8 +719,8 @@ fn handle_write_request(
     email_db_path: &Path,
     memory_db_path: &Path,
     engine: Option<&EmbeddingEngine>,
-    email_reopen: &AtomicBool,
-    memory_reopen: &AtomicBool,
+    reader_email_conn: &Mutex<Connection>,
+    reader_memory_conn: &Mutex<Connection>,
     method: &str,
     msg_id: &str,
     params: &Value,
@@ -788,14 +776,19 @@ fn handle_write_request(
             Ok(serde_json::json!({ "id": msg_id, "result": { "ok": true } }))
         }
         "clear" => {
+            // Hold the reader's connection for the whole clear: a read waits, and the reader's
+            // file handle can be closed first, since Windows refuses to delete an open file.
+            let mut reader_conn = lock_conn(reader_email_conn);
+            drop(std::mem::replace(&mut *reader_conn, Connection::open_in_memory()?));
             // Swap connection with a temporary in-memory one, clear + rebuild, swap back
             let old_conn = std::mem::replace(email_conn, Connection::open_in_memory()?);
-            let new_conn = crate::fts::db::clear_rebuild_standalone(email_db_path, old_conn)?;
+            let (new_conn, deleted) = crate::fts::db::clear_rebuild_standalone(email_db_path, old_conn)?;
             *email_conn = new_conn;
+            *reader_conn = crate::fts::db::open_read_only_connection(email_db_path)?;
+            // Files not deleted: every row is still there, so say so rather than answer ok.
+            deleted.context("clear")?;
             // Clear known years — shards will be recreated lazily during next indexing
             known_years.clear();
-            // Signal reader to reopen its read-only connection
-            email_reopen.store(true, Ordering::SeqCst);
             Ok(serde_json::json!({ "id": msg_id, "result": { "ok": true } }))
         }
         "rebuildEmbeddingsStart" => {
@@ -870,10 +863,14 @@ fn handle_write_request(
             Ok(serde_json::json!({ "id": msg_id, "result": { "ok": true, "count": removed } }))
         }
         "memoryClear" => {
+            // As in clear: hold and close the reader's connection before deleting the files.
+            let mut reader_conn = lock_conn(reader_memory_conn);
+            drop(std::mem::replace(&mut *reader_conn, Connection::open_in_memory()?));
             let old_conn = std::mem::replace(memory_conn, Connection::open_in_memory()?);
-            let new_conn = memory_db::memory_clear_rebuild_standalone(memory_db_path, old_conn)?;
+            let (new_conn, deleted) = memory_db::memory_clear_rebuild_standalone(memory_db_path, old_conn)?;
             *memory_conn = new_conn;
-            memory_reopen.store(true, Ordering::SeqCst);
+            *reader_conn = memory_db::open_read_only_memory_connection(memory_db_path)?;
+            deleted.context("memoryClear")?;
             Ok(serde_json::json!({ "id": msg_id, "result": { "ok": true } }))
         }
         _ => Ok(serde_json::json!({ "id": msg_id, "error": format!("Unknown writer method: {method}") })),
@@ -1792,8 +1789,8 @@ mod tests {
         params: Value,
     ) -> anyhow::Result<Value> {
         let mut known_years = HashSet::new();
-        let email_reopen = AtomicBool::new(false);
-        let memory_reopen = AtomicBool::new(false);
+        let reader_email = Mutex::new(Connection::open_in_memory().unwrap());
+        let reader_memory = Mutex::new(Connection::open_in_memory().unwrap());
         handle_write_request(
             email,
             memory,
@@ -1801,8 +1798,8 @@ mod tests {
             Path::new("/nonexistent/email.db"),
             Path::new("/nonexistent/memory.db"),
             None,
-            &email_reopen,
-            &memory_reopen,
+            &reader_email,
+            &reader_memory,
             method,
             "test-write-1",
             &params,

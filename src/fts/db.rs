@@ -1457,30 +1457,38 @@ pub fn rebuild_embeddings_batch(
 }
 
 /// Clear and rebuild the email FTS database.
-/// Takes ownership of the connection to close it, returns a new connection after rebuild.
-/// Caller must signal the reader thread to reopen its read-only connection and clear known_years.
-pub fn clear_rebuild_standalone(db_path: &Path, conn: Connection) -> anyhow::Result<Connection> {
+/// Takes ownership of the writer's connection to close it. The caller must have closed every
+/// other connection to the file first (the reader's): Windows refuses to delete an open file.
+/// Returns the writer's new connection and whether the files were deleted. When they were not,
+/// the new connection is to the old database with every row still in it, and the caller must
+/// keep known_years.
+pub fn clear_rebuild_standalone(db_path: &Path, conn: Connection) -> anyhow::Result<(Connection, anyhow::Result<()>)> {
     log::info!("Clearing email FTS by deleting database file (rebuild from scratch)");
     drop(conn);
     log::info!("Database connection closed");
 
-    delete_file_if_exists(db_path)?;
-    delete_file_if_exists(&PathBuf::from(format!("{}-wal", db_path.display())))?;
-    delete_file_if_exists(&PathBuf::from(format!("{}-shm", db_path.display())))?;
+    let deleted = delete_database_files(db_path);
 
     log::info!("Recreating database...");
     let new_conn = Connection::open(db_path)?;
     ensure_fts5_available(&new_conn)?;
     init_database(&new_conn)?;
     log::info!("Database recreated and initialized successfully (FTS shards will be created lazily)");
-    Ok(new_conn)
+    Ok((new_conn, deleted))
 }
 
-fn delete_file_if_exists(p: &Path) -> anyhow::Result<()> {
-    if p.exists() {
-        match std::fs::remove_file(p) {
-            Ok(_) => log::info!("Deleted {}", p.display()),
-            Err(e) => log::warn!("Failed to delete {}: {}", p.display(), e),
+/// Delete a database's write-ahead log, its shared-memory file, then the database itself.
+/// The database goes last, so a failure leaves it in place, and a new database is never
+/// opened next to an old log.
+pub(crate) fn delete_database_files(db_path: &Path) -> anyhow::Result<()> {
+    for p in [
+        PathBuf::from(format!("{}-wal", db_path.display())),
+        PathBuf::from(format!("{}-shm", db_path.display())),
+        db_path.to_path_buf(),
+    ] {
+        if p.exists() {
+            std::fs::remove_file(&p).with_context(|| format!("delete {}", p.display()))?;
+            log::info!("Deleted {}", p.display());
         }
     }
     Ok(())

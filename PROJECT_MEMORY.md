@@ -23,9 +23,9 @@ Native messaging host for full-text search + semantic search. Communicates with 
 ### Shared Resources
 - `EmbeddingEngine` and `SynonymLookup` shared via `Arc`
 - Responses written through `Arc<Mutex<Stdout>>`
-- `clear`/`memoryClear` in writer signals reader via `AtomicBool` to reopen its read-only connection
+- `clear`/`memoryClear` in writer locks the reader's connection (`Mutex`), closes it so Windows can delete the files, recreates, reopens; a failed delete is an error reply, rows kept (ADR-NF-009)
 - `memoryTrim` / `memoryIndexBatch{maxBytes}` trim in the writer: FTS5 `merge` steps reclaim removed rows' segment space before more rows go (started once negative after removing, continued positive so a write between calls never restarts it); budget asked per row and per step; no VACUUM, so the file keeps its largest size; caller with `modelDir` skips the orphan clean-up (ADR-NF-008)
-- No new crate dependencies — uses `std::sync::{mpsc, Arc, Mutex, atomic::AtomicBool}`
+- No new crate dependencies — uses `std::sync::{mpsc, Arc, Mutex}`
 
 ### SchemaVersion
 `SCHEMA_VERSION: u32 = 1` decouples reindex triggers from host version. JS side compares integer schema version instead of major.minor host version string. Storage key: `ftsLastIndexedSchemaVersion`.
@@ -91,7 +91,7 @@ Native messaging host for full-text search + semantic search. Communicates with 
 
 ## Known Quirks
 
-- Reader may briefly fail during `clear` operations (between writer clearing and reader reopening connection)
+- Reads wait while a `clear` runs; a `clear` waits for a read in progress (ADR-NF-009; before it, the reader could briefly fail)
 - Pre-init messages must remain single-threaded (hello/init/updateCheck/updateRequest)
 - JS side handles out-of-order responses via `pendingRPCs` Map — no changes needed for multi-threading
 - FTS5 `CREATE VIRTUAL TABLE` is auto-commit — must be called outside explicit transactions
