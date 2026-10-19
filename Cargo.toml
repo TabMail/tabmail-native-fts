@@ -44,3 +44,7 @@ predicates = "3.1.2"
 # Keep the historical executable name expected by manifests/installers.
 name = "fts_helper"
 path = "src/main.rs"
+
+# candle-core 0.8.4 moved to Zip 9 (ADR-NF-010, vendor/candle-core/TABMAIL-PATCHES.md).
+[patch.crates-io]
+candle-core = { path = "vendor/candle-core" }

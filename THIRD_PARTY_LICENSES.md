@@ -50,6 +50,8 @@ and is available at: https://cdn.tabmail.ai/releases/models/all-MiniLM-L6-v2/LIC
 - **License:** Apache License 2.0 OR MIT License (dual-licensed)
 - **Authors:** Hugging Face
 - **Usage:** Pure Rust ML inference framework for running the embedding model
+- **Modified copy:** `vendor/candle-core` is candle-core 0.8.4 with TabMail changes (a newer Zip);
+  each changed file says so, and `vendor/candle-core/TABMAIL-PATCHES.md` lists the changes.
 
 ---
 

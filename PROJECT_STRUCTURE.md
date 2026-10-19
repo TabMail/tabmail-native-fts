@@ -50,6 +50,9 @@ tabmail-native-fts/
 │       ├── text_prep.rs         # Tokenization, text preprocessing
 │       └── download.rs          # Model downloading & caching
 │
+├── vendor/
+│   └── candle-core/             # candle-core 0.8.4 moved to Zip 9 (ADR-NF-010; TABMAIL-PATCHES.md)
+│
 └── dist/                        # Build outputs for distribution
 ```
 
