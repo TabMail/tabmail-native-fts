@@ -24,14 +24,20 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
 
 ## Decision
 
-1. The query is scanned into words (no whitespace, no `"`) and `"phrases"` (an unclosed quote runs
-   to the end), on `&str` so text stays whole.
-2. Every word and phrase is written as an FTS5 string (`"word"`, with the prefix `*` rules as
-   before: a user `*`, a word with punctuation, or a plain word of 4+ bytes when there are no
-   synonym groups). No query text is ever FTS5 syntax. A word or phrase with no letter or digit is
-   dropped (an empty string inside an AND matches nothing).
+1. A NUL in the query becomes a space (FTS5 reads a NUL as the end of the query, leaving a string
+   open; the tokenizer treats it as a separator). The query is then scanned into words (no
+   whitespace, no `"`) and `"phrases"` (an unclosed quote runs to the end), on `&str` so text stays
+   whole.
+2. Every word and phrase is written as an FTS5 string (`"word"`, with a prefix `*` for a user `*`,
+   a word with punctuation, or a plain word of 4+ bytes when there are no synonym groups in the
+   query; the old builder decided the last per quote-delimited segment, now it is query-wide). No
+   query text is ever FTS5 syntax. A word or phrase with no letter or digit is dropped (an empty
+   string inside an AND matches nothing).
 3. A word expanding to synonyms becomes the generated `(a OR b …)` group, the only operators in
-   the result; when any group is present every term is joined with an explicit `AND`.
+   the result; when any group is present every term is joined with an explicit `AND`. Whether a
+   group is present is read from the terms as written (only a group starts with `(`), so it can't
+   disagree with how fields took their values (a separate pre-scan did, for runs of empty fields
+   like `from: to: meeting`).
 4. Column scoping is the caller's list: `build_fts_match(q, columns, …)`. Mail search passes
    `QUERY_COLUMNS` (the documented `subject from to cc bcc body`, plus `from_ to_`), matched
    case-insensitively and written as the shard column; `name:word`, `name:"phrase"` and
@@ -50,11 +56,16 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
 ## Consequences
 
 - Tests: `db::tests::test_search_reads_any_query_text_as_text` and
-  `memory_db::tests::memory_search_reads_any_query_text_as_text` run the queries above through
-  `search` / `memory_search` on real tables (red on the old builder: 16 errors, `café` empty, the
-  phrase-and-synonym query an error); `query::tests` pin the written expressions;
-  `db::tests::test_every_query_field_reaches_the_column_scope_filter` ties the field list to the
-  hybrid filter.
-- `role:` / `content:` no longer scope in memory search (undocumented, unused).
+  `memory_db::tests::memory_search_reads_any_query_text_as_text` run the queries above, runs of empty
+  fields, NULs, and words in several scripts through `search` / `memory_search` on real tables (red
+  on the old builder: 16 errors, `café` empty, the phrase-and-synonym query an error);
+  `db::tests::test_no_query_text_makes_search_fail` and the memory test run 3,000 seeded random
+  queries each (`random_queries`), asserting none fails; `query::tests` pin the written
+  expressions; `db::tests::test_each_documented_field_scopes_to_its_column` checks each documented
+  field against a list written in the test, by a two-sided search and in the hybrid filter;
+  `test_rust_process_parity` `test_scoped_search_with_embeddings_finds_only_the_field` checks the
+  same with the embedding model loaded.
+- `role:` / `content:` no longer scope in memory search, and `msgId:` / `attachmentNames:` no longer
+  scope in mail search (all undocumented and unused by any client).
 - Both behaviour changes (`from :` with a space before the colon no longer scopes; memory search has
   no fields) were approved by the owner on 2026-10-18.

@@ -898,7 +898,7 @@ fn query_has_column_scope(fts_query: &str) -> bool {
 }
 
 /// Extract only the column-scoped terms from a processed FTS5 query.
-/// Given `from_:"tmm@cs.ubc.ca" hiring*`, returns `from_:"tmm@cs.ubc.ca"`.
+/// Given `from_:"alice@example.com" hiring*`, returns `from_:"alice@example.com"`.
 fn extract_column_scope_filter(fts_query: &str) -> String {
     let mut scoped_terms: Vec<String> = Vec::new();
     let bytes = fts_query.as_bytes();
@@ -2233,7 +2233,7 @@ fn truncate_for_log(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rusqlite::{ffi, Connection};
     use std::ffi::CStr;
@@ -2543,7 +2543,14 @@ mod tests {
             "R&D notes: 50% off the launch, and the meeting with bob@example.com",
             a_week_ago,
         );
+        insert_test_message_full(
+            &conn, &mut known_years, "acc:/:two",
+            "Greetings", "carol@example.com", "dave@example.com",
+            "日本語 हिन्दी Привет",
+            a_week_ago,
+        );
         let one = vec!["acc:/:one".to_string()];
+        let two = vec!["acc:/:two".to_string()];
         let none: Vec<String> = vec![];
 
         // Characters FTS5 would read as syntax, and FTS5 operator words.
@@ -2551,6 +2558,10 @@ mod tests {
             "50% off", "hello!", "a/b", "#launch", "$100", "budget, plan", "invoice OR", "NOT budget",
             "budget NOT", "(budget", "budget)", "AND", "NEAR", "OR budget", "\"unclosed", "\"\"",
             "x^y", "budget -plan", "{budget}", "budget AND", "re:budget", "__FQ0__", "_",
+            // Fields with no value before the next field.
+            "from: to: meeting", "subject: cc: budget", "to: body: call", "from: from: invoice",
+            // A NUL, which FTS5 reads as the end of the query.
+            "budget\u{0}", "budget\u{0}plan", "\"a\u{0}b\"", "\u{0}alice",
         ] {
             search_ok(&conn, q, &known_years);
         }
@@ -2559,6 +2570,11 @@ mod tests {
         assert_eq!(search_ok(&conn, "café", &known_years), one, "non-ASCII word");
         assert_eq!(search_ok(&conn, "cafe", &known_years), one, "without its accent");
         assert_eq!(search_ok(&conn, "50% off", &known_years), one);
+        assert_eq!(search_ok(&conn, "budget\u{0}", &known_years), one, "a NUL separates words");
+        // Words in any script.
+        for q in ["日本語", "हिन्दी", "Привет"] {
+            assert_eq!(search_ok(&conn, q, &known_years), two, "{q}");
+        }
         assert_eq!(search_ok(&conn, "R&D", &known_years), one);
         assert_eq!(search_ok(&conn, "budget, plan", &known_years), one);
         assert_eq!(search_ok(&conn, "(budget", &known_years), one);
@@ -2580,14 +2596,101 @@ mod tests {
         assert_eq!(search_ok(&conn, "body:launch", &known_years), one);
     }
 
-    /// A scoped hybrid search finds its column terms in the query built for it, for every field.
+    /// Inserts a message with the given FTS columns set and the others empty.
+    fn insert_with_fields(conn: &Connection, known_years: &mut HashSet<i32>, msg_id: &str, fields: &[(&str, &str)]) {
+        let date_ms = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        conn.execute("INSERT OR IGNORE INTO message_ids (msgId) VALUES (?1)", params![msg_id]).unwrap();
+        let row_id: i64 = conn.query_row("SELECT rowid FROM message_ids WHERE msgId = ?1", params![msg_id], |r| r.get(0)).unwrap();
+        let year = year_from_date_ms(date_ms);
+        ensure_shard(conn, year, known_years).unwrap();
+        let table = fts_table_name(year);
+        let field = |c: &str| fields.iter().find(|(k, _)| *k == c).map(|(_, v)| *v).unwrap_or("");
+        conn.execute(
+            &format!("INSERT INTO {table} (rowid, msgId, subject, from_, to_, cc, bcc, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"),
+            params![row_id, msg_id, field("subject"), field("from_"), field("to_"), field("cc"), field("bcc"), field("body")],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO message_meta (rowid, dateMs, hasAttachments, parsedIcsAttachments, shardYear) VALUES (?1, ?2, 0, '', ?3)",
+            params![row_id, date_ms, year],
+        ).unwrap();
+    }
+
+    /// Each field the search tools document scopes to its own column, in FTS search and in the
+    /// hybrid search's vector filter; no other name scopes.
     #[test]
-    fn test_every_query_field_reaches_the_column_scope_filter() {
-        let synonyms = SynonymLookup::new();
-        for (typed, col) in QUERY_COLUMNS {
-            let built = build_fts_match(Some(&format!("{typed}:\"a@example.com\" meeting")), QUERY_COLUMNS, true, &synonyms);
+    fn test_each_documented_field_scopes_to_its_column() {
+        // Written out here, not read from QUERY_COLUMNS, so a dropped or wrong entry fails.
+        let documented = [
+            ("subject", "subject"), ("from", "from_"), ("from_", "from_"), ("to", "to_"),
+            ("to_", "to_"), ("cc", "cc"), ("bcc", "bcc"), ("body", "body"),
+        ];
+        for (typed, col) in documented {
+            let (conn, mut known_years) = setup_test_db();
+            insert_with_fields(&conn, &mut known_years, "acc:/:in-field", &[(col, "zorblax@example.com")]);
+            let elsewhere = if col == "body" { "subject" } else { "body" };
+            insert_with_fields(&conn, &mut known_years, "acc:/:elsewhere", &[(elsewhere, "zorblax@example.com")]);
+            for q in [format!("{typed}:zorblax@example.com"), format!("{} zorblax@example.com", format!("{typed}:").to_uppercase())] {
+                assert_eq!(search_ok(&conn, &q, &known_years), vec!["acc:/:in-field".to_string()], "{q}");
+            }
+            let mut both = search_ok(&conn, "zorblax@example.com", &known_years);
+            both.sort();
+            assert_eq!(both, vec!["acc:/:elsewhere".to_string(), "acc:/:in-field".to_string()]);
+
+            let built = build_fts_match(Some(&format!("{typed}:\"a@example.com\" meeting")), QUERY_COLUMNS, true, &SynonymLookup::new());
             assert!(query_has_column_scope(&built), "{built}");
             assert_eq!(extract_column_scope_filter(&built), format!("{col}:\"a@example.com\""), "{built}");
+        }
+        let mut listed: Vec<_> = QUERY_COLUMNS.to_vec();
+        listed.sort();
+        let mut expected = documented.to_vec();
+        expected.sort();
+        assert_eq!(listed, expected);
+    }
+
+    /// Words that may be typed together, joined at random: no query makes search fail.
+    pub(crate) const QUERY_FRAGMENTS: &[&str] = &[
+        "from:", "From:", "to:", "cc:", "bcc:", "subject:", "body:", "from_:", "to_:", "note:", ":", "re:",
+        "meeting", "budget", "plan", "call", "invoice", "done", "AND", "OR", "NOT", "NEAR", "\"",
+        "\"budget plan\"", "(", ")", "*", "-", "^", "+", "%", "!", "?", "/", "'", ",", ".", "@", "#", "$",
+        "&", "{", "}", "[", "]", "~", "`", "\\", "|", "<", ">", "=", ";", "_", "café", "日本語", "हिन्दी",
+        "Привет", "ⓐ", "\u{301}", "😀", "\u{a0}", "\u{3000}", "\u{200b}", "\u{feff}", "\u{2028}",
+        "\u{e000}", "\u{1}", "\u{0}", "\t", " ", "a@example.com",
+    ];
+
+    /// `count` queries of 1 to 7 fragments, from a fixed seed, so a failure repeats.
+    pub(crate) fn random_queries(count: usize) -> Vec<String> {
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        (0..count)
+            .map(|_| {
+                let n = 1 + (next() % 7) as usize;
+                let mut q = String::new();
+                for _ in 0..n {
+                    q.push_str(QUERY_FRAGMENTS[(next() % QUERY_FRAGMENTS.len() as u64) as usize]);
+                    if next() % 2 == 0 {
+                        q.push(' ');
+                    }
+                }
+                q
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_no_query_text_makes_search_fail() {
+        let (conn, mut known_years) = setup_test_db();
+        let a_week_ago = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        insert_test_message_full(
+            &conn, &mut known_years, "acc:/:one", "Budget plan meeting", "alice@example.com",
+            "team@example.com", "the call about the invoice", a_week_ago,
+        );
+        for q in random_queries(3000) {
+            search_ok(&conn, &q, &known_years);
         }
     }
 

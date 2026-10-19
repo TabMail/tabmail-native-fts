@@ -257,11 +257,15 @@ class TestCallerLocations(unittest.TestCase):
                 ("memorySearch", {"q": "re: planning", "ignoreDate": True}),
                 ("memorySearch", {"q": "planning", "ignoreDate": True}),
                 ("memoryStats", {}),
+                # A refused request, so the error path is driven too.
+                ("queryByDateRange", {}),
             ],
         )
         self.assertIn("result", responses[1], responses[1])
+        self.assertIn("result", responses[2], responses[2])
         self.assertIn("result", responses[3], responses[3])
         self.assertEqual(responses[4]["result"]["docs"], 1)
+        self.assertIn("error", responses[5], responses[5])
         # Not even a folder: the search text, refused or not, is written nowhere.
         self.assertFalse(log_dir.exists())
         self.assertEqual(_tree_hashes(self.home), before)

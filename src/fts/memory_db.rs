@@ -1482,7 +1482,13 @@ pub(crate) mod tests {
             "sessionId": "persistent_chat", "turnIndex": 0,
             "dateMs": chrono::Utc::now().timestamp_millis(),
         });
-        memory_index_batch(&mut conn, &[row], None).unwrap();
+        let other = serde_json::json!({
+            "memId": "turn:2", "role": "session",
+            "content": "[USER]: 日本語 हिन्दी Привет\n\n[AGENT]: Greetings.",
+            "sessionId": "persistent_chat", "turnIndex": 1,
+            "dateMs": chrono::Utc::now().timestamp_millis(),
+        });
+        memory_index_batch(&mut conn, &[row, other], None).unwrap();
         let synonyms = SynonymLookup::new();
         let params = serde_json::json!({"ignoreDate": true});
         let found = |q: &str| -> usize {
@@ -1490,8 +1496,15 @@ pub(crate) mod tests {
                 .unwrap_or_else(|e| panic!("memory search for {q:?} failed: {e:?}"))
                 .len()
         };
-        for q in ["50% off", "a/b", "#plan", "NOT plan", "(plan", "plan OR", "\"unclosed", "x^y", "subject:plan"] {
+        for q in ["50% off", "a/b", "#plan", "NOT plan", "(plan", "plan OR", "\"unclosed", "x^y", "subject:plan", "plan\u{0}", "\"a\u{0}b\""] {
             found(q);
+        }
+        for q in crate::fts::db::tests::random_queries(3000) {
+            found(&q);
+        }
+        assert_eq!(found("plan\u{0}"), 1, "a NUL separates words");
+        for q in ["日本語", "हिन्दी", "Привет"] {
+            assert_eq!(found(q), 1, "{q}");
         }
         assert_eq!(found("from: alice"), 1, "from: is text in memory");
         assert_eq!(found("from:alice@example.com"), 1);

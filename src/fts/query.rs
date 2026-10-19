@@ -18,43 +18,50 @@ pub fn build_fts_match(
     synonyms: &SynonymLookup,
 ) -> String {
     let Some(q) = q else { return String::new() };
-    let items = scan(q);
+    // FTS5 reads a NUL as the end of the query, leaving a string open; the tokenizer treats it
+    // as a separator anyway.
+    let q = q.replace('\0', " ");
+    let items = scan(&q);
 
     // A word with synonyms becomes an OR group; FTS5 then needs an explicit AND between all
-    // terms, and no word gets an automatic prefix star (as before).
-    let has_or_groups = use_synonyms
-        && items.iter().enumerate().any(|(i, item)| {
-            matches!(item, Item::Word(w) if scoped_column(w, columns).is_none()
-                && !follows_bare_field(&items, i, columns)
-                && prepare_word(w).is_some_and(|(core, star)| expands(&core, star, synonyms)))
-        });
-
-    let mut out: Vec<String> = vec![];
-    let mut i = 0usize;
-    while i < items.len() {
-        let item = items[i];
-        i += 1;
-        let term = match item {
-            Item::Phrase(p) => phrase(p),
-            Item::Word(w) => match scoped_column(w, columns) {
-                // name:"phrase" and name: word take the next item as the value.
-                Some((col, "")) => {
-                    let value = items.get(i).copied();
-                    i += 1;
-                    match value {
-                        Some(Item::Phrase(p)) => phrase(p).map(|v| format!("{col}:{v}")),
-                        Some(Item::Word(w)) => word(w, false, has_or_groups, synonyms).map(|v| format!("{col}:{v}")),
-                        None => None,
+    // terms, and no word gets an automatic prefix star (as before). Whether there is a group is
+    // read from the terms written, so it can't disagree with how they were written.
+    let render = |has_or_groups: bool| -> Vec<String> {
+        let mut out: Vec<String> = vec![];
+        let mut i = 0usize;
+        while i < items.len() {
+            let item = items[i];
+            i += 1;
+            let term = match item {
+                Item::Phrase(p) => phrase(p),
+                Item::Word(w) => match scoped_column(w, columns) {
+                    // name:"phrase" and name: word take the next item as the value.
+                    Some((col, "")) => {
+                        let value = items.get(i).copied();
+                        i += 1;
+                        match value {
+                            Some(Item::Phrase(p)) => phrase(p).map(|v| format!("{col}:{v}")),
+                            Some(Item::Word(w)) => word(w, false, has_or_groups, synonyms).map(|v| format!("{col}:{v}")),
+                            None => None,
+                        }
                     }
-                }
-                Some((col, value)) => word(value, false, has_or_groups, synonyms).map(|v| format!("{col}:{v}")),
-                None => word(w, use_synonyms, has_or_groups, synonyms),
-            },
-        };
-        out.extend(term);
-    }
+                    Some((col, value)) => word(value, false, has_or_groups, synonyms).map(|v| format!("{col}:{v}")),
+                    None => word(w, use_synonyms, has_or_groups, synonyms),
+                },
+            };
+            out.extend(term);
+        }
+        out
+    };
 
-    out.join(if has_or_groups { " AND " } else { " " })
+    let terms = render(false);
+    // Only a synonym group starts with "(": words and phrases start with a quote, scoped terms
+    // with their column.
+    if terms.iter().any(|t| t.starts_with('(')) {
+        render(true).join(" AND ")
+    } else {
+        terms.join(" ")
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -94,12 +101,7 @@ fn scoped_column<'a>(w: &'a str, columns: &[(&str, &'a str)]) -> Option<(&'a str
         .map(|(_, col)| (*col, value))
 }
 
-/// Whether item `i` is the value of a bare `name:` before it.
-fn follows_bare_field(items: &[Item], i: usize, columns: &[(&str, &str)]) -> bool {
-    i > 0 && matches!(items[i - 1], Item::Word(w) if matches!(scoped_column(w, columns), Some((_, ""))))
-}
-
-/// Whether text has anything a tokenizer would index (a term with none matches nothing).
+/// Whether text has a letter or digit (a term with nothing the tokenizer indexes matches nothing).
 fn has_text(s: &str) -> bool {
     s.chars().any(char::is_alphanumeric)
 }
@@ -158,6 +160,13 @@ mod tests {
         assert_eq!(build(r#"say "hi there"#, &[]), r#""say" "hi there""#);
         assert_eq!(build("it's gone?", &[]), r#""its" "gone"*"#);
         assert_eq!(build("budg*", &[]), r#""budg"*"#);
+        // A user's star keeps a short word a prefix, and a starred word never expands.
+        assert_eq!(build("ab*", &[]), r#""ab"*"#);
+        assert_eq!(build("meeting*", &[]), r#""meeting"*"#);
+        // An underscore is part of a word, not punctuation: no star on a short one.
+        assert_eq!(build("a_b", &[]), r#""a_b""#);
+        // A NUL separates words.
+        assert_eq!(build("ab\u{0}cd", &[]), r#""ab" "cd""#);
         assert_eq!(build(r#"-- "" _ ?"#, &[]), "");
     }
 
@@ -177,6 +186,12 @@ mod tests {
         assert!(q.starts_with('(') && q.contains(" OR meeting OR "), "{q}");
         // With groups present no word gets an automatic star.
         assert!(q.ends_with(r#") AND "budget plan" AND from_:"alice""#), "{q}");
+        // The user's star survives beside a group.
+        let q = build("meeting budg*", COLUMNS);
+        assert!(q.starts_with('(') && q.ends_with(r#") AND "budg"*"#), "{q}");
+        // Fields with no value: each takes the next item, and the joiner follows what is written.
+        let q = build("from: subject: meeting", COLUMNS);
+        assert!(q.starts_with(r#"from_:"subject:"* AND ("#), "{q}");
         // A field's value is never expanded, and does not cause groups.
         assert_eq!(build("subject:meeting zebra", COLUMNS), r#"subject:"meeting"* "zebra"*"#);
     }
