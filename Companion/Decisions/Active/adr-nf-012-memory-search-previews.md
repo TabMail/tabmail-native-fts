@@ -71,10 +71,18 @@ matches (it asked for 2,000). Review of that change found two helper defects it 
 Still open (not here): a search's `limit` times `CANDIDATE_MULTIPLIER` over 4,096 still fails the
 vector search silently, for email and memory searches alike (#20; Thunderbird's email search and Voice's
 memory search ask for 2,000), so those run keyword-only.
+The date filter also runs on sqlite-vec's top k over the whole memory: when k or more entries
+outside the dates are nearer the query, no match inside them keeps its vector score, so an entry
+inside the dates that matches only by meaning is missed (one with the words is still found by the
+keyword leg). Asking sqlite-vec for the dates directly would need the date in the vector table.
 
 Evidence: `memory_listing_gives_the_newest_within_the_dates_each_whole` (unit: newest first, the
 limit, both bounds inclusive, `ignoreDate` over the dates, every field whole) passes on the old
 query and the new; red with the inner order reversed, the outer order dropped, and `from` ignored.
-`test_memory_search_with_dates_keeps_the_matches_within_them` (process, model loaded: 40 entries
-nearer the query outside the dates, 6 matches inside, 300 others) returns the 6; red on the old
-code (it returned none).
+`test_memory_search_with_dates_keeps_the_matches_within_them` (process, model loaded: 20 entries
+nearer the query before the dates and 20 after, 6 matches inside with one at each bound, 300 others)
+returns the 6; red on the old code (it returned 4 of them) and with `to` not enforced.
+`test_memory_search_with_dates_scores_the_matches_within_them_as_without` (2 nearer entries on each
+side, 6 matches inside near enough the query that their vector score counts) ranks each match
+inside the dates as the search without dates does; red with the in-range vector candidates dropped
+and with `from` exclusive.
