@@ -37,7 +37,7 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 safetensors = "0.5"
 
 # Unicode general categories for the query builder (which characters the FTS tokenizer indexes).
-# Already built as a dependency of tokenizers: no new code in the binary.
+# Already a dependency of tokenizers (no new crate); its category tables add about 20 KB.
 unicode_categories = "0.1.1"
 
 [dev-dependencies]

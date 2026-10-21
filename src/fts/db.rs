@@ -2636,6 +2636,8 @@ pub(crate) mod tests {
         assert_eq!(found("from:alice@example.com NOT launch"), none);
         assert_eq!(found("from:alice@example.com NOT greetings"), one);
         assert_eq!(found("greetings NOT budget"), two);
+        // An operator replaces one join: this is café, or greetings and budget.
+        assert_eq!(found("café OR greetings budget"), one);
         // Not between two terms: dropped.
         assert_eq!(found("NOT budget"), one);
         assert_eq!(found("OR greetings"), two);
@@ -2691,6 +2693,7 @@ pub(crate) mod tests {
         insert_test_message_full(&conn, &mut known_years, "acc:/:sarahs", "Sarah's invoice", "billing@example.com", "team@example.com", "", a_week_ago);
         insert_test_message_full(&conn, &mut known_years, "acc:/:john", "Travel", "agent@example.com", "team@example.com", "John booked the flight to Denver.", a_week_ago);
         insert_test_message_full(&conn, &mut known_years, "acc:/:team", "Team budget", "carol@example.com", "team@example.com", "", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:expense", "Travel expense report", "agent@example.com", "office@example.com", "", a_week_ago);
         let found = |q: &str| -> Vec<String> {
             let mut ids = search_ok(&conn, q, &known_years);
             ids.sort();
@@ -2707,6 +2710,8 @@ pub(crate) mod tests {
         }
         assert_eq!(found("John's flight"), vec!["acc:/:john".to_string()]);
         assert_eq!(found("team's budget"), vec!["acc:/:team".to_string()]);
+        // Quote marks around a word are not part of it: it still expands to its synonyms.
+        assert_eq!(found("'budget'"), vec!["acc:/:expense".to_string(), "acc:/:team".to_string()]);
     }
 
     /// A word gets its automatic prefix star unless a word with synonyms is in its own run of
@@ -2718,6 +2723,17 @@ pub(crate) mod tests {
         insert_test_message_full(&conn, &mut known_years, "acc:/:sheet", "Roadmapping", "alice@example.com", "team@example.com", "Notesheet from Jane Doe for the meeting", a_week_ago);
         insert_test_message_full(&conn, &mut known_years, "acc:/:other", "Roadmapping", "alice@example.com", "team@example.com", "Jane Doe set up the meeting", a_week_ago);
         assert_eq!(search_ok(&conn, "notes \"Jane Doe\" roadmapping meeting", &known_years), vec!["acc:/:sheet".to_string()]);
+        // A possessive does not expand, so `notes` beside it stays a prefix: this finds
+        // "Notesheet", and not the mail that has only a synonym of "client".
+        insert_test_message_full(&conn, &mut known_years, "acc:/:r1", "Notesheet for the client", "alice@example.com", "office@example.com", "", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:r2", "Notes for the customer", "alice@example.com", "office@example.com", "", a_week_ago);
+        assert_eq!(search_ok(&conn, "client's notes", &known_years), vec!["acc:/:r1".to_string()]);
+        // A field's value beside a synonym group is not a prefix either, as before.
+        insert_test_message_full(&conn, &mut known_years, "acc:/:r3", "Meeting", "alex@example.com", "office@example.com", "", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:r4", "Meeting", "alexandra@example.com", "office@example.com", "", a_week_ago);
+        for q in ["meeting from:alex", "meeting from: alex"] {
+            assert_eq!(search_ok(&conn, q, &known_years), vec!["acc:/:r3".to_string()], "{q}");
+        }
     }
 
     /// Inserts a message with the given FTS columns set and the others empty.

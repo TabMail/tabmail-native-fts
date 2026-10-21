@@ -34,16 +34,20 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
    whole.
 2. Every word and phrase is written as an FTS5 string (`"word"`, with a prefix `*` for a user `*`,
    a word with punctuation, or a plain word of 4+ bytes when no word in its run of words between
-   quoted phrases has synonyms, as the old builder decided it per quote-delimited segment). Apart from
+   quoted phrases has synonyms, as before). Apart from
    the operators of point 4, no query text is ever FTS5 syntax. A word or phrase with nothing the tokenizer indexes is dropped (an
-   empty string inside an AND matches nothing). That is unicode61's own rule, letters, numbers and
-   private-use characters (`L* N* Co`), read from the `unicode_categories` crate (already built
-   for `tokenizers`): Rust's `is_alphanumeric` also counts marks and enclosed-letter symbols
-   (Ⓜ, 🅿) the tokenizer does not index, and misses private-use characters it does. A word keeps
-   its apostrophes, except one possessive `'s` (straight or typographic), which is removed:
+   empty string inside an AND matches nothing). That follows unicode61's rule, letters, numbers
+   and private-use characters (`L* N* Co`), read from the `unicode_categories` crate (already a
+   dependency of `tokenizers`): Rust's `is_alphanumeric` also counts marks and enclosed-letter
+   symbols (Ⓜ, 🅿) the tokenizer does not index, and misses private-use characters it does. It is
+   close, not exact: unicode61 uses Unicode 6.1 data, so a few code points classified since then
+   are read differently (see Consequences). A word keeps its apostrophes, except quote marks at
+   either end (`'budget'`) and one possessive `'s` (straight or typographic), which are removed:
    quoted, `O'Brien` is the phrase `o brien` the tokenizer indexed, and `John's` searches `John`,
-   as 0.11.8 effectively did (only one trailing `*`, then trailing `/` and `?`, then the
-   possessive are removed from a word).
+   as 0.11.8 effectively did (only one trailing `*`, then trailing `/` and `?`, then the quote
+   marks, then the possessive are removed from a word). A possessive does not expand to synonyms
+   (0.11.8 searched `client's` as `clients`, which has none), so it does not take the prefix star
+   off the words beside it.
 3. A word expanding to synonyms becomes the generated `(a OR b …)` group; when any group is
    present every term is joined with an explicit `AND`. Whether a
    group is present is read from the terms as written (only a group starts with `(`), so it can't
@@ -72,9 +76,9 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
   generated from a fixed word list, so they are the only syntax left to trust.
 - Operators were never documented (the tool descriptions offer plain language, `"phrases"` and
   the six fields), but the old builder passed them through, and a model writes Gmail-style
-  `from:X OR to:X`. That worked whenever no word beside it had synonyms. The review of the first
-  candidate (2026-10-21) measured it returning nothing once `OR` was searched as a word, so
-  between two terms they stay operators; only the placements that made FTS5 fail are dropped.
+  `from:X OR to:X`. That worked whenever no word beside it had synonyms, and returns nothing once
+  `OR` is searched as a word, so between two terms they stay operators; only the placements that
+  made FTS5 fail are dropped.
 
 ## Consequences
 
@@ -93,15 +97,29 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
   `don't forget` in the mail that has them and not in the one spelling `OBrien` / `Dont` (red
   with the apostrophe strip restored: each finds only the other row), and `Sarah's`,
   `Sarah’s invoice`, `John's flight`, `team's budget` find what they name (red without the
-  possessive strip); `db::tests::test_search_prefix_star_is_decided_per_run_of_words` and the
-  memory twin (red with a query-wide star rule); the text-less tests include enclosed letters and
+  possessive strip), and `'budget'` still expands;
+  `db::tests::test_search_prefix_star_is_decided_per_run_of_words` and the memory twin (red with
+  a query-wide star rule), including `client's notes` finding "Notesheet for the client" and not
+  "Notes for the customer" (red when a possessive expands) and a field's value beside a group
+  staying exact (`meeting from:alex` does not find alexandra); an operator replaces one join only
+  (`café OR greetings budget`); the text-less tests include enclosed letters and
   a lone mark, and `test_search_keeps_private_use_characters` is two-sided (red with
   `is_alphanumeric`); `test_rust_process_parity` `test_scoped_search_with_embeddings_finds_only_the_field` checks the
   same with the embedding model loaded.
 - A differential against the released 0.11.8 helper (Thunderbird-shaped `search` and
   `memorySearch`, with and without the embedding model, 2026-10-21) found no query that newly
-  fails. The round-6 review then measured possessives (`John's flight`), a query-wide star rule
-  and non-indexed letters losing matches 0.11.8 found; all three were corrected as above.
+  fails, and no common query shape that finds less, apart from the intended apostrophe change
+  above (`O'Brien`, `don't`).
+- Accepted limitations, approved by the owner on 2026-10-21 (common query shapes must find what
+  0.11.8 found; a recall difference on rare input is acceptable, and synonym expansion stays):
+  - Rare input: a few code points are read differently from unicode61's Unicode 6.1 data (code
+    points unassigned in 6.1, which it indexes, are dropped; New Tai Lue vowel signs, letters
+    today but marks in 6.1, are kept and match nothing). A `*` inside a word (`budg*et`) is part
+    of the word, not a prefix marker. A field with a space before its value (`from: "jane doe"`)
+    takes a phrase without starting a new run of words.
+  - Pre-existing in 0.11.8, tracked separately: a kept `NOT` is not applied to hybrid vector
+    candidates (#21); a query with more than 256 kept `NOT`s exceeds FTS5's expression depth and
+    fails (#22).
 - `role:` / `content:` no longer scope in memory search, and `msgId:` / `attachmentNames:` no longer
   scope in mail search (all undocumented and unused by any client).
 - Both behaviour changes (`from :` with a space before the colon no longer scopes; memory search has

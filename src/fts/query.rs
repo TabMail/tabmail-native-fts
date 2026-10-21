@@ -160,26 +160,28 @@ fn phrase(p: &str) -> Option<String> {
     has_text(p).then(|| format!("\"{p}\""))
 }
 
-/// A word's searched text and whether the user ended it with `*`: one trailing `*`, then
-/// trailing `/` and `?`, then one possessive `'s` are removed. Any other apostrophe stays: the
-/// tokenizer splits `O'Brien` into `o` and `brien`, and the quoted word searches them as a phrase.
+/// A word's searched text, whether the user ended it with `*`, and whether a possessive was
+/// removed: one trailing `*`, then trailing `/` and `?`, then quote marks at either end
+/// (`'budget'`), then one possessive `'s` are removed. Any other apostrophe stays: the tokenizer
+/// splits `O'Brien` into `o` and `brien`, and the quoted word searches them as a phrase.
 /// `John's` searches `John`, which (stemmed) also finds "John's".
-fn prepare_word(w: &str) -> Option<(String, bool)> {
+fn prepare_word(w: &str) -> Option<(String, bool, bool)> {
     let (w, star) = match w.strip_suffix('*') {
         Some(rest) => (rest, true),
         None => (w, false),
     };
-    let w = w.trim_end_matches(['/', '?']);
-    let core = POSSESSIVES.iter().find_map(|p| w.strip_suffix(p)).unwrap_or(w).to_string();
-    has_text(&core).then_some((core, star))
+    let w = w.trim_end_matches(['/', '?']).trim_matches(['\'', '\u{2018}', '\u{2019}']);
+    let stripped = POSSESSIVES.iter().find_map(|p| w.strip_suffix(p));
+    let core = stripped.unwrap_or(w).to_string();
+    has_text(&core).then_some((core, star, stripped.is_some()))
 }
 
 /// A possessive ending, with a straight or a typographic apostrophe.
 const POSSESSIVES: [&str; 4] = ["'s", "'S", "\u{2019}s", "\u{2019}S"];
 
-/// Only a plain word the user did not star expands to its synonyms.
+/// Only a word the user did not star expands to its synonyms (every synonym is plain letters).
 fn expands(core: &str, star: bool, synonyms: &SynonymLookup) -> bool {
-    !star && !has_punctuation(core) && synonyms.expand(core) != core
+    !star && synonyms.expand(core) != core
 }
 
 fn has_punctuation(core: &str) -> bool {
@@ -187,8 +189,10 @@ fn has_punctuation(core: &str) -> bool {
 }
 
 fn word(w: &str, use_synonyms: bool, has_or_groups: bool, synonyms: &SynonymLookup) -> Option<String> {
-    let (core, star) = prepare_word(w)?;
-    if use_synonyms && expands(&core, star, synonyms) {
+    let (core, star, possessive) = prepare_word(w)?;
+    // A possessive searches the word it names, never its synonyms: 0.11.8 searched `client's`
+    // as `clients`, which has none, and a group would take the prefix star off its neighbours.
+    if use_synonyms && !possessive && expands(&core, star, synonyms) {
         return Some(synonyms.expand(&core));
     }
     // A word with punctuation is a phrase of its parts ("dmarc-supp" → [dmarc, supp]); the star
@@ -217,6 +221,11 @@ mod tests {
         // One possessive 's is removed; any other apostrophe stays.
         assert_eq!(build("it's gone?", &[]), r#""it" "gone"*"#);
         assert_eq!(build("Sarah\u{2019}s O'Brien's don't", &[]), r#""Sarah"* "O'Brien"* "don't"*"#);
+        // A possessive never expands, so its neighbours keep their stars.
+        assert_eq!(build("client's notes", &[]), r#""client"* "notes"*"#);
+        // Quote marks around a word are not part of it.
+        assert_eq!(build("'budget'", &[]), build("budget", &[]));
+        assert_eq!(build("\u{2018}abcd\u{2019}", &[]), r#""abcd"*"#);
         assert_eq!(build("budg*", &[]), r#""budg"*"#);
         // A user's star keeps a short word a prefix, and a starred word never expands.
         assert_eq!(build("ab*", &[]), r#""ab"*"#);
@@ -247,6 +256,8 @@ mod tests {
         assert_eq!(build("from:alice OR from:bob", COLUMNS), r#"from_:"alice"* OR from_:"bob""#);
         assert_eq!(build(r#""a b" NOT zebra"#, &[]), r#""a b" NOT "zebra"*"#);
         assert_eq!(build("abcd AND efgh", &[]), r#""abcd"* AND "efgh"*"#);
+        // An operator replaces one join only.
+        assert_eq!(build("abcd OR efgh ijkl", &[]), r#""abcd"* OR "efgh"* "ijkl"*"#);
         // First, last, doubled, or left with no term after it: dropped.
         assert_eq!(build("OR abcd", &[]), r#""abcd"*"#);
         assert_eq!(build("abcd NOT", &[]), r#""abcd"*"#);
@@ -277,6 +288,11 @@ mod tests {
         // Fields with no value: each takes the next item, and the joiner follows what is written.
         let q = build("from: subject: meeting", COLUMNS);
         assert!(q.starts_with(r#"from_:"subject:"* AND ("#), "{q}");
+        // A field's value beside a group gets no automatic star either.
+        for q in ["meeting from:alex", "meeting from: alex"] {
+            let q = build(q, COLUMNS);
+            assert!(q.ends_with(r#") AND from_:"alex""#), "{q}");
+        }
         // A field's value is never expanded, and does not cause groups.
         assert_eq!(build("subject:meeting zebra", COLUMNS), r#"subject:"meeting"* "zebra"*"#);
     }

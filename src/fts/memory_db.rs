@@ -1542,7 +1542,9 @@ pub(crate) mod tests {
             "[USER]: lunch with OBrien\n\n[AGENT]: Dont forget the receipts.",
             "[USER]: what is the team budget?\n\n[AGENT]: Notesheet from Jane Doe: roadmapping for the meeting.",
             "[USER]: plan \u{e000} launch\n\n[AGENT]: Noted.",
-            "[USER]: plan launch\n\n[AGENT]: Noted."]
+            "[USER]: plan launch\n\n[AGENT]: Noted.",
+            "[USER]: Notesheet for the client\n\n[AGENT]: Noted.",
+            "[USER]: notes for the customer\n\n[AGENT]: Noted."]
             .iter()
             .enumerate()
             .map(|(i, content)| serde_json::json!({
@@ -1561,8 +1563,9 @@ pub(crate) mod tests {
             assert_eq!(ids, ["turn:0"], "{q:?}");
         }
         // A possessive finds what it names; a word in a run without synonyms keeps its prefix
-        // star (`notes` finds "Notesheet"); a private-use character is indexed and kept.
-        for (q, want) in [("team's budget", "turn:2"), ("notes \"Jane Doe\" roadmapping budget", "turn:2"), ("plan \u{e000}", "turn:3")] {
+        // star (`notes` finds "Notesheet"), and so does one beside a possessive, which does not
+        // expand; a private-use character is indexed and kept.
+        for (q, want) in [("team's budget", "turn:2"), ("notes \"Jane Doe\" roadmapping budget", "turn:2"), ("plan \u{e000}", "turn:3"), ("client's notes", "turn:5")] {
             let found = memory_search(&conn, q, &params, &synonyms, None)
                 .unwrap_or_else(|e| panic!("memory search for {q:?} failed: {e:?}"));
             let ids: Vec<_> = found.iter().map(|r| r["memId"].as_str().unwrap_or_default()).collect();
