@@ -6,11 +6,11 @@ use crate::fts::synonyms::SynonymLookup;
 
 /// Builds the FTS5 MATCH expression for a search query a user typed or a model wrote.
 ///
-/// Every word and every `"quoted phrase"` reaches FTS5 as a string, so nothing typed is read
-/// as FTS5 syntax: operator words, parentheses and punctuation are searched as text, and
-/// non-ASCII text is kept whole. `name:word`, `name:"phrase"` and `name: word` scope to a
-/// column only when `columns` names it (typed name, case-insensitive → table column); any
-/// other `x:` is text. The synonym groups added here are the only operators in the result.
+/// Every word and every `"quoted phrase"` reaches FTS5 as a string, so nothing typed breaks the
+/// query: parentheses and punctuation are searched as text, and non-ASCII text is kept whole.
+/// A capital AND, OR or NOT between two terms stays the operator; anywhere else it is dropped.
+/// `name:word`, `name:"phrase"` and `name: word` scope to a column only when `columns` names it
+/// (typed name, case-insensitive → table column); any other `x:` is text.
 pub fn build_fts_match(
     q: Option<&str>,
     columns: &[(&str, &str)],
@@ -26,12 +26,24 @@ pub fn build_fts_match(
     // A word with synonyms becomes an OR group; FTS5 then needs an explicit AND between all
     // terms, and no word gets an automatic prefix star (as before). Whether there is a group is
     // read from the terms written, so it can't disagree with how they were written.
-    let render = |has_or_groups: bool| -> Vec<String> {
-        let mut out: Vec<String> = vec![];
+    // A capital AND, OR or NOT standing between two terms stays the FTS5 operator, as the old
+    // builder passed it through (`from:"a@example.com" OR to:"a@example.com"`); anywhere else
+    // (first, last, after another operator) it is dropped.
+    let render = |has_or_groups: bool| -> Vec<(Option<&'static str>, String)> {
+        let mut out: Vec<(Option<&'static str>, String)> = vec![];
+        let mut operator: Option<&'static str> = None;
         let mut i = 0usize;
         while i < items.len() {
             let item = items[i];
             i += 1;
+            if let Item::Word(w) = item {
+                if let Some(op) = OPERATORS.iter().find(|op| **op == w) {
+                    if !out.is_empty() && operator.is_none() {
+                        operator = Some(*op);
+                    }
+                    continue;
+                }
+            }
             let term = match item {
                 Item::Phrase(p) => phrase(p),
                 Item::Word(w) => match scoped_column(w, columns) {
@@ -49,20 +61,42 @@ pub fn build_fts_match(
                     None => word(w, use_synonyms, has_or_groups, synonyms),
                 },
             };
-            out.extend(term);
+            if let Some(term) = term {
+                out.push((operator.take(), term));
+            }
         }
         out
+    };
+    let join = |terms: Vec<(Option<&str>, String)>, joiner: &str| -> String {
+        let mut s = String::new();
+        for (n, (op, term)) in terms.into_iter().enumerate() {
+            if n > 0 {
+                match op {
+                    Some(op) => {
+                        s.push(' ');
+                        s.push_str(op);
+                        s.push(' ');
+                    }
+                    None => s.push_str(joiner),
+                }
+            }
+            s.push_str(&term);
+        }
+        s
     };
 
     let terms = render(false);
     // Only a synonym group starts with "(": words and phrases start with a quote, scoped terms
     // with their column.
-    if terms.iter().any(|t| t.starts_with('(')) {
-        render(true).join(" AND ")
+    if terms.iter().any(|(_, t)| t.starts_with('(')) {
+        join(render(true), " AND ")
     } else {
-        terms.join(" ")
+        join(terms, " ")
     }
 }
+
+/// FTS5's binary operators, which are case-sensitive.
+const OPERATORS: [&str; 3] = ["AND", "OR", "NOT"];
 
 #[derive(Clone, Copy)]
 enum Item<'a> {
@@ -156,7 +190,7 @@ mod tests {
     fn words_and_phrases_are_strings() {
         assert_eq!(build("café", &[]), r#""café"*"#);
         assert_eq!(build("50% off", &[]), r#""50%"* "off""#);
-        assert_eq!(build("NOT (budget", &[]), r#""NOT" "(budget"*"#);
+        assert_eq!(build("NOT (budget", &[]), r#""(budget"*"#);
         assert_eq!(build(r#"say "hi there"#, &[]), r#""say" "hi there""#);
         assert_eq!(build("it's gone?", &[]), r#""its" "gone"*"#);
         assert_eq!(build("budg*", &[]), r#""budg"*"#);
@@ -178,6 +212,26 @@ mod tests {
         assert_eq!(build("subject:", COLUMNS), "");
         assert_eq!(build("note:launch", COLUMNS), r#""note:launch"*"#);
         assert_eq!(build("from:alice", &[]), r#""from:alice"*"#);
+    }
+
+    #[test]
+    fn operators_between_terms_stay_operators() {
+        assert_eq!(build("from:alice OR from:bob", COLUMNS), r#"from_:"alice"* OR from_:"bob""#);
+        assert_eq!(build(r#""a b" NOT zebra"#, &[]), r#""a b" NOT "zebra"*"#);
+        assert_eq!(build("abcd AND efgh", &[]), r#""abcd"* AND "efgh"*"#);
+        // First, last, doubled, or left with no term after it: dropped.
+        assert_eq!(build("OR abcd", &[]), r#""abcd"*"#);
+        assert_eq!(build("abcd NOT", &[]), r#""abcd"*"#);
+        assert_eq!(build("abcd OR NOT efgh", &[]), r#""abcd"* OR "efgh"*"#);
+        assert_eq!(build("abcd OR -- efgh", &[]), r#""abcd"* OR "efgh"*"#);
+        assert_eq!(build("OR AND NOT", &[]), "");
+        // Lowercase, quoted, or a field's value: text.
+        assert_eq!(build("abcd or efgh", &[]), r#""abcd"* "or" "efgh"*"#);
+        assert_eq!(build(r#"abcd "OR" efgh"#, &[]), r#""abcd"* "OR" "efgh"*"#);
+        assert_eq!(build("subject: OR", COLUMNS), r#"subject:"OR""#);
+        // Beside a synonym group, an operator replaces the AND join.
+        let q = build("meeting OR zebra", COLUMNS);
+        assert!(q.starts_with('(') && q.ends_with(r#") OR "zebra""#), "{q}");
     }
 
     #[test]

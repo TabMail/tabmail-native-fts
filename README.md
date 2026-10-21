@@ -228,8 +228,9 @@ FTS5 uses Porter stemming for English:
 
 ### Query Text
 
-Every word and `"quoted phrase"` in a query is searched as text, so punctuation and capitalized
-`AND`/`OR`/`NOT` never cause a syntax error. Mail search scopes `subject:`, `from:`, `to:`,
+Every word and `"quoted phrase"` in a query is searched as text, so punctuation never causes a
+syntax error. A capitalized `AND`, `OR` or `NOT` between two terms is an operator
+(`from:"alice@example.com" OR to:"alice@example.com"`); anywhere else it is dropped. Mail search scopes `subject:`, `from:`, `to:`,
 `cc:`, `bcc:` and `body:` (for example `from:"alice@example.com" budget`); any other `word:` is
 text, and memory search has no fields.
 

@@ -2596,6 +2596,65 @@ pub(crate) mod tests {
         assert_eq!(search_ok(&conn, "body:launch", &known_years), one);
     }
 
+    /// Capital AND, OR and NOT between two terms are operators, as they always were
+    /// (`from:X OR to:X`); first, last or doubled they are dropped. Any whitespace separates
+    /// words, and a word with no letter or digit never hides a match.
+    #[test]
+    fn test_search_operators_separators_and_text_less_words() {
+        let (conn, mut known_years) = setup_test_db();
+        let a_week_ago = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        insert_test_message_full(
+            &conn, &mut known_years, "acc:/:one",
+            "Budget plan for the café",
+            "alice@example.com", "team@example.com",
+            "R&D notes: 50% off the launch, and the meeting with bob@example.com",
+            a_week_ago,
+        );
+        insert_test_message_full(
+            &conn, &mut known_years, "acc:/:two",
+            "Greetings", "carol@example.com", "dave@example.com",
+            "日本語 हिन्दी Привет",
+            a_week_ago,
+        );
+        let found = |q: &str| -> Vec<String> {
+            let mut ids = search_ok(&conn, q, &known_years);
+            ids.sort();
+            ids
+        };
+        let one = vec!["acc:/:one".to_string()];
+        let two = vec!["acc:/:two".to_string()];
+        let both = vec!["acc:/:one".to_string(), "acc:/:two".to_string()];
+        let none: Vec<String> = vec![];
+
+        assert_eq!(found("from:alice@example.com OR from:carol@example.com"), both);
+        assert_eq!(found("from:\"alice@example.com\" OR to:\"dave@example.com\""), both);
+        assert_eq!(found("\"budget plan\" OR greetings"), both);
+        // Beside a synonym group.
+        assert_eq!(found("meeting OR greetings"), both);
+        assert_eq!(found("from:alice@example.com AND from:carol@example.com"), none);
+        assert_eq!(found("from:alice@example.com AND launch"), one);
+        assert_eq!(found("from:alice@example.com NOT launch"), none);
+        assert_eq!(found("from:alice@example.com NOT greetings"), one);
+        assert_eq!(found("greetings NOT budget"), two);
+        // Not between two terms: dropped.
+        assert_eq!(found("NOT budget"), one);
+        assert_eq!(found("OR greetings"), two);
+        assert_eq!(found("greetings OR"), two);
+        assert_eq!(found("greetings OR NOT budget"), both);
+        assert_eq!(found("greetings OR -- budget"), both);
+
+        // Tabs, no-break and ideographic spaces separate words like a space: the words are
+        // found apart, not as the phrase "plan budget".
+        assert_eq!(found("\"plan budget\""), none);
+        for q in ["plan budget", "plan\tbudget", "plan\u{a0}budget", "plan\u{3000}budget"] {
+            assert_eq!(found(q), one, "{q:?}");
+        }
+
+        // A word with no letter or digit, beside words with synonyms (an AND join).
+        assert_eq!(found("budget ?"), one);
+        assert_eq!(found("meeting -- \"\""), one);
+    }
+
     /// Inserts a message with the given FTS columns set and the others empty.
     fn insert_with_fields(conn: &Connection, known_years: &mut HashSet<i32>, msg_id: &str, fields: &[(&str, &str)]) {
         let date_ms = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;

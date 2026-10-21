@@ -30,15 +30,21 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
    whole.
 2. Every word and phrase is written as an FTS5 string (`"word"`, with a prefix `*` for a user `*`,
    a word with punctuation, or a plain word of 4+ bytes when there are no synonym groups in the
-   query; the old builder decided the last per quote-delimited segment, now it is query-wide). No
-   query text is ever FTS5 syntax. A word or phrase with no letter or digit is dropped (an empty
+   query; the old builder decided the last per quote-delimited segment, now it is query-wide). Apart from
+   the operators of point 4, no query text is ever FTS5 syntax. A word or phrase with no letter or digit is dropped (an empty
    string inside an AND matches nothing).
-3. A word expanding to synonyms becomes the generated `(a OR b …)` group, the only operators in
-   the result; when any group is present every term is joined with an explicit `AND`. Whether a
+3. A word expanding to synonyms becomes the generated `(a OR b …)` group; when any group is
+   present every term is joined with an explicit `AND`. Whether a
    group is present is read from the terms as written (only a group starts with `(`), so it can't
    disagree with how fields took their values (a separate pre-scan did, for runs of empty fields
    like `from: to: meeting`).
-4. Column scoping is the caller's list: `build_fts_match(q, columns, …)`. Mail search passes
+4. A capital `AND`, `OR` or `NOT` (FTS5's operators are case-sensitive) standing between two
+   written terms stays that operator, in place of the join: `from:"a@example.com" OR
+   to:"a@example.com"`, `"budget plan" OR greetings`, `alice NOT carol`. One that is first, last,
+   after another operator, or left with no written term after it is dropped (`NOT budget` searches
+   `budget`), so it can never be a syntax error. Lowercase, quoted or a field's value, it is text.
+   The hybrid column filter keeps joining the scoped terms with a space, as before.
+5. Column scoping is the caller's list: `build_fts_match(q, columns, …)`. Mail search passes
    `QUERY_COLUMNS` (the documented `subject from to cc bcc body`, plus `from_ to_`), matched
    case-insensitively and written as the shard column; `name:word`, `name:"phrase"` and
    `name: word` scope. Every listed column is in `COLUMN_SCOPE_PREFIXES`, so a scoped hybrid
@@ -49,9 +55,11 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
 
 - Quoting everything is the one rule that makes every input valid; the synonym groups are
   generated from a fixed word list, so they are the only syntax left to trust.
-- Operators typed by a user or model were never documented (the tool descriptions offer plain
-  language, `"phrases"` and the six fields), and as passed through they failed more often than
-  they worked; searched as words they behave like their lowercase forms always did.
+- Operators were never documented (the tool descriptions offer plain language, `"phrases"` and
+  the six fields), but the old builder passed them through, and a model writes Gmail-style
+  `from:X OR to:X`. That worked whenever no word beside it had synonyms. The review of the first
+  candidate (2026-10-21) measured it returning nothing once `OR` was searched as a word, so
+  between two terms they stay operators; only the placements that made FTS5 fail are dropped.
 
 ## Consequences
 
@@ -63,7 +71,9 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
   queries each (`random_queries`), asserting none fails; `query::tests` pin the written
   expressions; `db::tests::test_each_documented_field_scopes_to_its_column` checks each documented
   field against a list written in the test, by a two-sided search and in the hybrid filter;
-  `test_rust_process_parity` `test_scoped_search_with_embeddings_finds_only_the_field` checks the
+  `db::tests::test_search_operators_separators_and_text_less_words` and its memory twin pin the
+  operators both ways, tabs / no-break / ideographic spaces as separators, and that a word with no
+  letter or digit beside a synonym group hides no match; `test_rust_process_parity` `test_scoped_search_with_embeddings_finds_only_the_field` checks the
   same with the embedding model loaded.
 - `role:` / `content:` no longer scope in memory search, and `msgId:` / `attachmentNames:` no longer
   scope in mail search (all undocumented and unused by any client).

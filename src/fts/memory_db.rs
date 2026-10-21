@@ -1478,7 +1478,7 @@ pub(crate) mod tests {
         let (dir, mut conn) = temp_memory_db("query-text");
         let row = serde_json::json!({
             "memId": "turn:1", "role": "session",
-            "content": "[USER]: from: alice@example.com, the café plan\n\n[AGENT]: R&D is 50% off",
+            "content": "[USER]: from: alice@example.com, the café plan\n\n[AGENT]: R&D is 50% off the budget",
             "sessionId": "persistent_chat", "turnIndex": 0,
             "dateMs": chrono::Utc::now().timestamp_millis(),
         });
@@ -1511,6 +1511,20 @@ pub(crate) mod tests {
         assert_eq!(found("café"), 1, "non-ASCII word");
         assert_eq!(found("R&D"), 1);
         assert_eq!(found("50% off"), 1);
+        // Capital AND, OR and NOT between two terms are operators; elsewhere dropped.
+        assert_eq!(found("café OR greetings"), 2);
+        assert_eq!(found("café AND greetings"), 0);
+        assert_eq!(found("café NOT greetings"), 1);
+        assert_eq!(found("NOT café"), 1);
+        assert_eq!(found("greetings OR"), 1);
+        // Any whitespace separates words: found apart, not as the phrase "plan café".
+        assert_eq!(found("\"plan café\""), 0);
+        for q in ["plan\tcafé", "plan\u{a0}café", "plan\u{3000}café"] {
+            assert_eq!(found(q), 1, "{q:?}");
+        }
+        // A word with no letter or digit beside a word with synonyms (an AND join).
+        assert_eq!(found("budget ?"), 1);
+        assert_eq!(found("budget -- \"\""), 1);
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }
