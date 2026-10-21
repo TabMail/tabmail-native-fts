@@ -408,7 +408,7 @@ struct MemoryMeta {
 /// If query is empty, returns all entries sorted by date (for browsing)
 ///
 /// With `previewChars` (a positive integer), each result's `content` and `snippet` come back cut to
-/// that many characters: a caller that shows only the start of each exchange keeps its reply small
+/// that many characters (code points): a caller that shows only the start of each exchange keeps its reply small
 /// whatever the rows hold (Thunderbird refuses a native message over 1 MiB, and memory rows are kept
 /// in full). The stored rows are unchanged; without it every result is whole, as before.
 pub fn memory_search(
@@ -1869,12 +1869,22 @@ mod tests {
     fn memory_search_cuts_results_to_the_preview_asked_for() {
         let (dir, mut conn) = temp_memory_db("preview");
         let long = format!("[USER]: 日本語 plan {}\n\n[AGENT]: done", "word ".repeat(2_000));
-        let row = serde_json::json!({
-            "memId": "turn:long", "role": "session", "content": long,
-            "sessionId": "persistent_chat", "turnIndex": 0,
-            "dateMs": chrono::Utc::now().timestamp_millis(),
-        });
-        memory_index_batch(&mut conn, &[row], None).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        // Every other field longer than the cut asked for below, so a cut reaching one shows.
+        let long_id = format!("turn:long:{}", "x".repeat(40));
+        let long_session = format!("persistent_chat:{}", "s".repeat(40));
+        let rows = [
+            serde_json::json!({
+                "memId": long_id, "role": "session", "content": long,
+                "sessionId": long_session, "turnIndex": 0, "dateMs": now,
+            }),
+            // Shorter than every cut asked for below: returned whole.
+            serde_json::json!({
+                "memId": "turn:short", "role": "session", "content": "plan ok",
+                "sessionId": "persistent_chat", "turnIndex": 1, "dateMs": now - 1_000,
+            }),
+        ];
+        memory_index_batch(&mut conn, &rows, None).unwrap();
         let synonyms = SynonymLookup::new();
         let search = |q: &str, extra: Value| {
             let mut params = serde_json::json!({ "ignoreDate": true, "limit": 10 });
@@ -1885,25 +1895,44 @@ mod tests {
         };
         // 10 characters: "[USER]: 日本" ends inside the multi-byte word, on a character.
         for q in ["", "plan"] {
+            let whole = search(q, serde_json::json!({}));
             let cut = search(q, serde_json::json!({ "previewChars": 10 }));
-            assert_eq!(cut.len(), 1, "{q:?}");
-            assert_eq!(cut[0]["content"], "[USER]: 日本", "{q:?}");
-            assert_eq!(cut[0]["memId"], "turn:long");
-            if let Some(snippet) = cut[0]["snippet"].as_str() {
-                assert!(snippet.chars().count() <= 10, "{q:?}: {snippet}");
+            assert_eq!(cut.len(), 2, "{q:?}");
+            assert_eq!(whole.len(), 2, "{q:?}");
+            let long_cut = cut.iter().find(|r| r["memId"] == long_id.as_str()).unwrap();
+            let long_whole = whole.iter().find(|r| r["memId"] == long_id.as_str()).unwrap();
+            assert_eq!(long_cut["content"], "[USER]: 日本", "{q:?}");
+            assert_eq!(long_whole["content"], long.as_str(), "{q:?}");
+            if let Some(snippet) = long_whole["snippet"].as_str() {
+                assert_eq!(long_cut["snippet"], snippet.chars().take(10).collect::<String>().as_str(), "{q:?}");
             }
-            for extra in [serde_json::json!({}), serde_json::json!({ "previewChars": 0 }), serde_json::json!({ "previewChars": -5 }), serde_json::json!({ "previewChars": "10" })] {
-                let whole = search(q, extra.clone());
-                assert_eq!(whole[0]["content"], long.as_str(), "{q:?} {extra}");
+            let short_cut = cut.iter().find(|r| r["memId"] == "turn:short").unwrap();
+            let short_whole = whole.iter().find(|r| r["memId"] == "turn:short").unwrap();
+            assert_eq!(short_cut["content"], "plan ok", "{q:?}");
+            // Only content and snippet differ, and only where they were longer than the cut.
+            for (c, w) in cut.iter().zip(whole.iter()) {
+                let mut c = c.clone();
+                let mut w = w.clone();
+                for key in ["content", "snippet"] {
+                    c.as_object_mut().unwrap().remove(key);
+                    w.as_object_mut().unwrap().remove(key);
+                }
+                assert_eq!(c, w, "{q:?}");
+            }
+            assert_eq!(short_cut, short_whole, "{q:?}");
+            assert_eq!(long_cut["sessionId"], long_session.as_str());
+            for extra in [serde_json::json!({ "previewChars": 0 }), serde_json::json!({ "previewChars": -5 }), serde_json::json!({ "previewChars": "10" })] {
+                assert_eq!(search(q, extra.clone()), whole, "{q:?} {extra}");
             }
         }
         // The snippet of a match is cut too.
-        let snippet_whole = search("plan", serde_json::json!({}))[0]["snippet"].as_str().unwrap().to_string();
+        let snippet_of = |results: Vec<Value>| results.into_iter().find(|r| r["memId"] == long_id.as_str()).unwrap()["snippet"].as_str().unwrap().to_string();
+        let snippet_whole = snippet_of(search("plan", serde_json::json!({})));
         assert!(snippet_whole.chars().count() > 3);
-        let snippet_cut = search("plan", serde_json::json!({ "previewChars": 3 }))[0]["snippet"].as_str().unwrap().to_string();
+        let snippet_cut = snippet_of(search("plan", serde_json::json!({ "previewChars": 3 })));
         assert_eq!(snippet_cut, snippet_whole.chars().take(3).collect::<String>());
         // Stored whole.
-        let stored: String = conn.query_row("SELECT content FROM memory_fts WHERE memId = 'turn:long'", [], |r| r.get(0)).unwrap();
+        let stored: String = conn.query_row("SELECT content FROM memory_fts WHERE memId = ?1", [&long_id], |r| r.get(0)).unwrap();
         assert_eq!(stored, long);
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);

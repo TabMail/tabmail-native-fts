@@ -15,8 +15,10 @@ although Thunderbird shows only the first 400 characters of each.
 ## Decision
 
 1. `memorySearch` takes an optional `previewChars`, a positive integer. With it, each result's
-   `content` and `snippet` are cut to that many characters, on a character boundary. Every other
-   field (`memId`, `sessionId`, `dateMs`, `role`, `score`) is unchanged, and so is the ranking.
+   `content` and `snippet` are cut to that many characters (Unicode code points, so never inside
+   one), and only where they are longer. Every other field (`memId`, `sessionId`, `dateMs`, `role`,
+   `rank`, ...) is unchanged, and so is the ranking. A caller sizing its reply counts up to 4 bytes a
+   character (6 for one JSON escapes); a JavaScript caller showing N UTF-16 units gets at least N.
 2. Without it, or with a value that is not a positive integer (0, negative, a string), every result is
    whole, as before.
 3. The stored rows are never changed: the cut is made on the reply only. `memoryRead` still returns a
@@ -26,15 +28,21 @@ although Thunderbird shows only the first 400 characters of each.
 
 ## Rejected
 
-- A byte cap on the whole reply (drop rows past it): the caller then can't tell a short result from
-  a cut one, and it pages by date.
+- A byte cap on the whole reply (drop rows past it): the caller then can't tell a reply short of
+  rows from a cut one, and it pages a listing by date. (A cut row it can tell: it asks for one
+  character more than it shows, if it needs to know.)
 - Cutting stored rows at write time: user content is stored in full (root rule 11).
 
 ## Evidence
 
 - `memory_search_cuts_results_to_the_preview_asked_for` (unit): listing and FTS search cut to 10
-  characters on a multi-byte boundary; 0, -5 and `"10"` give whole results; the snippet is cut; the
-  stored rows stay whole. Red with no cut, and with `content` only.
+  characters on a multi-byte boundary; a row shorter than the cut and every other field (an id and a
+  session longer than the cut) come back as without it; 0, -5 and `"10"` give whole results; the
+  snippet is cut to its first characters; the stored rows stay whole. Red with no cut, with `content`
+  only, with short text emptied and with the ids cut too.
+- `test_memory_search_previews_with_embeddings` (process, model loaded, so the search is hybrid):
+  the matching row cut to its first 400 characters, the other fields and results as without it; red
+  with no cut.
 - `test_previews_keep_a_memory_reply_under_the_native_message_cap` (process): three rows of about
   600 KB; the whole listing is over 1 MiB; a listing and a search with `previewChars: 400` are far
   under it, carry all three rows, and each `content` is the row's first 400 characters.

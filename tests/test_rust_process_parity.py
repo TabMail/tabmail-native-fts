@@ -211,6 +211,70 @@ class TestRustHelperProcess(unittest.TestCase):
                 proc.kill()
 
 
+    def test_memory_search_previews_with_embeddings(self):
+        """With the embedding model loaded, a memory search (hybrid: keyword and
+        vector) returns previews of the length asked, and whole rows without it."""
+        proc = subprocess.Popen(
+            [self.rust_helper_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            _send_message(proc, {"id": "1", "method": "hello", "params": {"addonVersion": "1.2.1"}})
+            self.assert_success(_read_message(proc), "hello")
+            _send_message(proc, {"id": "2", "method": "init", "params": {"profilePath": self.temp_dir}})
+            self.assert_success(_read_message(proc), "init")
+
+            base = 1700000000000
+            rows = [
+                {
+                    "memId": f"filler-{i}",
+                    "role": "session",
+                    "content": f"[USER]: lunch order {i}\n\n[AGENT]: sandwich and soup for day {i}",
+                    "sessionId": "persistent_chat",
+                    "dateMs": base + i * 1000,
+                    "turnIndex": i,
+                }
+                for i in range(FILLER_COUNT)
+            ]
+            long = "[USER]: plan the itinerary for our trip\n\n[AGENT]: " + "itinerary details " * 2000
+            rows.append({"memId": "trip", "role": "session", "content": long, "sessionId": "persistent_chat", "dateMs": base + 99_000, "turnIndex": 99})
+            _send_message(proc, {"id": "3", "method": "memoryIndexBatch", "params": {"rows": rows}})
+            self.assert_success(_read_message(proc), "memoryIndexBatch")
+            _send_message(proc, {"id": "4", "method": "memoryStats", "params": {}})
+            stats = _read_message(proc)
+            self.assert_success(stats, "memoryStats")
+            # The model is loaded: every row has its vector, so the search below is hybrid.
+            self.assertEqual(stats["result"]["vecDocs"], len(rows))
+
+            def search(request_id, extra):
+                _send_message(proc, {"id": request_id, "method": "memorySearch", "params": {"q": "itinerary", "ignoreDate": True, "limit": 10, **extra}})
+                response = _read_message(proc)
+                self.assert_success(response, f"memorySearch {extra}")
+                return {r["memId"]: r for r in response["result"]}
+
+            whole = search("5", {})
+            cut = search("6", {"previewChars": 400})
+            self.assertIn("trip", whole)
+            self.assertEqual(set(cut), set(whole))
+            self.assertEqual(whole["trip"]["content"], long)
+            self.assertEqual(cut["trip"]["content"], long[:400])
+            if whole["trip"].get("snippet") is not None:
+                self.assertEqual(cut["trip"]["snippet"], whole["trip"]["snippet"][:400])
+            for mem_id, row in cut.items():
+                others = {k: v for k, v in row.items() if k not in ("content", "snippet")}
+                self.assertEqual(others, {k: v for k, v in whole[mem_id].items() if k not in ("content", "snippet")})
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+
     def test_rebuild_embeddings_batch(self):
         """Test the batch-based rebuildEmbeddings workflow:
         rebuildEmbeddingsStart → rebuildEmbeddingsBatch loop → verify via stats.
