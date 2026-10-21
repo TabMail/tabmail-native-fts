@@ -17,6 +17,9 @@ expression. It put most words in bare, quoting only words with `- @ : + .`, so:
   which the memory table does not have.
 - The alias and `field:"value"` scanners copied the query byte by byte into chars, so non-ASCII
   text was corrupted: `café` searched for `cafÃ©` and found nothing.
+- Apostrophes were deleted from every word, so `O'Brien` searched `obrien` and `don't` searched
+  `dont`, while the tokenizer indexes the text as `o brien` and `don t`: a word with an apostrophe
+  never found the mail it was written in, and found mail that spelled it without one.
 - FTS5 rejects an implicit AND beside a parenthesised group, so a quoted phrase next to a word
   with synonyms (`meeting "budget plan"`) was a syntax error.
 
@@ -32,7 +35,9 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
    a word with punctuation, or a plain word of 4+ bytes when there are no synonym groups in the
    query; the old builder decided the last per quote-delimited segment, now it is query-wide). Apart from
    the operators of point 4, no query text is ever FTS5 syntax. A word or phrase with no letter or digit is dropped (an empty
-   string inside an AND matches nothing).
+   string inside an AND matches nothing). A word keeps its apostrophes: quoted, `O'Brien` is the
+   phrase `o brien` the tokenizer indexed (only one trailing `*`, then trailing `/` and `?`, are
+   removed from a word).
 3. A word expanding to synonyms becomes the generated `(a OR b …)` group; when any group is
    present every term is joined with an explicit `AND`. Whether a
    group is present is read from the terms as written (only a group starts with `(`), so it can't
@@ -73,8 +78,15 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
   field against a list written in the test, by a two-sided search and in the hybrid filter;
   `db::tests::test_search_operators_separators_and_text_less_words` and its memory twin pin the
   operators both ways, tabs / no-break / ideographic spaces as separators, and that a word with no
-  letter or digit beside a synonym group hides no match; `test_rust_process_parity` `test_scoped_search_with_embeddings_finds_only_the_field` checks the
+  letter or digit beside a synonym group hides no match;
+  `db::tests::test_search_finds_words_with_apostrophes` and its memory twin find `O'Brien` and
+  `don't forget` in the mail that has them and not in the one spelling `OBrien` / `Dont` (red
+  with the apostrophe strip restored: each finds only the other row); `test_rust_process_parity` `test_scoped_search_with_embeddings_finds_only_the_field` checks the
   same with the embedding model loaded.
+- A differential against the released 0.11.8 helper (Thunderbird-shaped `search` and
+  `memorySearch`, with and without the embedding model, 2026-10-21) found no query that newly
+  fails; every difference is an error that now succeeds or one of the fixes above (non-ASCII,
+  whitespace separators, apostrophes).
 - `role:` / `content:` no longer scope in memory search, and `msgId:` / `attachmentNames:` no longer
   scope in mail search (all undocumented and unused by any client).
 - Both behaviour changes (`from :` with a space before the colon no longer scopes; memory search has

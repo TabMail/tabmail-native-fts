@@ -1529,6 +1529,34 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A word with an apostrophe finds the text it was written as (`o` + `brien`), not the
+    /// joined word.
+    #[test]
+    fn memory_search_finds_words_with_apostrophes() {
+        let (dir, mut conn) = temp_memory_db("apostrophe");
+        let rows: Vec<_> = ["[USER]: lunch with O'Brien\n\n[AGENT]: Don't forget the receipts.",
+            "[USER]: lunch with OBrien\n\n[AGENT]: Dont forget the receipts."]
+            .iter()
+            .enumerate()
+            .map(|(i, content)| serde_json::json!({
+                "memId": format!("turn:{i}"), "role": "session", "content": content,
+                "sessionId": "persistent_chat", "turnIndex": i,
+                "dateMs": chrono::Utc::now().timestamp_millis(),
+            }))
+            .collect();
+        memory_index_batch(&mut conn, &rows, None).unwrap();
+        let synonyms = SynonymLookup::new();
+        let params = serde_json::json!({"ignoreDate": true});
+        for q in ["O'Brien", "don't forget", "Don't"] {
+            let found = memory_search(&conn, q, &params, &synonyms, None)
+                .unwrap_or_else(|e| panic!("memory search for {q:?} failed: {e:?}"));
+            let ids: Vec<_> = found.iter().map(|r| r["memId"].as_str().unwrap_or_default()).collect();
+            assert_eq!(ids, ["turn:0"], "{q:?}");
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Indexes one text-only exchange dated `i`, as one memory write does.
     fn add_text(conn: &mut Connection, i: usize) {
         let row = serde_json::json!({

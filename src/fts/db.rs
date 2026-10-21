@@ -2655,6 +2655,30 @@ pub(crate) mod tests {
         assert_eq!(found("meeting -- \"\""), one);
     }
 
+    /// A word with an apostrophe finds the text it was written as: the tokenizer splits
+    /// `O'Brien` into `o` and `brien`, and the word must search those, not `obrien`.
+    #[test]
+    fn test_search_finds_words_with_apostrophes() {
+        let (conn, mut known_years) = setup_test_db();
+        let a_week_ago = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        insert_test_message_full(
+            &conn, &mut known_years, "acc:/:apostrophe",
+            "Lunch with O'Brien", "alice@example.com", "team@example.com",
+            "Don't forget the receipts.",
+            a_week_ago,
+        );
+        insert_test_message_full(
+            &conn, &mut known_years, "acc:/:joined",
+            "Lunch with OBrien", "carol@example.com", "team@example.com",
+            "Dont forget the receipts.",
+            a_week_ago,
+        );
+        let apostrophe = vec!["acc:/:apostrophe".to_string()];
+        for q in ["O'Brien", "o'brien", "subject:O'Brien", "don't forget", "Don't"] {
+            assert_eq!(search_ok(&conn, q, &known_years), apostrophe, "{q:?}");
+        }
+    }
+
     /// Inserts a message with the given FTS columns set and the others empty.
     fn insert_with_fields(conn: &Connection, known_years: &mut HashSet<i32>, msg_id: &str, fields: &[(&str, &str)]) {
         let date_ms = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;

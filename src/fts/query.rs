@@ -38,7 +38,7 @@ pub fn build_fts_match(
             i += 1;
             if let Item::Word(w) = item {
                 if let Some(op) = OPERATORS.iter().find(|op| **op == w) {
-                    if !out.is_empty() && operator.is_none() {
+                    if operator.is_none() {
                         operator = Some(*op);
                     }
                     continue;
@@ -145,13 +145,14 @@ fn phrase(p: &str) -> Option<String> {
 }
 
 /// A word's searched text and whether the user ended it with `*`: one trailing `*`, then
-/// trailing `/` and `?`, are removed, and apostrophes are dropped.
+/// trailing `/` and `?`, are removed. An apostrophe stays: the tokenizer splits `O'Brien` into
+/// `o` and `brien`, and the quoted word searches them as a phrase.
 fn prepare_word(w: &str) -> Option<(String, bool)> {
     let (w, star) = match w.strip_suffix('*') {
         Some(rest) => (rest, true),
         None => (w, false),
     };
-    let core = w.trim_end_matches(['/', '?']).replace('\'', "");
+    let core = w.trim_end_matches(['/', '?']).to_string();
     has_text(&core).then_some((core, star))
 }
 
@@ -192,7 +193,7 @@ mod tests {
         assert_eq!(build("50% off", &[]), r#""50%"* "off""#);
         assert_eq!(build("NOT (budget", &[]), r#""(budget"*"#);
         assert_eq!(build(r#"say "hi there"#, &[]), r#""say" "hi there""#);
-        assert_eq!(build("it's gone?", &[]), r#""its" "gone"*"#);
+        assert_eq!(build("it's gone?", &[]), r#""it's"* "gone"*"#);
         assert_eq!(build("budg*", &[]), r#""budg"*"#);
         // A user's star keeps a short word a prefix, and a starred word never expands.
         assert_eq!(build("ab*", &[]), r#""ab"*"#);
