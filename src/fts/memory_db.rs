@@ -406,7 +406,36 @@ struct MemoryMeta {
 
 /// Search memory database (uses same FTS5/BM25/synonyms as email search)
 /// If query is empty, returns all entries sorted by date (for browsing)
+///
+/// With `previewChars` (a positive integer), each result's `content` and `snippet` come back cut to
+/// that many characters: a caller that shows only the start of each exchange keeps its reply small
+/// whatever the rows hold (Thunderbird refuses a native message over 1 MiB, and memory rows are kept
+/// in full). The stored rows are unchanged; without it every result is whole, as before.
 pub fn memory_search(
+    conn: &Connection,
+    q: &str,
+    params: &Value,
+    synonyms: &SynonymLookup,
+    engine: Option<&EmbeddingEngine>,
+) -> anyhow::Result<Vec<Value>> {
+    let mut results = memory_search_rows(conn, q, params, synonyms, engine)?;
+    let preview_chars = params.get("previewChars").and_then(|v| v.as_u64()).filter(|&n| n > 0);
+    if let Some(max) = preview_chars {
+        let max = usize::try_from(max).unwrap_or(usize::MAX);
+        for result in &mut results {
+            for key in ["content", "snippet"] {
+                if let Some(Value::String(text)) = result.get_mut(key) {
+                    if let Some((end, _)) = text.char_indices().nth(max) {
+                        text.truncate(end);
+                    }
+                }
+            }
+        }
+    }
+    Ok(results)
+}
+
+fn memory_search_rows(
     conn: &Connection,
     q: &str,
     params: &Value,
@@ -1830,5 +1859,53 @@ mod tests {
             [], |r| r.get(0),
         ).unwrap();
         assert_eq!(n, 1);
+    }
+
+    /// A caller that asks for previews gets each result's text and snippet cut to that many
+    /// characters (never inside a character), in a listing and in a search; the stored rows stay
+    /// whole, and without the parameter (or with one that isn't a positive integer) every result is
+    /// whole, as before.
+    #[test]
+    fn memory_search_cuts_results_to_the_preview_asked_for() {
+        let (dir, mut conn) = temp_memory_db("preview");
+        let long = format!("[USER]: 日本語 plan {}\n\n[AGENT]: done", "word ".repeat(2_000));
+        let row = serde_json::json!({
+            "memId": "turn:long", "role": "session", "content": long,
+            "sessionId": "persistent_chat", "turnIndex": 0,
+            "dateMs": chrono::Utc::now().timestamp_millis(),
+        });
+        memory_index_batch(&mut conn, &[row], None).unwrap();
+        let synonyms = SynonymLookup::new();
+        let search = |q: &str, extra: Value| {
+            let mut params = serde_json::json!({ "ignoreDate": true, "limit": 10 });
+            for (k, v) in extra.as_object().unwrap() {
+                params[k] = v.clone();
+            }
+            memory_search(&conn, q, &params, &synonyms, None).unwrap()
+        };
+        // 10 characters: "[USER]: 日本" ends inside the multi-byte word, on a character.
+        for q in ["", "plan"] {
+            let cut = search(q, serde_json::json!({ "previewChars": 10 }));
+            assert_eq!(cut.len(), 1, "{q:?}");
+            assert_eq!(cut[0]["content"], "[USER]: 日本", "{q:?}");
+            assert_eq!(cut[0]["memId"], "turn:long");
+            if let Some(snippet) = cut[0]["snippet"].as_str() {
+                assert!(snippet.chars().count() <= 10, "{q:?}: {snippet}");
+            }
+            for extra in [serde_json::json!({}), serde_json::json!({ "previewChars": 0 }), serde_json::json!({ "previewChars": -5 }), serde_json::json!({ "previewChars": "10" })] {
+                let whole = search(q, extra.clone());
+                assert_eq!(whole[0]["content"], long.as_str(), "{q:?} {extra}");
+            }
+        }
+        // The snippet of a match is cut too.
+        let snippet_whole = search("plan", serde_json::json!({}))[0]["snippet"].as_str().unwrap().to_string();
+        assert!(snippet_whole.chars().count() > 3);
+        let snippet_cut = search("plan", serde_json::json!({ "previewChars": 3 }))[0]["snippet"].as_str().unwrap().to_string();
+        assert_eq!(snippet_cut, snippet_whole.chars().take(3).collect::<String>());
+        // Stored whole.
+        let stored: String = conn.query_row("SELECT content FROM memory_fts WHERE memId = 'turn:long'", [], |r| r.get(0)).unwrap();
+        assert_eq!(stored, long);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

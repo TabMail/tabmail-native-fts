@@ -20,6 +20,7 @@ Run:
 """
 
 import hashlib
+import json
 import os
 import shutil
 import stat
@@ -209,6 +210,37 @@ class TestCallerLocations(unittest.TestCase):
         self.assertTrue((log_dir / LIVE_LOG).is_file())
 
         self.assertEqual(_tree_hashes(self.home), before)
+
+    def test_previews_keep_a_memory_reply_under_the_native_message_cap(self):
+        # Thunderbird refuses a native message over 1 MiB, and memory rows are kept whole: three
+        # exchanges of 600 KB come back whole without previews, and cut, all three, with them. No
+        # model, so the search is by keyword alone: every path's results go through the same cut.
+        cap = 1024 * 1024
+        model_dir = self.caller / "nomodel"
+        _write_unreadable_model(model_dir)
+        rows = [{"memId": f"turn:{i}", "role": "session",
+                 "content": f"[USER]: planning {i} " + "note " * 120_000 + "\n\n[AGENT]: Done.",
+                 "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": 1_700_000_000_000 + i * DAY_MS}
+                for i in range(3)]
+        responses = self._session(
+            ["--log-dir", str(self.caller / "logs"), "--log-level", "off"],
+            [
+                ("init", {"profilePath": str(self.caller / "db" / "preview"), "modelDir": str(model_dir)}),
+                ("memoryIndexBatch", {"rows": rows}),
+                ("memorySearch", {"q": "", "ignoreDate": True, "limit": 10}),
+                ("memorySearch", {"q": "", "ignoreDate": True, "limit": 10, "previewChars": 400}),
+                ("memorySearch", {"q": "planning", "ignoreDate": True, "limit": 10, "previewChars": 400}),
+            ],
+        )
+        whole, listed, found = (r["result"] for r in responses[2:5])
+        self.assertGreater(len(json.dumps(whole).encode()), cap)
+        self.assertEqual([r["content"] for r in whole], [r["content"] for r in reversed(rows)])
+        for result in (listed, found):
+            self.assertLess(len(json.dumps(result).encode()), cap // 100)
+            self.assertEqual(sorted(r["memId"] for r in result), ["turn:0", "turn:1", "turn:2"])
+            for r in result:
+                original = next(row for row in rows if row["memId"] == r["memId"])
+                self.assertEqual(r["content"], original["content"][:400])
 
     def test_log_level_off_writes_no_log_anywhere(self):
         _replace_with_fifo(self.home / ".tabmail" / "logs" / LIVE_LOG)

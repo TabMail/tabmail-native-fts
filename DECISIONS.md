@@ -152,6 +152,11 @@ archives of any size.
 
 - **[Full ADR](Companion/Decisions/Active/adr-nf-010-vendored-candle-core-on-zip-9.md)** — `cargo audit` RUSTSEC-2026-0367/0368/0369 (Zip < 9 archive extraction: permission bits, symlinks) reached the helper only through candle-core 0.8.4's `zip ^1.1.1` (unreachable: no `.npz`/`.pth` loading, safetensors only). No candle release uses Zip 9 (0.11 = Zip 8, and a new engine), so `vendor/candle-core` (crates.io 0.8.4, LICENSE kept, `TABMAIL-PATCHES.md`, per-file notices) is used via `[patch.crates-io]` with zip 9.0.5, entry `name()` `Result` passed on (upstream huggingface/candle#4041), elided lifetimes written out; its own Cargo.lock left out (dependency scanners). Remove once a candle release with Zip >= 9 is adopted. Builders on their own computer: `RUSTFLAGS=--remap-path-prefix=$HOME=~` (home folder / user name in binary paths; CI runners need none; `trim-paths` unstable). Paste unmaintained warning (gemm, compile time) remains.
 
+
+## ADR-NF-012: Memory Search Can Return Previews
+
+- **[Full ADR](Companion/Decisions/Active/adr-nf-012-memory-search-previews.md)** — Thunderbird refuses a native message over 1 MiB (disconnects the helper, rejects pending requests) and `memorySearch` returned whole rows (`content`, `snippet`), so a listing or search of a few long chat exchanges passed the cap. Optional `previewChars` (positive integer) cuts each result's `content` and `snippet` to that many characters on a char boundary, in the reply only; stored rows and `memoryRead` unchanged; absent/0/negative/string = whole results; no capability flag (an older helper ignores it and answers whole rows). Rejected: whole-reply byte cap, cutting stored rows.
+
 ---
 
 ## Template for New Decisions
