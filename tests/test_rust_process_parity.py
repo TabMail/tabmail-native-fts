@@ -275,6 +275,66 @@ class TestRustHelperProcess(unittest.TestCase):
             except Exception:
                 proc.kill()
 
+    def test_memory_search_with_dates_keeps_the_matches_within_them(self):
+        """With the embedding model loaded, a memory search with dates returns its
+        matches within the dates, however many nearer exchanges lie outside them."""
+        proc = subprocess.Popen(
+            [self.rust_helper_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            _send_message(proc, {"id": "1", "method": "hello", "params": {"addonVersion": "1.2.1"}})
+            self.assert_success(_read_message(proc), "hello")
+            _send_message(proc, {"id": "2", "method": "init", "params": {"profilePath": self.temp_dir}})
+            self.assert_success(_read_message(proc), "init")
+
+            base = 1700000000000
+            day = 86_400_000
+            # Outside the dates: exchanges about nothing but the itinerary, the nearest to the query.
+            outside = [
+                {"memId": f"old-{i}", "role": "session", "content": f"[USER]: trip itinerary {i}\n\n[AGENT]: the itinerary",
+                 "sessionId": "persistent_chat", "dateMs": base + i * 1000, "turnIndex": i}
+                for i in range(40)
+            ]
+            # Within them: exchanges that name it among other things.
+            inside = [
+                {"memId": f"new-{i}", "role": "session",
+                 "content": f"[USER]: lunch order {i}, soup and sandwich, then the quarterly budget, and the itinerary\n\n[AGENT]: noted the lunch and budget {i}",
+                 "sessionId": "persistent_chat", "dateMs": base + 30 * day + i * 1000, "turnIndex": 100 + i}
+                for i in range(6)
+            ]
+            # Enough unrelated exchanges that the word is rare and a keyword match scores.
+            filler = [
+                {"memId": f"filler-{i}", "role": "session", "content": f"[USER]: weather report {i}\n\n[AGENT]: sunny on day {i}",
+                 "sessionId": "persistent_chat", "dateMs": base + 30 * day + 100_000 + i * 1000, "turnIndex": 200 + i}
+                for i in range(300)
+            ]
+            rows = outside + inside + filler
+            _send_message(proc, {"id": "3", "method": "memoryIndexBatch", "params": {"rows": rows}})
+            self.assert_success(_read_message(proc), "memoryIndexBatch")
+            _send_message(proc, {"id": "4", "method": "memoryStats", "params": {}})
+            stats = _read_message(proc)
+            self.assert_success(stats, "memoryStats")
+            # The model is loaded: every row has its vector, so the search below is hybrid.
+            self.assertEqual(stats["result"]["vecDocs"], len(rows))
+
+            params = {"q": "itinerary", "from": base + 30 * day, "to": base + 31 * day, "limit": len(inside)}
+            _send_message(proc, {"id": "5", "method": "memorySearch", "params": params})
+            response = _read_message(proc)
+            self.assert_success(response, "memorySearch")
+            self.assertEqual(sorted(r["memId"] for r in response["result"]), sorted(r["memId"] for r in inside))
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+
     def test_rebuild_embeddings_batch(self):
         """Test the batch-based rebuildEmbeddings workflow:
         rebuildEmbeddingsStart → rebuildEmbeddingsBatch loop → verify via stats.

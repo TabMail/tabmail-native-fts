@@ -498,6 +498,24 @@ fn memory_search_rows(
         return memory_search_fts_only(conn, query, params, synonyms, ignore_date, limit);
     }
 
+    // Keep only the vector candidates within the dates asked, before the merge keeps the best
+    // `limit`: dropped after it, nearer ones outside the dates would take the places of matches
+    // inside them. (The FTS candidates are filtered by date in their query.)
+    let vec_candidates = if from_ts.is_some() || to_ts.is_some() {
+        let mut date_of = conn.prepare("SELECT dateMs FROM memory_meta WHERE rowid = ?1")?;
+        let mut kept = Vec::with_capacity(vec_candidates.len());
+        for (rowid, distance) in vec_candidates {
+            let date_ms: Option<i64> = date_of.query_row(params![rowid], |r| r.get(0)).optional()?;
+            let within = date_ms.is_some_and(|d| from_ts.is_none_or(|from| d >= from) && to_ts.is_none_or(|to| d <= to));
+            if within {
+                kept.push((rowid, distance));
+            }
+        }
+        kept
+    } else {
+        vec_candidates
+    };
+
     // --- Merge ---
     let text_pairs: Vec<(i64, f64)> = fts_candidates.iter().map(|c| (c.rowid, c.rank)).collect();
     let merged = crate::fts::hybrid::merge_results(
@@ -525,18 +543,8 @@ fn memory_search_rows(
                 "rank": -hr.final_score
             }));
         } else {
-            // Vector-only result
+            // Vector-only result (within the dates: filtered before the merge)
             if let Some(meta) = fetch_memory_meta(conn, hr.rowid)? {
-                if let Some(from) = from_ts {
-                    if meta.date_ms < from {
-                        continue;
-                    }
-                }
-                if let Some(to) = to_ts {
-                    if meta.date_ms > to {
-                        continue;
-                    }
-                }
                 results.push(serde_json::json!({
                     "memId": meta.mem_id,
                     "role": meta.role,
@@ -568,10 +576,10 @@ fn memory_list_all(
 ) -> anyhow::Result<Vec<Value>> {
     log::info!("Memory search with empty query - listing all by date (limit={})", limit);
 
+    // The page's rows are chosen from memory_meta (dates only) before any content is read: sorting
+    // the join itself read every row's content, the whole memory, for each request.
     let mut sql = r#"
-        SELECT fts.memId, fts.role, fts.content, fts.sessionId, meta.dateMs
-        FROM memory_fts fts
-        JOIN memory_meta meta ON fts.rowid = meta.rowid
+        SELECT rowid, dateMs FROM memory_meta
         WHERE 1=1
     "#
     .to_string();
@@ -581,20 +589,28 @@ fn memory_list_all(
     if !ignore_date {
         if let Some(from_v) = params.get("from") {
             if let Some(ts) = super::db::parse_date_param(from_v)? {
-                sql.push_str(" AND meta.dateMs >= ?");
+                sql.push_str(" AND dateMs >= ?");
                 bind.push(rusqlite::types::Value::from(ts));
             }
         }
         if let Some(to_v) = params.get("to") {
             if let Some(ts) = super::db::parse_date_param(to_v)? {
-                sql.push_str(" AND meta.dateMs <= ?");
+                sql.push_str(" AND dateMs <= ?");
                 bind.push(rusqlite::types::Value::from(ts));
             }
         }
     }
 
-    sql.push_str(" ORDER BY meta.dateMs DESC LIMIT ?");
+    sql.push_str(" ORDER BY dateMs DESC LIMIT ?");
     bind.push(rusqlite::types::Value::from(limit));
+    let sql = format!(
+        r#"
+        SELECT fts.memId, fts.role, fts.content, fts.sessionId, meta.dateMs
+        FROM ({sql}) meta
+        JOIN memory_fts fts ON fts.rowid = meta.rowid
+        ORDER BY meta.dateMs DESC
+        "#
+    );
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(bind.iter()), |r| {
@@ -1859,6 +1875,50 @@ mod tests {
             [], |r| r.get(0),
         ).unwrap();
         assert_eq!(n, 1);
+    }
+
+    /// A listing (no query) gives the newest entries within the dates asked, newest first, at most
+    /// `limit` of them, each whole; both bounds include their millisecond and `ignoreDate` wins.
+    #[test]
+    fn memory_listing_gives_the_newest_within_the_dates_each_whole() {
+        let (dir, mut conn) = temp_memory_db("listing");
+        let base = chrono::Utc::now().timestamp_millis() - 100_000;
+        // Kept out of date order, so an order the table happens to hold shows.
+        let order = [4, 9, 0, 7, 2, 5, 8, 1, 6, 3];
+        let rows: Vec<Value> = order
+            .iter()
+            .map(|&i| serde_json::json!({
+                "memId": format!("turn:{i}"), "role": "session",
+                "content": format!("[USER]: question {i}\n\n[AGENT]: answer {i}"),
+                "sessionId": format!("session-{i}"), "turnIndex": i, "dateMs": base + i * 1_000,
+            }))
+            .collect();
+        memory_index_batch(&mut conn, &rows, None).unwrap();
+        let synonyms = SynonymLookup::new();
+        let list = |params: Value| -> Vec<i64> {
+            let results = memory_search(&conn, "", &params, &synonyms, None).unwrap();
+            for r in &results {
+                let i = r["memId"].as_str().unwrap().strip_prefix("turn:").unwrap().parse::<i64>().unwrap();
+                assert_eq!(r["content"], format!("[USER]: question {i}\n\n[AGENT]: answer {i}"));
+                assert_eq!(r["sessionId"], format!("session-{i}"));
+                assert_eq!(r["role"], "session");
+                assert_eq!(r["dateMs"], base + i * 1_000);
+                assert!(r["snippet"].is_null());
+            }
+            results.iter().map(|r| (r["dateMs"].as_i64().unwrap() - base) / 1_000).collect()
+        };
+        assert_eq!(list(serde_json::json!({ "ignoreDate": true, "limit": 3 })), vec![9, 8, 7]);
+        assert_eq!(list(serde_json::json!({ "ignoreDate": true, "limit": 50 })), vec![9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);
+        // Both bounds include their millisecond.
+        let within = serde_json::json!({ "from": base + 2_000, "to": base + 6_000, "limit": 3 });
+        assert_eq!(list(within), vec![6, 5, 4]);
+        let within = serde_json::json!({ "from": base + 2_000, "to": base + 6_000, "limit": 50 });
+        assert_eq!(list(within), vec![6, 5, 4, 3, 2]);
+        assert_eq!(list(serde_json::json!({ "to": base + 1_000, "limit": 50 })), vec![1, 0]);
+        // ignoreDate wins over the dates.
+        assert_eq!(list(serde_json::json!({ "ignoreDate": true, "from": base + 2_000, "to": base + 6_000, "limit": 2 })), vec![9, 8]);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A caller that asks for previews gets each result's text and snippet cut to that many

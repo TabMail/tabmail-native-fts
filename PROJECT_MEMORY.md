@@ -25,7 +25,7 @@ Native messaging host for full-text search + semantic search. Communicates with 
 - Responses written through `Arc<Mutex<Stdout>>`
 - `clear`/`memoryClear` in writer locks the reader's connection (`Mutex`), closes it so Windows can delete the files, recreates, reopens; a failed delete is an error reply, rows kept; a clear that could not reopen leaves an in-memory stand-in that each thread opens again at its next request (`reopen_stand_in`) (ADR-NF-009)
 - `memoryTrim` / `memoryIndexBatch{maxBytes}` trim in the writer: FTS5 `merge` steps reclaim removed rows' segment space before more rows go (started once negative after removing, continued positive so a write between calls never restarts it); budget asked per row and per step; no VACUUM, so the file keeps its largest size; caller with `modelDir` skips the orphan clean-up (ADR-NF-008)
-- `memorySearch {previewChars}` cuts each result's `content`/`snippet` to N chars in the reply only (`memory_search` wraps `memory_search_rows`), so a Thunderbird reply stays under its 1 MiB native-message cap; rows stay whole (ADR-NF-012)
+- `memorySearch {previewChars}` cuts each result's `content`/`snippet` to N chars in the reply only (`memory_search` wraps `memory_search_rows`), so a Thunderbird reply stays under its 1 MiB native-message cap; rows stay whole (ADR-NF-012). A dated hybrid memory search filters vector candidates by date before the merge; the listing chooses rows from `memory_meta` then reads their content. sqlite-vec k is at most 4,096: a search `limit` x `CANDIDATE_MULTIPLIER` (4) above it fails the vector leg silently (`unwrap_or_default`) and the search runs keyword-only
 - No new crate dependencies — uses `std::sync::{mpsc, Arc, Mutex}`
 
 ### SchemaVersion

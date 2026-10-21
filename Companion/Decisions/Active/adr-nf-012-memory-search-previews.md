@@ -46,3 +46,35 @@ although Thunderbird shows only the first 400 characters of each.
 - `test_previews_keep_a_memory_reply_under_the_native_message_cap` (process): three rows of about
   600 KB; the whole listing is over 1 MiB; a listing and a search with `previewChars: 400` are far
   under it, carry all three rows, and each `content` is the row's first 400 characters.
+
+## Amendment (2026-10-21): what Thunderbird's paged listing and 100-match search need from the helper
+
+Thunderbird's chat now lists memory five entries a request, and a search asks for its 100 best
+matches (it asked for 2,000). Review of that change found two helper defects it exposes.
+
+1. **A search with dates kept too few matches.** The vector candidates were not filtered by date:
+   the merge kept the best `limit` of all candidates, and those outside the dates were dropped only
+   afterwards, so nearer entries outside the dates took the places of matches inside them (7 of 31
+   in-range matches at `limit` 100 on 6,000 entries). It never showed before because a `limit` of
+   2,000 asks sqlite-vec for k = 8,000, over its maximum of 4,096: the vector search failed, and
+   every such search fell back to keyword-only. Now the vector candidates outside the dates are
+   removed before the merge (one `memory_meta` lookup per candidate, only when dates are given), and
+   the check after the merge, which can no longer drop anything, is deleted. The keyword candidates
+   were already filtered by date in their query.
+2. **Each listing request read the whole memory.** The listing sorted the join of `memory_fts` and
+   `memory_meta`, so every row's content was read for each request (1.5 to 4 s at 1 GB, on the
+   reader thread email search also uses), and a page of 20 takes four requests. Now the page's rows
+   are chosen from `memory_meta` (`rowid`, `dateMs`) by date, and only their content is read: the same
+   rows in the same order (about 2 ms at 1 GB, measured by the reviewer on the helper's schema). No
+   index or schema change.
+
+Still open (not here): a search's `limit` times `CANDIDATE_MULTIPLIER` over 4,096 still fails the
+vector search silently, for email and memory searches alike (#20; Thunderbird's email search and Voice's
+memory search ask for 2,000), so those run keyword-only.
+
+Evidence: `memory_listing_gives_the_newest_within_the_dates_each_whole` (unit: newest first, the
+limit, both bounds inclusive, `ignoreDate` over the dates, every field whole) passes on the old
+query and the new; red with the inner order reversed, the outer order dropped, and `from` ignored.
+`test_memory_search_with_dates_keeps_the_matches_within_them` (process, model loaded: 40 entries
+nearer the query outside the dates, 6 matches inside, 300 others) returns the 6; red on the old
+code (it returned none).
