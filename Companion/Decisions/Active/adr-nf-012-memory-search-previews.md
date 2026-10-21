@@ -81,10 +81,14 @@ The date filter also runs on sqlite-vec's top k over the whole memory: when k or
 outside the dates are nearer the query, no match inside them keeps its vector score, so an entry
 inside the dates that matches only by meaning is missed (one with the words is still found by the
 keyword leg). Asking sqlite-vec for the dates directly would need the date in the vector table.
+The email hybrid search in `db.rs` still drops vector candidates outside the dates after its merge,
+as memory did; it shows only once #20 lets its vector search run, so it is fixed there (noted on #20).
 
 Evidence: `memory_listing_gives_the_newest_within_the_dates_each_whole` (unit: newest first, the
 limit, both bounds inclusive, `ignoreDate` over the dates, every field whole) passes on the old
-query and the new; red with the inner order reversed, the outer order dropped, and `from` ignored.
+query and the new; red with the inner order reversed and with `from` ignored. (Dropping the outer
+`ORDER BY` stays green: through the `CROSS JOIN` SQLite returns the inner order, but it does not
+promise it, so the outer order stays.)
 `memory_listing_reads_only_its_pages_content` (unit: that page, on a cold reader) is red with the
 plain `JOIN`.
 `test_memory_search_with_dates_keeps_the_matches_within_them` (process, model loaded: 20 entries

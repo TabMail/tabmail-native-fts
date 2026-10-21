@@ -226,7 +226,7 @@ class TestRustHelperProcess(unittest.TestCase):
             _send_message(proc, {"id": "2", "method": "init", "params": {"profilePath": self.temp_dir}})
             self.assert_success(_read_message(proc), "init")
 
-            base = 1700000000000
+            base = int(time.time() * 1000) - 100_000
             rows = [
                 {
                     "memId": f"filler-{i}",
@@ -292,8 +292,8 @@ class TestRustHelperProcess(unittest.TestCase):
         _send_message(proc, {"id": "2", "method": "init", "params": {"profilePath": profile}})
         self.assert_success(_read_message(proc), "init")
 
-        base = 1700000000000
         day = 86_400_000
+        base = int(time.time() * 1000) - 60 * day
         start, end = base + 30 * day, base + 31 * day
         outside = [
             {"memId": f"{side}-{i}", "role": "session", "content": f"[USER]: trip itinerary {side} {i}\n\n[AGENT]: the itinerary",

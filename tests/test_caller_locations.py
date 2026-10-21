@@ -27,6 +27,7 @@ import stat
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -220,7 +221,7 @@ class TestCallerLocations(unittest.TestCase):
         _write_unreadable_model(model_dir)
         rows = [{"memId": f"turn:{i}", "role": "session",
                  "content": f"[USER]: planning {i} " + "note " * 120_000 + "\n\n[AGENT]: Done.",
-                 "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": 1_700_000_000_000 + i * DAY_MS}
+                 "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": int(time.time() * 1000) - (3 - i) * DAY_MS}
                 for i in range(3)]
         responses = self._session(
             ["--log-dir", str(self.caller / "logs"), "--log-level", "off"],
