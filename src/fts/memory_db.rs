@@ -406,7 +406,41 @@ struct MemoryMeta {
 
 /// Search memory database (uses same FTS5/BM25/synonyms as email search)
 /// If query is empty, returns all entries sorted by date (for browsing)
+///
+/// With `previewChars` (a positive integer), each result's `content` and `snippet` come back cut to
+/// that many characters (code points): a caller that shows only the start of each exchange keeps its reply small
+/// whatever the rows hold (Thunderbird refuses a native message over 1 MiB, and memory rows are kept
+/// in full). The stored rows are unchanged; without it every result is whole, as before.
 pub fn memory_search(
+    conn: &Connection,
+    q: &str,
+    params: &Value,
+    synonyms: &SynonymLookup,
+    engine: Option<&EmbeddingEngine>,
+) -> anyhow::Result<Vec<Value>> {
+    // One read transaction, so the search's queries all read the memory as it was when it began: a
+    // write landing between them (an exchange removed and its rowid reused) can't put another
+    // exchange, or one outside the dates, in its results.
+    let tx = conn.unchecked_transaction()?;
+    let mut results = memory_search_rows(&tx, q, params, synonyms, engine)?;
+    drop(tx);
+    let preview_chars = params.get("previewChars").and_then(|v| v.as_u64()).filter(|&n| n > 0);
+    if let Some(max) = preview_chars {
+        let max = usize::try_from(max).unwrap_or(usize::MAX);
+        for result in &mut results {
+            for key in ["content", "snippet"] {
+                if let Some(Value::String(text)) = result.get_mut(key) {
+                    if let Some((end, _)) = text.char_indices().nth(max) {
+                        text.truncate(end);
+                    }
+                }
+            }
+        }
+    }
+    Ok(results)
+}
+
+fn memory_search_rows(
     conn: &Connection,
     q: &str,
     params: &Value,
@@ -469,6 +503,24 @@ pub fn memory_search(
         return memory_search_fts_only(conn, query, params, synonyms, ignore_date, limit);
     }
 
+    // Keep only the vector candidates within the dates asked, before the merge keeps the best
+    // `limit`: dropped after it, nearer ones outside the dates would take the places of matches
+    // inside them. (The FTS candidates are filtered by date in their query.)
+    let vec_candidates = if from_ts.is_some() || to_ts.is_some() {
+        let mut date_of = conn.prepare("SELECT dateMs FROM memory_meta WHERE rowid = ?1")?;
+        let mut kept = Vec::with_capacity(vec_candidates.len());
+        for (rowid, distance) in vec_candidates {
+            let date_ms: Option<i64> = date_of.query_row(params![rowid], |r| r.get(0)).optional()?;
+            let within = date_ms.is_some_and(|d| from_ts.is_none_or(|from| d >= from) && to_ts.is_none_or(|to| d <= to));
+            if within {
+                kept.push((rowid, distance));
+            }
+        }
+        kept
+    } else {
+        vec_candidates
+    };
+
     // --- Merge ---
     let text_pairs: Vec<(i64, f64)> = fts_candidates.iter().map(|c| (c.rowid, c.rank)).collect();
     let merged = crate::fts::hybrid::merge_results(
@@ -496,18 +548,8 @@ pub fn memory_search(
                 "rank": -hr.final_score
             }));
         } else {
-            // Vector-only result
+            // Vector-only result (within the dates: filtered before the merge)
             if let Some(meta) = fetch_memory_meta(conn, hr.rowid)? {
-                if let Some(from) = from_ts {
-                    if meta.date_ms < from {
-                        continue;
-                    }
-                }
-                if let Some(to) = to_ts {
-                    if meta.date_ms > to {
-                        continue;
-                    }
-                }
                 results.push(serde_json::json!({
                     "memId": meta.mem_id,
                     "role": meta.role,
@@ -539,10 +581,11 @@ fn memory_list_all(
 ) -> anyhow::Result<Vec<Value>> {
     log::info!("Memory search with empty query - listing all by date (limit={})", limit);
 
+    // The page's rows are chosen from memory_meta (dates only) before any content is read: sorting
+    // the join itself read every row's content, the whole memory, for each request. CROSS JOIN keeps
+    // that order: with a plain JOIN, SQLite scans memory_fts and looks each row up in the page.
     let mut sql = r#"
-        SELECT fts.memId, fts.role, fts.content, fts.sessionId, meta.dateMs
-        FROM memory_fts fts
-        JOIN memory_meta meta ON fts.rowid = meta.rowid
+        SELECT rowid, dateMs FROM memory_meta
         WHERE 1=1
     "#
     .to_string();
@@ -552,20 +595,28 @@ fn memory_list_all(
     if !ignore_date {
         if let Some(from_v) = params.get("from") {
             if let Some(ts) = super::db::parse_date_param(from_v)? {
-                sql.push_str(" AND meta.dateMs >= ?");
+                sql.push_str(" AND dateMs >= ?");
                 bind.push(rusqlite::types::Value::from(ts));
             }
         }
         if let Some(to_v) = params.get("to") {
             if let Some(ts) = super::db::parse_date_param(to_v)? {
-                sql.push_str(" AND meta.dateMs <= ?");
+                sql.push_str(" AND dateMs <= ?");
                 bind.push(rusqlite::types::Value::from(ts));
             }
         }
     }
 
-    sql.push_str(" ORDER BY meta.dateMs DESC LIMIT ?");
+    sql.push_str(" ORDER BY dateMs DESC LIMIT ?");
     bind.push(rusqlite::types::Value::from(limit));
+    let sql = format!(
+        r#"
+        SELECT fts.memId, fts.role, fts.content, fts.sessionId, meta.dateMs
+        FROM ({sql}) meta
+        CROSS JOIN memory_fts fts ON fts.rowid = meta.rowid
+        ORDER BY meta.dateMs DESC
+        "#
+    );
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(bind.iter()), |r| {
@@ -1830,5 +1881,336 @@ mod tests {
             [], |r| r.get(0),
         ).unwrap();
         assert_eq!(n, 1);
+    }
+
+    /// A listing (no query) gives the newest entries within the dates asked, newest first, at most
+    /// `limit` of them, each whole; both bounds include their millisecond and `ignoreDate` wins.
+    #[test]
+    fn memory_listing_gives_the_newest_within_the_dates_each_whole() {
+        let (dir, mut conn) = temp_memory_db("listing");
+        let base = chrono::Utc::now().timestamp_millis() - 100_000;
+        // Kept out of date order, so an order the table happens to hold shows.
+        let order = [4, 9, 0, 7, 2, 5, 8, 1, 6, 3];
+        let rows: Vec<Value> = order
+            .iter()
+            .map(|&i| serde_json::json!({
+                "memId": format!("turn:{i}"), "role": "session",
+                "content": format!("[USER]: question {i}\n\n[AGENT]: answer {i}"),
+                "sessionId": format!("session-{i}"), "turnIndex": i, "dateMs": base + i * 1_000,
+            }))
+            .collect();
+        memory_index_batch(&mut conn, &rows, None).unwrap();
+        let synonyms = SynonymLookup::new();
+        let list = |params: Value| -> Vec<i64> {
+            let results = memory_search(&conn, "", &params, &synonyms, None).unwrap();
+            for r in &results {
+                let i = r["memId"].as_str().unwrap().strip_prefix("turn:").unwrap().parse::<i64>().unwrap();
+                assert_eq!(r["content"], format!("[USER]: question {i}\n\n[AGENT]: answer {i}"));
+                assert_eq!(r["sessionId"], format!("session-{i}"));
+                assert_eq!(r["role"], "session");
+                assert_eq!(r["dateMs"], base + i * 1_000);
+                assert!(r["snippet"].is_null());
+            }
+            results.iter().map(|r| (r["dateMs"].as_i64().unwrap() - base) / 1_000).collect()
+        };
+        assert_eq!(list(serde_json::json!({ "ignoreDate": true, "limit": 3 })), vec![9, 8, 7]);
+        assert_eq!(list(serde_json::json!({ "ignoreDate": true, "limit": 50 })), vec![9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);
+        // Both bounds include their millisecond.
+        let within = serde_json::json!({ "from": base + 2_000, "to": base + 6_000, "limit": 3 });
+        assert_eq!(list(within), vec![6, 5, 4]);
+        let within = serde_json::json!({ "from": base + 2_000, "to": base + 6_000, "limit": 50 });
+        assert_eq!(list(within), vec![6, 5, 4, 3, 2]);
+        assert_eq!(list(serde_json::json!({ "to": base + 1_000, "limit": 50 })), vec![1, 0]);
+        // ignoreDate wins over the dates.
+        assert_eq!(list(serde_json::json!({ "ignoreDate": true, "from": base + 2_000, "to": base + 6_000, "limit": 2 })), vec![9, 8]);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A caller that asks for previews gets each result's text and snippet cut to that many
+    /// characters (never inside a character), in a listing and in a search; the stored rows stay
+    /// whole, and without the parameter (or with one that isn't a positive integer) every result is
+    /// whole, as before.
+    #[test]
+    fn memory_search_cuts_results_to_the_preview_asked_for() {
+        let (dir, mut conn) = temp_memory_db("preview");
+        let long = format!("[USER]: 日本語 plan {}\n\n[AGENT]: done", "word ".repeat(2_000));
+        let now = chrono::Utc::now().timestamp_millis();
+        // Every other field longer than the cut asked for below, so a cut reaching one shows.
+        let long_id = format!("turn:long:{}", "x".repeat(40));
+        let long_session = format!("persistent_chat:{}", "s".repeat(40));
+        let rows = [
+            serde_json::json!({
+                "memId": long_id, "role": "session", "content": long,
+                "sessionId": long_session, "turnIndex": 0, "dateMs": now,
+            }),
+            // Shorter than every cut asked for below: returned whole.
+            serde_json::json!({
+                "memId": "turn:short", "role": "session", "content": "plan ok",
+                "sessionId": "persistent_chat", "turnIndex": 1, "dateMs": now - 1_000,
+            }),
+        ];
+        memory_index_batch(&mut conn, &rows, None).unwrap();
+        let synonyms = SynonymLookup::new();
+        let search = |q: &str, extra: Value| {
+            let mut params = serde_json::json!({ "ignoreDate": true, "limit": 10 });
+            for (k, v) in extra.as_object().unwrap() {
+                params[k] = v.clone();
+            }
+            memory_search(&conn, q, &params, &synonyms, None).unwrap()
+        };
+        // 10 characters: "[USER]: 日本" ends inside the multi-byte word, on a character.
+        for q in ["", "plan"] {
+            let whole = search(q, serde_json::json!({}));
+            let cut = search(q, serde_json::json!({ "previewChars": 10 }));
+            assert_eq!(cut.len(), 2, "{q:?}");
+            assert_eq!(whole.len(), 2, "{q:?}");
+            let long_cut = cut.iter().find(|r| r["memId"] == long_id.as_str()).unwrap();
+            let long_whole = whole.iter().find(|r| r["memId"] == long_id.as_str()).unwrap();
+            assert_eq!(long_cut["content"], "[USER]: 日本", "{q:?}");
+            assert_eq!(long_whole["content"], long.as_str(), "{q:?}");
+            if let Some(snippet) = long_whole["snippet"].as_str() {
+                assert_eq!(long_cut["snippet"], snippet.chars().take(10).collect::<String>().as_str(), "{q:?}");
+            }
+            let short_cut = cut.iter().find(|r| r["memId"] == "turn:short").unwrap();
+            let short_whole = whole.iter().find(|r| r["memId"] == "turn:short").unwrap();
+            assert_eq!(short_cut["content"], "plan ok", "{q:?}");
+            // Only content and snippet differ, and only where they were longer than the cut.
+            for (c, w) in cut.iter().zip(whole.iter()) {
+                let mut c = c.clone();
+                let mut w = w.clone();
+                for key in ["content", "snippet"] {
+                    c.as_object_mut().unwrap().remove(key);
+                    w.as_object_mut().unwrap().remove(key);
+                }
+                assert_eq!(c, w, "{q:?}");
+            }
+            assert_eq!(short_cut, short_whole, "{q:?}");
+            assert_eq!(long_cut["sessionId"], long_session.as_str());
+            for extra in [serde_json::json!({ "previewChars": 0 }), serde_json::json!({ "previewChars": -5 }), serde_json::json!({ "previewChars": "10" })] {
+                assert_eq!(search(q, extra.clone()), whole, "{q:?} {extra}");
+            }
+        }
+        // The snippet of a match is cut too.
+        let snippet_of = |results: Vec<Value>| results.into_iter().find(|r| r["memId"] == long_id.as_str()).unwrap()["snippet"].as_str().unwrap().to_string();
+        let snippet_whole = snippet_of(search("plan", serde_json::json!({})));
+        assert!(snippet_whole.chars().count() > 3);
+        let snippet_cut = snippet_of(search("plan", serde_json::json!({ "previewChars": 3 })));
+        assert_eq!(snippet_cut, snippet_whole.chars().take(3).collect::<String>());
+        // Stored whole.
+        let stored: String = conn.query_row("SELECT content FROM memory_fts WHERE memId = ?1", [&long_id], |r| r.get(0)).unwrap();
+        assert_eq!(stored, long);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// What a write landing during a search does, at its `at`-th VM step (counted from 1): the
+    /// exchange the search finds by meaning is removed and another, outside the dates, is kept in its
+    /// rowid. `at` 0 only counts the steps.
+    struct WriteDuringSearch {
+        writer: Connection,
+        engine: *const EmbeddingEngine,
+        at: usize,
+        steps: usize,
+        written: bool,
+    }
+
+    extern "C" fn write_during_search(state: *mut std::os::raw::c_void) -> std::os::raw::c_int {
+        let state = unsafe { &mut *(state as *mut WriteDuringSearch) };
+        state.steps += 1;
+        if state.steps == state.at {
+            state.written = true;
+            let engine = unsafe { &*state.engine };
+            let replacement = serde_json::json!({ "memId": "replacement", "role": "session", "sessionId": "persistent_chat",
+                "content": "A completely unrelated exchange", "dateMs": chrono::Utc::now().timestamp_millis() + 86_400_000, "turnIndex": 1 });
+            assert_eq!(memory_remove_batch(&mut state.writer, &[serde_json::json!("found")]).unwrap(), 1);
+            memory_index_batch(&mut state.writer, &[replacement], Some(engine)).unwrap();
+        }
+        0
+    }
+
+    /// The embedding model from its usual folder (not downloaded here); without it, a test that
+    /// needs it is skipped.
+    fn embedding_engine() -> Option<EmbeddingEngine> {
+        let model = crate::embeddings::download::model_dir(None).unwrap();
+        let engine = EmbeddingEngine::load(&model).ok();
+        if engine.is_none() {
+            eprintln!("skipped: no embedding model in {}", model.display());
+        }
+        engine
+    }
+
+    /// A match found by meaning alone (no keyword in it) is cut to the preview asked for too.
+    #[test]
+    fn memory_search_cuts_a_match_by_meaning_to_the_preview_asked_for() {
+        let Some(engine) = embedding_engine() else { return };
+        let (dir, mut conn) = temp_memory_db("meaning-preview");
+        let content = "Here is the vacation itinerary";
+        let row = serde_json::json!({ "memId": "found", "role": "session", "sessionId": "persistent_chat",
+            "content": content, "dateMs": chrono::Utc::now().timestamp_millis(), "turnIndex": 0 });
+        memory_index_batch(&mut conn, &[row], Some(&engine)).unwrap();
+        let search = |params: Value| memory_search(&conn, "plan the vacation itinerary", &params, &SynonymLookup::new(), Some(&engine)).unwrap();
+        let whole = search(serde_json::json!({ "ignoreDate": true }));
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0]["snippet"], "", "found by meaning, not by its words");
+        assert_eq!(whole[0]["content"], content);
+        let cut = search(serde_json::json!({ "ignoreDate": true, "previewChars": 10 }));
+        assert_eq!(cut.len(), 1);
+        assert_eq!(cut[0]["content"], &content[..10]);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A search answers from the memory as it was when it began: wherever in it a write lands, it
+    /// gives the exchange it found, never one that took its rowid meanwhile, outside the dates. With
+    /// dates or without: a search without them could give that other exchange the same way.
+    #[test]
+    fn memory_search_answers_from_the_memory_as_it_began() {
+        let Some(engine) = embedding_engine() else { return };
+        let (dir, mut conn) = temp_memory_db("search-snapshot");
+        let synonyms = SynonymLookup::new();
+        let now = chrono::Utc::now().timestamp_millis();
+        let found = serde_json::json!({ "memId": "found", "role": "session", "sessionId": "persistent_chat",
+            "content": "Here is the vacation itinerary", "dateMs": now, "turnIndex": 0 });
+        let query = "plan the vacation itinerary";
+        let ids = |rows: &[Value]| rows.iter().map(|r| r["memId"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        let mut state = WriteDuringSearch {
+            writer: open_memory_writer_connection(&dir.join("memory.db")).unwrap(),
+            engine: &engine,
+            at: 0,
+            steps: 0,
+            written: false,
+        };
+        let search_with_write_at = |conn: &Connection, state: &mut WriteDuringSearch, params: &Value, at: usize| {
+            (state.at, state.steps, state.written) = (at, 0, false);
+            unsafe {
+                rusqlite::ffi::sqlite3_progress_handler(conn.handle(), 1, Some(write_during_search), state as *mut WriteDuringSearch as *mut std::os::raw::c_void);
+            }
+            let rows = memory_search(conn, query, params, &synonyms, Some(&engine)).unwrap();
+            unsafe { rusqlite::ffi::sqlite3_progress_handler(conn.handle(), 0, None, std::ptr::null_mut()) };
+            rows
+        };
+        let listing = serde_json::json!({ "ignoreDate": true });
+
+        memory_index_batch(&mut conn, &[found.clone()], Some(&engine)).unwrap();
+        for params in [serde_json::json!({ "from": now - 1, "to": now + 1, "limit": 10 }), serde_json::json!({ "ignoreDate": true, "limit": 10 })] {
+            // Found by meaning only (no keyword match), so the vector leg answers it.
+            let before = search_with_write_at(&conn, &mut state, &params, 0);
+            assert_eq!(ids(&before), ["found"], "{params}");
+            assert_eq!(before[0]["snippet"], "");
+            // How many steps a search takes, its query's embedding kept from the first.
+            search_with_write_at(&conn, &mut state, &params, 0);
+            let steps = state.steps;
+            assert!(steps > 100, "a search took {steps} steps");
+
+            // From past the transaction's start to the search's last step.
+            for at in (20..=steps).step_by((steps / 40).max(1)) {
+                let during = search_with_write_at(&conn, &mut state, &params, at);
+                assert!(state.written, "the write landed at step {at} of {steps}");
+                assert_eq!(ids(&during), ["found"], "with the write at step {at} of {steps}, {params}");
+                assert_eq!(during[0]["dateMs"], now);
+                // The write took the found exchange's rowid, and the next request reads it.
+                let reused: i64 = conn.query_row("SELECT rowid FROM memory_ids WHERE memId = 'replacement'", [], |r| r.get(0)).unwrap();
+                assert_eq!(reused, 1);
+                assert_eq!(ids(&memory_search(&conn, "", &listing, &synonyms, Some(&engine)).unwrap()), ["replacement"]);
+                // As it was, for the next step.
+                assert_eq!(memory_remove_batch(&mut conn, &[serde_json::json!("replacement")]).unwrap(), 1);
+                memory_index_batch(&mut conn, &[found.clone()], Some(&engine)).unwrap();
+            }
+        }
+        drop(state);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A search with one date bound keeps a match inside it found by meaning alone, scored as
+    /// without dates: the vector candidates are filtered by either bound on its own.
+    #[test]
+    fn memory_search_with_one_date_scores_a_match_by_meaning_as_without() {
+        let Some(engine) = embedding_engine() else { return };
+        let (dir, mut conn) = temp_memory_db("one-date-meaning");
+        let now = chrono::Utc::now().timestamp_millis();
+        let row = serde_json::json!({ "memId": "found", "role": "session", "sessionId": "persistent_chat",
+            "content": "Here is the vacation itinerary", "dateMs": now, "turnIndex": 0 });
+        memory_index_batch(&mut conn, &[row], Some(&engine)).unwrap();
+        let search = |params: Value| memory_search(&conn, "plan the vacation itinerary", &params, &SynonymLookup::new(), Some(&engine)).unwrap();
+        let whole = search(serde_json::json!({ "ignoreDate": true }));
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0]["snippet"], "", "found by meaning, not by its words");
+        for params in [serde_json::json!({ "from": now - 1 }), serde_json::json!({ "to": now + 1 })] {
+            assert_eq!(search(params.clone()), whole, "{params}");
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Refuses every read of memory_meta, counting them.
+    extern "C" fn deny_meta_reads(
+        denied: *mut std::os::raw::c_void,
+        action: std::os::raw::c_int,
+        table: *const std::os::raw::c_char,
+        _column: *const std::os::raw::c_char,
+        _db: *const std::os::raw::c_char,
+        _trigger: *const std::os::raw::c_char,
+    ) -> std::os::raw::c_int {
+        if action == rusqlite::ffi::SQLITE_READ && !table.is_null() && unsafe { std::ffi::CStr::from_ptr(table) }.to_bytes() == b"memory_meta" {
+            unsafe { *(denied as *mut usize) += 1 };
+            return rusqlite::ffi::SQLITE_DENY;
+        }
+        rusqlite::ffi::SQLITE_OK
+    }
+
+    /// A search that fails part way ends its read transaction: the next request on the connection
+    /// is answered, whole.
+    #[test]
+    fn memory_search_after_a_failed_one_is_answered() {
+        let (dir, mut conn) = temp_memory_db("failed-search");
+        let content = "[USER]: a question\n\n[AGENT]: an answer";
+        let row = serde_json::json!({ "memId": "turn:a", "role": "session", "sessionId": "persistent_chat",
+            "content": content, "dateMs": chrono::Utc::now().timestamp_millis(), "turnIndex": 0 });
+        memory_index_batch(&mut conn, &[row], None).unwrap();
+        let params = serde_json::json!({ "ignoreDate": true });
+        let mut denied = 0usize;
+        unsafe { rusqlite::ffi::sqlite3_set_authorizer(conn.handle(), Some(deny_meta_reads), &mut denied as *mut usize as *mut std::os::raw::c_void) };
+        let failed = memory_search(&conn, "", &params, &SynonymLookup::new(), None);
+        unsafe { rusqlite::ffi::sqlite3_set_authorizer(conn.handle(), None, std::ptr::null_mut()) };
+        assert!(denied > 0 && failed.is_err(), "the search failed on a read inside it");
+        let next = memory_search(&conn, "", &params, &SynonymLookup::new(), None).unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0]["memId"], "turn:a");
+        assert_eq!(next[0]["content"], content);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A page of the listing reads only its own rows' content, not the whole memory's: three rows
+    /// of a hundred long ones read a few pages from disk, well under the hundred they take.
+    #[test]
+    fn memory_listing_reads_only_its_pages_content() {
+        let (dir, mut conn) = temp_memory_db("listing-reads");
+        let now = chrono::Utc::now().timestamp_millis();
+        let rows: Vec<Value> = (0..100)
+            .map(|i| serde_json::json!({ "memId": format!("turn:{i}"), "role": "session", "sessionId": "persistent_chat",
+                "content": format!("exchange {i} {}", "word ".repeat(1000)), "dateMs": now + i, "turnIndex": i }))
+            .collect();
+        memory_index_batch(&mut conn, &rows, None).unwrap();
+        drop(conn);
+        // A cold reader with a tiny cache and no memory map, so each page it needs is a miss.
+        let conn = open_read_only_memory_connection(&dir.join("memory.db")).unwrap();
+        conn.execute_batch("PRAGMA mmap_size = 0; PRAGMA cache_size = 8;").unwrap();
+        let misses = || {
+            let (mut current, mut high) = (0, 0);
+            assert_eq!(unsafe { rusqlite::ffi::sqlite3_db_status(conn.handle(), rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS, &mut current, &mut high, 0) }, rusqlite::ffi::SQLITE_OK);
+            current
+        };
+        let before = misses();
+        let page = memory_search(&conn, "", &serde_json::json!({ "ignoreDate": true, "limit": 3 }), &SynonymLookup::new(), None).unwrap();
+        let read = misses() - before;
+        assert_eq!(page.iter().map(|r| r["memId"].as_str().unwrap()).collect::<Vec<_>>(), ["turn:99", "turn:98", "turn:97"]);
+        assert_eq!(page[0]["content"], rows[99]["content"]);
+        assert!(read > 0, "the cold reader read from disk");
+        assert!(read < 30, "a three-row page read {read} pages");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

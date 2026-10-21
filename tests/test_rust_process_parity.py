@@ -211,6 +211,179 @@ class TestRustHelperProcess(unittest.TestCase):
                 proc.kill()
 
 
+    def test_memory_search_previews_with_embeddings(self):
+        """With the embedding model loaded, a memory search (hybrid: keyword and
+        vector) returns previews of the length asked, and whole rows without it."""
+        proc = subprocess.Popen(
+            [self.rust_helper_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            _send_message(proc, {"id": "1", "method": "hello", "params": {"addonVersion": "1.2.1"}})
+            self.assert_success(_read_message(proc), "hello")
+            _send_message(proc, {"id": "2", "method": "init", "params": {"profilePath": self.temp_dir}})
+            self.assert_success(_read_message(proc), "init")
+
+            base = int(time.time() * 1000) - 100_000
+            rows = [
+                {
+                    "memId": f"filler-{i}",
+                    "role": "session",
+                    "content": f"[USER]: lunch order {i}\n\n[AGENT]: sandwich and soup for day {i}",
+                    "sessionId": "persistent_chat",
+                    "dateMs": base + i * 1000,
+                    "turnIndex": i,
+                }
+                for i in range(FILLER_COUNT)
+            ]
+            long = "[USER]: plan the itinerary for our trip\n\n[AGENT]: " + "itinerary details " * 2000
+            rows.append({"memId": "trip", "role": "session", "content": long, "sessionId": "persistent_chat", "dateMs": base + 99_000, "turnIndex": 99})
+            _send_message(proc, {"id": "3", "method": "memoryIndexBatch", "params": {"rows": rows}})
+            self.assert_success(_read_message(proc), "memoryIndexBatch")
+            _send_message(proc, {"id": "4", "method": "memoryStats", "params": {}})
+            stats = _read_message(proc)
+            self.assert_success(stats, "memoryStats")
+            # The model is loaded: every row has its vector, so the search below is hybrid.
+            self.assertEqual(stats["result"]["vecDocs"], len(rows))
+
+            def search(request_id, extra):
+                _send_message(proc, {"id": request_id, "method": "memorySearch", "params": {"q": "itinerary", "ignoreDate": True, "limit": 10, **extra}})
+                response = _read_message(proc)
+                self.assert_success(response, f"memorySearch {extra}")
+                return {r["memId"]: r for r in response["result"]}
+
+            whole = search("5", {})
+            cut = search("6", {"previewChars": 400})
+            self.assertIn("trip", whole)
+            self.assertEqual(set(cut), set(whole))
+            self.assertEqual(whole["trip"]["content"], long)
+            self.assertEqual(cut["trip"]["content"], long[:400])
+            if whole["trip"].get("snippet") is not None:
+                self.assertEqual(cut["trip"]["snippet"], whole["trip"]["snippet"][:400])
+            for mem_id, row in cut.items():
+                others = {k: v for k, v in row.items() if k not in ("content", "snippet")}
+                self.assertEqual(others, {k: v for k, v in whole[mem_id].items() if k not in ("content", "snippet")})
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+
+    def _dated_memory_search_case(self, profile, outside_each_side, inside_content):
+        """Indexes, with the embedding model loaded, exchanges about the itinerary (the nearest to
+        the query) on both sides of a one-day range, exchanges within it (`inside_content`, one at
+        each bound), and unrelated filler; returns the in-range rows, the dates, and a search
+        function on that helper."""
+        os.makedirs(profile, exist_ok=True)
+        proc = subprocess.Popen(
+            [self.rust_helper_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        _send_message(proc, {"id": "1", "method": "hello", "params": {"addonVersion": "1.2.1"}})
+        self.assert_success(_read_message(proc), "hello")
+        _send_message(proc, {"id": "2", "method": "init", "params": {"profilePath": profile}})
+        self.assert_success(_read_message(proc), "init")
+
+        day = 86_400_000
+        base = int(time.time() * 1000) - 60 * day
+        start, end = base + 30 * day, base + 31 * day
+        outside = [
+            {"memId": f"{side}-{i}", "role": "session", "content": f"[USER]: trip itinerary {side} {i}\n\n[AGENT]: the itinerary",
+             "sessionId": "persistent_chat", "dateMs": at + i * 1000, "turnIndex": i}
+            for side, at in (("before", start - 2 * day), ("after", end + day))
+            for i in range(outside_each_side)
+        ]
+        inside_dates = [start, start + 1000, start + 2000, start + 3000, start + 4000, end]
+        inside = [
+            {"memId": f"new-{i}", "role": "session",
+             "content": inside_content.format(i=i),
+             "sessionId": "persistent_chat", "dateMs": at, "turnIndex": 100 + i}
+            for i, at in enumerate(inside_dates)
+        ]
+        # Enough unrelated exchanges that the word is rare and a keyword match scores.
+        filler = [
+            {"memId": f"filler-{i}", "role": "session", "content": f"[USER]: weather report {i}\n\n[AGENT]: sunny on day {i}",
+             "sessionId": "persistent_chat", "dateMs": start + 100_000 + i * 1000, "turnIndex": 200 + i}
+            for i in range(300)
+        ]
+        rows = outside + inside + filler
+        _send_message(proc, {"id": "3", "method": "memoryIndexBatch", "params": {"rows": rows}})
+        self.assert_success(_read_message(proc), "memoryIndexBatch")
+        _send_message(proc, {"id": "4", "method": "memoryStats", "params": {}})
+        stats = _read_message(proc)
+        self.assert_success(stats, "memoryStats")
+        # The model is loaded: every row has its vector, so the searches are hybrid.
+        self.assertEqual(stats["result"]["vecDocs"], len(rows))
+
+        ids = iter(range(5, 1000))
+
+        def search(params):
+            _send_message(proc, {"id": str(next(ids)), "method": "memorySearch", "params": {"q": "itinerary", **params}})
+            response = _read_message(proc)
+            self.assert_success(response, "memorySearch")
+            return response["result"]
+
+        return proc, inside, start, end, search
+
+    def _close(self, proc):
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+            proc.wait()
+        proc.stdout.close()
+        proc.stderr.close()
+
+    def test_memory_search_with_dates_keeps_the_matches_within_them(self):
+        """With the embedding model loaded, a memory search with dates returns its
+        matches within the dates, both bounds included, however many nearer exchanges
+        lie before or after them."""
+        # Within them, exchanges that name it among other things: nearer ones outside the dates
+        # outscore them.
+        proc, inside, start, end, search = self._dated_memory_search_case(
+            os.path.join(self.temp_dir, "many"), 20,
+            "[USER]: lunch order {i}, soup and sandwich, then the quarterly budget, and the itinerary\n\n[AGENT]: noted the lunch and budget {i}")
+        try:
+            found = search({"from": start, "to": end, "limit": len(inside)})
+            self.assertEqual(sorted(r["memId"] for r in found), sorted(r["memId"] for r in inside))
+        finally:
+            self._close(proc)
+
+    def test_memory_search_with_dates_scores_the_matches_within_them_as_without(self):
+        """With the embedding model loaded, a match within the dates keeps its vector
+        score, at either bound: a search with dates ranks each one as a search without
+        them does."""
+        # Within them, exchanges near enough the query that their vector score counts.
+        proc, inside, start, end, search = self._dated_memory_search_case(
+            os.path.join(self.temp_dir, "few"), 2,
+            "[USER]: the trip itinerary, and lunch order {i}\n\n[AGENT]: the itinerary and lunch {i}")
+        try:
+            dated = {r["memId"]: r["rank"] for r in search({"from": start, "to": end, "limit": len(inside)})}
+            undated = {r["memId"]: r["rank"] for r in search({"limit": 50})}
+            self.assertEqual(sorted(dated), sorted(r["memId"] for r in inside))
+            for mem_id, rank in dated.items():
+                self.assertIn(mem_id, undated)
+                self.assertAlmostEqual(rank, undated[mem_id], delta=0.01, msg=mem_id)
+            # One bound alone keeps the matches on its side of it, those near the query too.
+            for bound, within in (("from", lambda d: d >= start), ("to", lambda d: d <= end)):
+                one_sided = search({bound: start if bound == "from" else end, "limit": 50})
+                self.assertTrue(one_sided, bound)
+                self.assertTrue(all(within(r["dateMs"]) for r in one_sided), (bound, [r["memId"] for r in one_sided]))
+        finally:
+            self._close(proc)
+
     def test_rebuild_embeddings_batch(self):
         """Test the batch-based rebuildEmbeddings workflow:
         rebuildEmbeddingsStart → rebuildEmbeddingsBatch loop → verify via stats.

@@ -152,6 +152,11 @@ archives of any size.
 
 - **[Full ADR](Companion/Decisions/Active/adr-nf-010-vendored-candle-core-on-zip-9.md)** — `cargo audit` RUSTSEC-2026-0367/0368/0369 (Zip < 9 archive extraction: permission bits, symlinks) reached the helper only through candle-core 0.8.4's `zip ^1.1.1` (unreachable: no `.npz`/`.pth` loading, safetensors only). No candle release uses Zip 9 (0.11 = Zip 8, and a new engine), so `vendor/candle-core` (crates.io 0.8.4, LICENSE kept, `TABMAIL-PATCHES.md`, per-file notices) is used via `[patch.crates-io]` with zip 9.0.5, entry `name()` `Result` passed on (upstream huggingface/candle#4041), elided lifetimes written out; its own Cargo.lock left out (dependency scanners). Remove once a candle release with Zip >= 9 is adopted. Builders on their own computer: `RUSTFLAGS=--remap-path-prefix=$HOME=~` (home folder / user name in binary paths; CI runners need none; `trim-paths` unstable). Paste unmaintained warning (gemm, compile time) remains.
 
+
+## ADR-NF-012: Memory Search Can Return Previews
+
+- **[Full ADR](Companion/Decisions/Active/adr-nf-012-memory-search-previews.md)** — `memorySearch` `previewChars` cuts `content`/`snippet` in the reply only (Thunderbird refuses a native message over 1 MiB); stored rows and `memoryRead` whole; no capability flag. Amended 2026-10-21: dated hybrid search filters vector candidates by date before the merge; listing picks rowids from `memory_meta` first; a memory search runs in one read transaction (rowid reuse). Open: limit x 4 > 4,096 fails the vector search silently (#20).
+
 ---
 
 ## Template for New Decisions

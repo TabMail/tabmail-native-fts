@@ -120,6 +120,11 @@ The memory database enables:
 - **Memory search** — Find past conversations by keyword using FTS5 with stemming and synonyms
 - **Memory read** — Retrieve full chat sessions by timestamp for context continuity
 
+`memorySearch` takes an optional `previewChars` (a positive integer): each result's
+`content` and `snippet` then come back cut to that many characters, so a reply of long
+entries stays small (Thunderbird refuses a native message over 1 MiB). The stored
+entries are unchanged. See ADR-NF-012 in `DECISIONS.md`.
+
 Each Thunderbird profile gets its own isolated FTS and memory databases.
 
 **Size limit.** A client can bound the memory database: `memoryIndexBatch` takes an
