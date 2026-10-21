@@ -47,7 +47,8 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
    as 0.11.8 effectively did (only one trailing `*`, then trailing `/` and `?`, then the quote
    marks, then the possessive are removed from a word). A possessive does not expand to synonyms
    (0.11.8 searched `client's` as `clients`, which has none), so it does not take the prefix star
-   off the words beside it.
+   off the words beside it, and its removed `s` counts toward the 4 bytes (`Tom's` searches
+   `"Tom"*`, as 0.11.8's `Toms*` did).
 3. A word expanding to synonyms becomes the generated `(a OR b …)` group; when any group is
    present every term is joined with an explicit `AND`. Whether a
    group is present is read from the terms as written (only a group starts with `(`), so it can't
@@ -97,7 +98,8 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
   `don't forget` in the mail that has them and not in the one spelling `OBrien` / `Dont` (red
   with the apostrophe strip restored: each finds only the other row), and `Sarah's`,
   `Sarah’s invoice`, `John's flight`, `team's budget` find what they name (red without the
-  possessive strip), and `'budget'` still expands;
+  possessive strip), `Tom's` finds "Tommy" (red without the `s` counted), and `'budget'` still
+  expands;
   `db::tests::test_search_prefix_star_is_decided_per_run_of_words` and the memory twin (red with
   a query-wide star rule), including `client's notes` finding "Notesheet for the client" and not
   "Notes for the customer" (red when a possessive expands) and a field's value beside a group
@@ -116,7 +118,8 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
     points unassigned in 6.1, which it indexes, are dropped; New Tai Lue vowel signs, letters
     today but marks in 6.1, are kept and match nothing). A `*` inside a word (`budg*et`) is part
     of the word, not a prefix marker. A field with a space before its value (`from: "jane doe"`)
-    takes a phrase without starting a new run of words.
+    takes a phrase without starting a new run of words. Typed parentheses are text, not grouping
+    (`(budget OR plan) review`; 0.11.8 failed on them).
   - Pre-existing in 0.11.8, tracked separately: a kept `NOT` is not applied to hybrid vector
     candidates (#21); a query with more than 256 kept `NOT`s exceeds FTS5's expression depth and
     fails (#22).

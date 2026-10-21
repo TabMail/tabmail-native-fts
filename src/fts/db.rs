@@ -2694,6 +2694,7 @@ pub(crate) mod tests {
         insert_test_message_full(&conn, &mut known_years, "acc:/:john", "Travel", "agent@example.com", "team@example.com", "John booked the flight to Denver.", a_week_ago);
         insert_test_message_full(&conn, &mut known_years, "acc:/:team", "Team budget", "carol@example.com", "team@example.com", "", a_week_ago);
         insert_test_message_full(&conn, &mut known_years, "acc:/:expense", "Travel expense report", "agent@example.com", "office@example.com", "", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:r5", "Files", "agent@example.com", "office@example.com", "Tommy sent the files.", a_week_ago);
         let found = |q: &str| -> Vec<String> {
             let mut ids = search_ok(&conn, q, &known_years);
             ids.sort();
@@ -2709,6 +2710,8 @@ pub(crate) mod tests {
             assert_eq!(found(q), sarah, "{q:?}");
         }
         assert_eq!(found("John's flight"), vec!["acc:/:john".to_string()]);
+        // A short name's possessive stays a prefix, as 0.11.8's `Toms*` was.
+        assert_eq!(found("Tom's"), vec!["acc:/:r5".to_string()]);
         assert_eq!(found("team's budget"), vec!["acc:/:team".to_string()]);
         // Quote marks around a word are not part of it: it still expands to its synonyms.
         assert_eq!(found("'budget'"), vec!["acc:/:expense".to_string(), "acc:/:team".to_string()]);

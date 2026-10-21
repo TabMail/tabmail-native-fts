@@ -197,8 +197,9 @@ fn word(w: &str, use_synonyms: bool, has_or_groups: bool, synonyms: &SynonymLook
     }
     // A word with punctuation is a phrase of its parts ("dmarc-supp" → [dmarc, supp]); the star
     // keeps a partial address matching while it is typed. Plain words of 4+ bytes get one too,
-    // unless synonym groups are present.
-    let prefix = star || has_punctuation(&core) || (core.len() >= 4 && !has_or_groups);
+    // unless synonym groups are present; a possessive's `s` counts, as 0.11.8 searched `Tom's`
+    // as `Toms*`.
+    let prefix = star || has_punctuation(&core) || (core.len() + usize::from(possessive) >= 4 && !has_or_groups);
     Some(format!("\"{core}\"{}", if prefix { "*" } else { "" }))
 }
 
@@ -223,6 +224,8 @@ mod tests {
         assert_eq!(build("Sarah\u{2019}s O'Brien's don't", &[]), r#""Sarah"* "O'Brien"* "don't"*"#);
         // A possessive never expands, so its neighbours keep their stars.
         assert_eq!(build("client's notes", &[]), r#""client"* "notes"*"#);
+        // A possessive's `s` counts toward the automatic star's 4 bytes.
+        assert_eq!(build("Tom's it's", &[]), r#""Tom"* "it""#);
         // Quote marks around a word are not part of it.
         assert_eq!(build("'budget'", &[]), build("budget", &[]));
         assert_eq!(build("\u{2018}abcd\u{2019}", &[]), r#""abcd"*"#);
@@ -293,6 +296,8 @@ mod tests {
             let q = build(q, COLUMNS);
             assert!(q.ends_with(r#") AND from_:"alex""#), "{q}");
         }
+        // A parenthesis inside a word is text: it is not a group and changes no join or star.
+        assert_eq!(build("f(x) budg", &[]), r#""f(x)"* "budg"*"#);
         // A field's value is never expanded, and does not cause groups.
         assert_eq!(build("subject:meeting zebra", COLUMNS), r#"subject:"meeting"* "zebra"*"#);
     }
