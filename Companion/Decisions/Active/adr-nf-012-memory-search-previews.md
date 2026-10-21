@@ -70,8 +70,9 @@ matches (it asked for 2,000). Review of that change found two helper defects it 
    `memory_meta`, so every row's content was read for each request (1.5 to 4 s at 1 GB, on the
    reader thread email search also uses), and a page of 20 takes four requests. Now the page's rows
    are chosen from `memory_meta` (`rowid`, `dateMs`) by date, and only their content is read: the same
-   rows in the same order (about 2 ms at 1 GB, measured by the reviewer on the helper's schema). No
-   index or schema change.
+   rows in the same order. The join is a `CROSS JOIN`, which SQLite keeps in the order written: with a
+   plain `JOIN` it scanned `memory_fts` and looked each row up in the page, still reading every row's
+   content (a page of 3 of 100 long rows read 130 pages from disk; now 9). No index or schema change.
 
 Still open (not here): a search's `limit` times `CANDIDATE_MULTIPLIER` over 4,096 still fails the
 vector search silently, for email and memory searches alike (#20; Thunderbird's email search and Voice's
@@ -84,6 +85,8 @@ keyword leg). Asking sqlite-vec for the dates directly would need the date in th
 Evidence: `memory_listing_gives_the_newest_within_the_dates_each_whole` (unit: newest first, the
 limit, both bounds inclusive, `ignoreDate` over the dates, every field whole) passes on the old
 query and the new; red with the inner order reversed, the outer order dropped, and `from` ignored.
+`memory_listing_reads_only_its_pages_content` (unit: that page, on a cold reader) is red with the
+plain `JOIN`.
 `test_memory_search_with_dates_keeps_the_matches_within_them` (process, model loaded: 20 entries
 nearer the query before the dates and 20 after, 6 matches inside with one at each bound, 300 others)
 returns the 6; red on the old code (it returned 4 of them) and with `to` not enforced.
@@ -91,9 +94,14 @@ returns the 6; red on the old code (it returned 4 of them) and with `to` not enf
 side, 6 matches inside near enough the query that their vector score counts) ranks each match
 inside the dates as the search without dates does, and one bound alone keeps the matches on its
 side; red with the in-range vector candidates dropped, with `from` exclusive, and with the filter
-applied only when both bounds are given.
+applied only when both bounds are given. `memory_search_with_one_date_scores_a_match_by_meaning_as_without`
+(unit, model loaded) does the same for a match by meaning alone; red with the vector candidates dropped
+when only one bound is given.
 `memory_search_answers_from_the_memory_as_it_began` (unit, model loaded, skipped without it: a write
 removing the match and keeping an exchange outside the dates in its rowid, landing at each of about
-40 points across the search) gives the match every time; without the transaction, 34 of 39 points
-lost it and one gave the other exchange. `memory_search_cuts_a_match_by_meaning_to_the_preview_asked_for`
+40 points across a search with dates and one without) gives the match every time; without the
+transaction, 34 of 39 points lost it and one gave the other exchange, and with it only for a search
+with dates, the search without them lost it. `memory_search_after_a_failed_one_is_answered` (unit: a
+read refused inside the search) answers the next request; red when a failed search leaves its
+transaction open. `memory_search_cuts_a_match_by_meaning_to_the_preview_asked_for`
 (unit, model loaded) cuts a match by meaning alone; red with results that have no snippet left whole.

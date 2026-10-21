@@ -582,7 +582,8 @@ fn memory_list_all(
     log::info!("Memory search with empty query - listing all by date (limit={})", limit);
 
     // The page's rows are chosen from memory_meta (dates only) before any content is read: sorting
-    // the join itself read every row's content, the whole memory, for each request.
+    // the join itself read every row's content, the whole memory, for each request. CROSS JOIN keeps
+    // that order: with a plain JOIN, SQLite scans memory_fts and looks each row up in the page.
     let mut sql = r#"
         SELECT rowid, dateMs FROM memory_meta
         WHERE 1=1
@@ -612,7 +613,7 @@ fn memory_list_all(
         r#"
         SELECT fts.memId, fts.role, fts.content, fts.sessionId, meta.dateMs
         FROM ({sql}) meta
-        JOIN memory_fts fts ON fts.rowid = meta.rowid
+        CROSS JOIN memory_fts fts ON fts.rowid = meta.rowid
         ORDER BY meta.dateMs DESC
         "#
     );
@@ -2061,7 +2062,8 @@ mod tests {
     }
 
     /// A search answers from the memory as it was when it began: wherever in it a write lands, it
-    /// gives the exchange it found, never one that took its rowid meanwhile, outside the dates.
+    /// gives the exchange it found, never one that took its rowid meanwhile, outside the dates. With
+    /// dates or without: a search without them could give that other exchange the same way.
     #[test]
     fn memory_search_answers_from_the_memory_as_it_began() {
         let Some(engine) = embedding_engine() else { return };
@@ -2071,7 +2073,6 @@ mod tests {
         let found = serde_json::json!({ "memId": "found", "role": "session", "sessionId": "persistent_chat",
             "content": "Here is the vacation itinerary", "dateMs": now, "turnIndex": 0 });
         let query = "plan the vacation itinerary";
-        let dated = serde_json::json!({ "from": now - 1, "to": now + 1, "limit": 10 });
         let ids = |rows: &[Value]| rows.iter().map(|r| r["memId"].as_str().unwrap().to_string()).collect::<Vec<_>>();
         let mut state = WriteDuringSearch {
             writer: open_memory_writer_connection(&dir.join("memory.db")).unwrap(),
@@ -2080,41 +2081,135 @@ mod tests {
             steps: 0,
             written: false,
         };
-        let search_with_write_at = |conn: &Connection, state: &mut WriteDuringSearch, at: usize| {
+        let search_with_write_at = |conn: &Connection, state: &mut WriteDuringSearch, params: &Value, at: usize| {
             (state.at, state.steps, state.written) = (at, 0, false);
             unsafe {
                 rusqlite::ffi::sqlite3_progress_handler(conn.handle(), 1, Some(write_during_search), state as *mut WriteDuringSearch as *mut std::os::raw::c_void);
             }
-            let rows = memory_search(conn, query, &dated, &synonyms, Some(&engine)).unwrap();
+            let rows = memory_search(conn, query, params, &synonyms, Some(&engine)).unwrap();
             unsafe { rusqlite::ffi::sqlite3_progress_handler(conn.handle(), 0, None, std::ptr::null_mut()) };
             rows
         };
+        let listing = serde_json::json!({ "ignoreDate": true });
 
         memory_index_batch(&mut conn, &[found.clone()], Some(&engine)).unwrap();
-        // Found by meaning only (no keyword match), so the vector leg answers it.
-        let before = search_with_write_at(&conn, &mut state, 0);
-        assert_eq!(ids(&before), ["found"]);
-        assert_eq!(before[0]["snippet"], "");
-        // How many steps a search takes, its query's embedding kept from the first.
-        search_with_write_at(&conn, &mut state, 0);
-        let steps = state.steps;
-        assert!(steps > 100, "a search took {steps} steps");
+        for params in [serde_json::json!({ "from": now - 1, "to": now + 1, "limit": 10 }), serde_json::json!({ "ignoreDate": true, "limit": 10 })] {
+            // Found by meaning only (no keyword match), so the vector leg answers it.
+            let before = search_with_write_at(&conn, &mut state, &params, 0);
+            assert_eq!(ids(&before), ["found"], "{params}");
+            assert_eq!(before[0]["snippet"], "");
+            // How many steps a search takes, its query's embedding kept from the first.
+            search_with_write_at(&conn, &mut state, &params, 0);
+            let steps = state.steps;
+            assert!(steps > 100, "a search took {steps} steps");
 
-        // From past the transaction's start to the search's last step.
-        for at in (20..=steps).step_by((steps / 40).max(1)) {
-            let during = search_with_write_at(&conn, &mut state, at);
-            assert!(state.written, "the write landed at step {at} of {steps}");
-            assert_eq!(ids(&during), ["found"], "with the write at step {at} of {steps}");
-            assert_eq!(during[0]["dateMs"], now);
-            // The write took the found exchange's rowid, and the next search reads it.
-            let reused: i64 = conn.query_row("SELECT rowid FROM memory_ids WHERE memId = 'replacement'", [], |r| r.get(0)).unwrap();
-            assert_eq!(reused, 1);
-            assert!(memory_search(&conn, query, &dated, &synonyms, Some(&engine)).unwrap().is_empty());
-            // As it was, for the next step.
-            assert_eq!(memory_remove_batch(&mut conn, &[serde_json::json!("replacement")]).unwrap(), 1);
-            memory_index_batch(&mut conn, &[found.clone()], Some(&engine)).unwrap();
+            // From past the transaction's start to the search's last step.
+            for at in (20..=steps).step_by((steps / 40).max(1)) {
+                let during = search_with_write_at(&conn, &mut state, &params, at);
+                assert!(state.written, "the write landed at step {at} of {steps}");
+                assert_eq!(ids(&during), ["found"], "with the write at step {at} of {steps}, {params}");
+                assert_eq!(during[0]["dateMs"], now);
+                // The write took the found exchange's rowid, and the next request reads it.
+                let reused: i64 = conn.query_row("SELECT rowid FROM memory_ids WHERE memId = 'replacement'", [], |r| r.get(0)).unwrap();
+                assert_eq!(reused, 1);
+                assert_eq!(ids(&memory_search(&conn, "", &listing, &synonyms, Some(&engine)).unwrap()), ["replacement"]);
+                // As it was, for the next step.
+                assert_eq!(memory_remove_batch(&mut conn, &[serde_json::json!("replacement")]).unwrap(), 1);
+                memory_index_batch(&mut conn, &[found.clone()], Some(&engine)).unwrap();
+            }
         }
         drop(state);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A search with one date bound keeps a match inside it found by meaning alone, scored as
+    /// without dates: the vector candidates are filtered by either bound on its own.
+    #[test]
+    fn memory_search_with_one_date_scores_a_match_by_meaning_as_without() {
+        let Some(engine) = embedding_engine() else { return };
+        let (dir, mut conn) = temp_memory_db("one-date-meaning");
+        let now = chrono::Utc::now().timestamp_millis();
+        let row = serde_json::json!({ "memId": "found", "role": "session", "sessionId": "persistent_chat",
+            "content": "Here is the vacation itinerary", "dateMs": now, "turnIndex": 0 });
+        memory_index_batch(&mut conn, &[row], Some(&engine)).unwrap();
+        let search = |params: Value| memory_search(&conn, "plan the vacation itinerary", &params, &SynonymLookup::new(), Some(&engine)).unwrap();
+        let whole = search(serde_json::json!({ "ignoreDate": true }));
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0]["snippet"], "", "found by meaning, not by its words");
+        for params in [serde_json::json!({ "from": now - 1 }), serde_json::json!({ "to": now + 1 })] {
+            assert_eq!(search(params.clone()), whole, "{params}");
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Refuses every read of memory_meta, counting them.
+    extern "C" fn deny_meta_reads(
+        denied: *mut std::os::raw::c_void,
+        action: std::os::raw::c_int,
+        table: *const std::os::raw::c_char,
+        _column: *const std::os::raw::c_char,
+        _db: *const std::os::raw::c_char,
+        _trigger: *const std::os::raw::c_char,
+    ) -> std::os::raw::c_int {
+        if action == rusqlite::ffi::SQLITE_READ && !table.is_null() && unsafe { std::ffi::CStr::from_ptr(table) }.to_bytes() == b"memory_meta" {
+            unsafe { *(denied as *mut usize) += 1 };
+            return rusqlite::ffi::SQLITE_DENY;
+        }
+        rusqlite::ffi::SQLITE_OK
+    }
+
+    /// A search that fails part way ends its read transaction: the next request on the connection
+    /// is answered, whole.
+    #[test]
+    fn memory_search_after_a_failed_one_is_answered() {
+        let (dir, mut conn) = temp_memory_db("failed-search");
+        let content = "[USER]: a question\n\n[AGENT]: an answer";
+        let row = serde_json::json!({ "memId": "turn:a", "role": "session", "sessionId": "persistent_chat",
+            "content": content, "dateMs": chrono::Utc::now().timestamp_millis(), "turnIndex": 0 });
+        memory_index_batch(&mut conn, &[row], None).unwrap();
+        let params = serde_json::json!({ "ignoreDate": true });
+        let mut denied = 0usize;
+        unsafe { rusqlite::ffi::sqlite3_set_authorizer(conn.handle(), Some(deny_meta_reads), &mut denied as *mut usize as *mut std::os::raw::c_void) };
+        let failed = memory_search(&conn, "", &params, &SynonymLookup::new(), None);
+        unsafe { rusqlite::ffi::sqlite3_set_authorizer(conn.handle(), None, std::ptr::null_mut()) };
+        assert!(denied > 0 && failed.is_err(), "the search failed on a read inside it");
+        let next = memory_search(&conn, "", &params, &SynonymLookup::new(), None).unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0]["memId"], "turn:a");
+        assert_eq!(next[0]["content"], content);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A page of the listing reads only its own rows' content, not the whole memory's: three rows
+    /// of a hundred long ones read a few pages from disk, well under the hundred they take.
+    #[test]
+    fn memory_listing_reads_only_its_pages_content() {
+        let (dir, mut conn) = temp_memory_db("listing-reads");
+        let now = chrono::Utc::now().timestamp_millis();
+        let rows: Vec<Value> = (0..100)
+            .map(|i| serde_json::json!({ "memId": format!("turn:{i}"), "role": "session", "sessionId": "persistent_chat",
+                "content": format!("exchange {i} {}", "word ".repeat(1000)), "dateMs": now + i, "turnIndex": i }))
+            .collect();
+        memory_index_batch(&mut conn, &rows, None).unwrap();
+        drop(conn);
+        // A cold reader with a tiny cache and no memory map, so each page it needs is a miss.
+        let conn = open_read_only_memory_connection(&dir.join("memory.db")).unwrap();
+        conn.execute_batch("PRAGMA mmap_size = 0; PRAGMA cache_size = 8;").unwrap();
+        let misses = || {
+            let (mut current, mut high) = (0, 0);
+            assert_eq!(unsafe { rusqlite::ffi::sqlite3_db_status(conn.handle(), rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS, &mut current, &mut high, 0) }, rusqlite::ffi::SQLITE_OK);
+            current
+        };
+        let before = misses();
+        let page = memory_search(&conn, "", &serde_json::json!({ "ignoreDate": true, "limit": 3 }), &SynonymLookup::new(), None).unwrap();
+        let read = misses() - before;
+        assert_eq!(page.iter().map(|r| r["memId"].as_str().unwrap()).collect::<Vec<_>>(), ["turn:99", "turn:98", "turn:97"]);
+        assert_eq!(page[0]["content"], rows[99]["content"]);
+        assert!(read > 0, "the cold reader read from disk");
+        assert!(read < 30, "a three-row page read {read} pages");
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }
