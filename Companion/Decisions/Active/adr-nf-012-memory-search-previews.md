@@ -61,6 +61,11 @@ matches (it asked for 2,000). Review of that change found two helper defects it 
    removed before the merge (one `memory_meta` lookup per candidate, only when dates are given), and
    the check after the merge, which can no longer drop anything, is deleted. The keyword candidates
    were already filtered by date in their query.
+   With that check gone, a write landing between the search's queries could put an exchange outside
+   the dates in its results: the candidate's date was read before the write, its row after it, and
+   an exchange removed while it is the newest leaves its rowid to the next one kept. So a memory
+   search now runs in one read transaction, and all its queries read the memory as it was when it
+   began (dated or not: an undated search could give the other exchange the same way).
 2. **Each listing request read the whole memory.** The listing sorted the join of `memory_fts` and
    `memory_meta`, so every row's content was read for each request (1.5 to 4 s at 1 GB, on the
    reader thread email search also uses), and a page of 20 takes four requests. Now the page's rows
@@ -84,5 +89,11 @@ nearer the query before the dates and 20 after, 6 matches inside with one at eac
 returns the 6; red on the old code (it returned 4 of them) and with `to` not enforced.
 `test_memory_search_with_dates_scores_the_matches_within_them_as_without` (2 nearer entries on each
 side, 6 matches inside near enough the query that their vector score counts) ranks each match
-inside the dates as the search without dates does; red with the in-range vector candidates dropped
-and with `from` exclusive.
+inside the dates as the search without dates does, and one bound alone keeps the matches on its
+side; red with the in-range vector candidates dropped, with `from` exclusive, and with the filter
+applied only when both bounds are given.
+`memory_search_answers_from_the_memory_as_it_began` (unit, model loaded, skipped without it: a write
+removing the match and keeping an exchange outside the dates in its rowid, landing at each of about
+40 points across the search) gives the match every time; without the transaction, 34 of 39 points
+lost it and one gave the other exchange. `memory_search_cuts_a_match_by_meaning_to_the_preview_asked_for`
+(unit, model loaded) cuts a match by meaning alone; red with results that have no snippet left whole.

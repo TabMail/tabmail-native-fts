@@ -376,6 +376,11 @@ class TestRustHelperProcess(unittest.TestCase):
             for mem_id, rank in dated.items():
                 self.assertIn(mem_id, undated)
                 self.assertAlmostEqual(rank, undated[mem_id], delta=0.01, msg=mem_id)
+            # One bound alone keeps the matches on its side of it, those near the query too.
+            for bound, within in (("from", lambda d: d >= start), ("to", lambda d: d <= end)):
+                one_sided = search({bound: start if bound == "from" else end, "limit": 50})
+                self.assertTrue(one_sided, bound)
+                self.assertTrue(all(within(r["dateMs"]) for r in one_sided), (bound, [r["memId"] for r in one_sided]))
         finally:
             self._close(proc)
 

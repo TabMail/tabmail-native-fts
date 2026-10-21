@@ -418,7 +418,12 @@ pub fn memory_search(
     synonyms: &SynonymLookup,
     engine: Option<&EmbeddingEngine>,
 ) -> anyhow::Result<Vec<Value>> {
-    let mut results = memory_search_rows(conn, q, params, synonyms, engine)?;
+    // One read transaction, so the search's queries all read the memory as it was when it began: a
+    // write landing between them (an exchange removed and its rowid reused) can't put another
+    // exchange, or one outside the dates, in its results.
+    let tx = conn.unchecked_transaction()?;
+    let mut results = memory_search_rows(&tx, q, params, synonyms, engine)?;
+    drop(tx);
     let preview_chars = params.get("previewChars").and_then(|v| v.as_u64()).filter(|&n| n > 0);
     if let Some(max) = preview_chars {
         let max = usize::try_from(max).unwrap_or(usize::MAX);
@@ -1994,6 +1999,122 @@ mod tests {
         // Stored whole.
         let stored: String = conn.query_row("SELECT content FROM memory_fts WHERE memId = ?1", [&long_id], |r| r.get(0)).unwrap();
         assert_eq!(stored, long);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// What a write landing during a search does, at its `at`-th VM step (counted from 1): the
+    /// exchange the search finds by meaning is removed and another, outside the dates, is kept in its
+    /// rowid. `at` 0 only counts the steps.
+    struct WriteDuringSearch {
+        writer: Connection,
+        engine: *const EmbeddingEngine,
+        at: usize,
+        steps: usize,
+        written: bool,
+    }
+
+    extern "C" fn write_during_search(state: *mut std::os::raw::c_void) -> std::os::raw::c_int {
+        let state = unsafe { &mut *(state as *mut WriteDuringSearch) };
+        state.steps += 1;
+        if state.steps == state.at {
+            state.written = true;
+            let engine = unsafe { &*state.engine };
+            let replacement = serde_json::json!({ "memId": "replacement", "role": "session", "sessionId": "persistent_chat",
+                "content": "A completely unrelated exchange", "dateMs": chrono::Utc::now().timestamp_millis() + 86_400_000, "turnIndex": 1 });
+            assert_eq!(memory_remove_batch(&mut state.writer, &[serde_json::json!("found")]).unwrap(), 1);
+            memory_index_batch(&mut state.writer, &[replacement], Some(engine)).unwrap();
+        }
+        0
+    }
+
+    /// The embedding model from its usual folder (not downloaded here); without it, a test that
+    /// needs it is skipped.
+    fn embedding_engine() -> Option<EmbeddingEngine> {
+        let model = crate::embeddings::download::model_dir(None).unwrap();
+        let engine = EmbeddingEngine::load(&model).ok();
+        if engine.is_none() {
+            eprintln!("skipped: no embedding model in {}", model.display());
+        }
+        engine
+    }
+
+    /// A match found by meaning alone (no keyword in it) is cut to the preview asked for too.
+    #[test]
+    fn memory_search_cuts_a_match_by_meaning_to_the_preview_asked_for() {
+        let Some(engine) = embedding_engine() else { return };
+        let (dir, mut conn) = temp_memory_db("meaning-preview");
+        let content = "Here is the vacation itinerary";
+        let row = serde_json::json!({ "memId": "found", "role": "session", "sessionId": "persistent_chat",
+            "content": content, "dateMs": chrono::Utc::now().timestamp_millis(), "turnIndex": 0 });
+        memory_index_batch(&mut conn, &[row], Some(&engine)).unwrap();
+        let search = |params: Value| memory_search(&conn, "plan the vacation itinerary", &params, &SynonymLookup::new(), Some(&engine)).unwrap();
+        let whole = search(serde_json::json!({ "ignoreDate": true }));
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0]["snippet"], "", "found by meaning, not by its words");
+        assert_eq!(whole[0]["content"], content);
+        let cut = search(serde_json::json!({ "ignoreDate": true, "previewChars": 10 }));
+        assert_eq!(cut.len(), 1);
+        assert_eq!(cut[0]["content"], &content[..10]);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A search answers from the memory as it was when it began: wherever in it a write lands, it
+    /// gives the exchange it found, never one that took its rowid meanwhile, outside the dates.
+    #[test]
+    fn memory_search_answers_from_the_memory_as_it_began() {
+        let Some(engine) = embedding_engine() else { return };
+        let (dir, mut conn) = temp_memory_db("search-snapshot");
+        let synonyms = SynonymLookup::new();
+        let now = chrono::Utc::now().timestamp_millis();
+        let found = serde_json::json!({ "memId": "found", "role": "session", "sessionId": "persistent_chat",
+            "content": "Here is the vacation itinerary", "dateMs": now, "turnIndex": 0 });
+        let query = "plan the vacation itinerary";
+        let dated = serde_json::json!({ "from": now - 1, "to": now + 1, "limit": 10 });
+        let ids = |rows: &[Value]| rows.iter().map(|r| r["memId"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        let mut state = WriteDuringSearch {
+            writer: open_memory_writer_connection(&dir.join("memory.db")).unwrap(),
+            engine: &engine,
+            at: 0,
+            steps: 0,
+            written: false,
+        };
+        let search_with_write_at = |conn: &Connection, state: &mut WriteDuringSearch, at: usize| {
+            (state.at, state.steps, state.written) = (at, 0, false);
+            unsafe {
+                rusqlite::ffi::sqlite3_progress_handler(conn.handle(), 1, Some(write_during_search), state as *mut WriteDuringSearch as *mut std::os::raw::c_void);
+            }
+            let rows = memory_search(conn, query, &dated, &synonyms, Some(&engine)).unwrap();
+            unsafe { rusqlite::ffi::sqlite3_progress_handler(conn.handle(), 0, None, std::ptr::null_mut()) };
+            rows
+        };
+
+        memory_index_batch(&mut conn, &[found.clone()], Some(&engine)).unwrap();
+        // Found by meaning only (no keyword match), so the vector leg answers it.
+        let before = search_with_write_at(&conn, &mut state, 0);
+        assert_eq!(ids(&before), ["found"]);
+        assert_eq!(before[0]["snippet"], "");
+        // How many steps a search takes, its query's embedding kept from the first.
+        search_with_write_at(&conn, &mut state, 0);
+        let steps = state.steps;
+        assert!(steps > 100, "a search took {steps} steps");
+
+        // From past the transaction's start to the search's last step.
+        for at in (20..=steps).step_by((steps / 40).max(1)) {
+            let during = search_with_write_at(&conn, &mut state, at);
+            assert!(state.written, "the write landed at step {at} of {steps}");
+            assert_eq!(ids(&during), ["found"], "with the write at step {at} of {steps}");
+            assert_eq!(during[0]["dateMs"], now);
+            // The write took the found exchange's rowid, and the next search reads it.
+            let reused: i64 = conn.query_row("SELECT rowid FROM memory_ids WHERE memId = 'replacement'", [], |r| r.get(0)).unwrap();
+            assert_eq!(reused, 1);
+            assert!(memory_search(&conn, query, &dated, &synonyms, Some(&engine)).unwrap().is_empty());
+            // As it was, for the next step.
+            assert_eq!(memory_remove_batch(&mut conn, &[serde_json::json!("replacement")]).unwrap(), 1);
+            memory_index_batch(&mut conn, &[found.clone()], Some(&engine)).unwrap();
+        }
+        drop(state);
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }
