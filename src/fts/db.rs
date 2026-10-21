@@ -2653,6 +2653,20 @@ pub(crate) mod tests {
         // A word with no letter or digit, beside words with synonyms (an AND join).
         assert_eq!(found("budget ?"), one);
         assert_eq!(found("meeting -- \"\""), one);
+        // Letters the tokenizer does not index (enclosed-letter symbols, a lone mark) too.
+        for q in ["meeting \u{24d0}", "budget \u{1f17f}\u{fe0f}", "\"\u{24d0}\" meeting", "meeting AND \u{24d0}", "meeting \u{93e}"] {
+            assert_eq!(found(q), one, "{q:?}");
+        }
+    }
+
+    /// A private-use character is indexed, so a query keeps it: it finds the mail that has it.
+    #[test]
+    fn test_search_keeps_private_use_characters() {
+        let (conn, mut known_years) = setup_test_db();
+        let a_week_ago = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        insert_test_message_full(&conn, &mut known_years, "acc:/:mark", "Plan \u{e000} launch", "alice@example.com", "team@example.com", "", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:plain", "Plan launch", "alice@example.com", "team@example.com", "", a_week_ago);
+        assert_eq!(search_ok(&conn, "plan \u{e000}", &known_years), vec!["acc:/:mark".to_string()]);
     }
 
     /// A word with an apostrophe finds the text it was written as: the tokenizer splits
@@ -2673,10 +2687,37 @@ pub(crate) mod tests {
             "Dont forget the receipts.",
             a_week_ago,
         );
+        insert_test_message_full(&conn, &mut known_years, "acc:/:sarah", "Invoice from Sarah", "sarah@example.com", "team@example.com", "Thanks, Sarah", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:sarahs", "Sarah's invoice", "billing@example.com", "team@example.com", "", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:john", "Travel", "agent@example.com", "team@example.com", "John booked the flight to Denver.", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:team", "Team budget", "carol@example.com", "team@example.com", "", a_week_ago);
+        let found = |q: &str| -> Vec<String> {
+            let mut ids = search_ok(&conn, q, &known_years);
+            ids.sort();
+            ids
+        };
         let apostrophe = vec!["acc:/:apostrophe".to_string()];
         for q in ["O'Brien", "o'brien", "subject:O'Brien", "don't forget", "Don't"] {
-            assert_eq!(search_ok(&conn, q, &known_years), apostrophe, "{q:?}");
+            assert_eq!(found(q), apostrophe, "{q:?}");
         }
+        // A possessive finds what it names, written with or without the 's.
+        let sarah = vec!["acc:/:sarah".to_string(), "acc:/:sarahs".to_string()];
+        for q in ["Sarah's", "Sarah\u{2019}s invoice", "SARAH'S"] {
+            assert_eq!(found(q), sarah, "{q:?}");
+        }
+        assert_eq!(found("John's flight"), vec!["acc:/:john".to_string()]);
+        assert_eq!(found("team's budget"), vec!["acc:/:team".to_string()]);
+    }
+
+    /// A word gets its automatic prefix star unless a word with synonyms is in its own run of
+    /// words (between quoted phrases), as before: `notes` here still finds "Notesheet".
+    #[test]
+    fn test_search_prefix_star_is_decided_per_run_of_words() {
+        let (conn, mut known_years) = setup_test_db();
+        let a_week_ago = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        insert_test_message_full(&conn, &mut known_years, "acc:/:sheet", "Roadmapping", "alice@example.com", "team@example.com", "Notesheet from Jane Doe for the meeting", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:other", "Roadmapping", "alice@example.com", "team@example.com", "Jane Doe set up the meeting", a_week_ago);
+        assert_eq!(search_ok(&conn, "notes \"Jane Doe\" roadmapping meeting", &known_years), vec!["acc:/:sheet".to_string()]);
     }
 
     /// Inserts a message with the given FTS columns set and the others empty.

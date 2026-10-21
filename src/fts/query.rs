@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use crate::fts::synonyms::SynonymLookup;
+use unicode_categories::UnicodeCategories;
 
 /// Builds the FTS5 MATCH expression for a search query a user typed or a model wrote.
 ///
@@ -24,14 +25,16 @@ pub fn build_fts_match(
     let items = scan(&q);
 
     // A word with synonyms becomes an OR group; FTS5 then needs an explicit AND between all
-    // terms, and no word gets an automatic prefix star (as before). Whether there is a group is
-    // read from the terms written, so it can't disagree with how they were written.
+    // terms. As before, no word in the same run of words (between quoted phrases) as a group gets
+    // an automatic prefix star. Which runs have a group is read from the terms written, so it
+    // can't disagree with how they were written.
     // A capital AND, OR or NOT standing between two terms stays the FTS5 operator, as the old
     // builder passed it through (`from:"a@example.com" OR to:"a@example.com"`); anywhere else
     // (first, last, after another operator) it is dropped.
-    let render = |has_or_groups: bool| -> Vec<(Option<&'static str>, String)> {
-        let mut out: Vec<(Option<&'static str>, String)> = vec![];
+    let render = |grouped_runs: &[bool]| -> Vec<(Option<&'static str>, String, usize)> {
+        let mut out: Vec<(Option<&'static str>, String, usize)> = vec![];
         let mut operator: Option<&'static str> = None;
+        let mut run = 0usize;
         let mut i = 0usize;
         while i < items.len() {
             let item = items[i];
@@ -44,8 +47,12 @@ pub fn build_fts_match(
                     continue;
                 }
             }
+            let has_or_groups = grouped_runs.get(run).copied().unwrap_or(false);
             let term = match item {
-                Item::Phrase(p) => phrase(p),
+                Item::Phrase(p) => {
+                    run += 1;
+                    phrase(p)
+                }
                 Item::Word(w) => match scoped_column(w, columns) {
                     // name:"phrase" and name: word take the next item as the value.
                     Some((col, "")) => {
@@ -62,14 +69,14 @@ pub fn build_fts_match(
                 },
             };
             if let Some(term) = term {
-                out.push((operator.take(), term));
+                out.push((operator.take(), term, run));
             }
         }
         out
     };
-    let join = |terms: Vec<(Option<&str>, String)>, joiner: &str| -> String {
+    let join = |terms: Vec<(Option<&str>, String, usize)>, joiner: &str| -> String {
         let mut s = String::new();
-        for (n, (op, term)) in terms.into_iter().enumerate() {
+        for (n, (op, term, _)) in terms.into_iter().enumerate() {
             if n > 0 {
                 match op {
                     Some(op) => {
@@ -85,11 +92,17 @@ pub fn build_fts_match(
         s
     };
 
-    let terms = render(false);
+    let terms = render(&[]);
     // Only a synonym group starts with "(": words and phrases start with a quote, scoped terms
     // with their column.
-    if terms.iter().any(|(_, t)| t.starts_with('(')) {
-        join(render(true), " AND ")
+    let mut grouped_runs = vec![false; terms.last().map_or(0, |(_, _, run)| run + 1)];
+    for (_, term, run) in &terms {
+        if term.starts_with('(') {
+            grouped_runs[*run] = true;
+        }
+    }
+    if grouped_runs.contains(&true) {
+        join(render(&grouped_runs), " AND ")
     } else {
         join(terms, " ")
     }
@@ -135,9 +148,12 @@ fn scoped_column<'a>(w: &'a str, columns: &[(&str, &'a str)]) -> Option<(&'a str
         .map(|(_, col)| (*col, value))
 }
 
-/// Whether text has a letter or digit (a term with nothing the tokenizer indexes matches nothing).
+/// Whether text has a character the tokenizer indexes (a term with none matches nothing).
+/// unicode61 indexes letters, numbers and private-use characters (`L* N* Co`); Rust's
+/// alphanumeric also counts the marks and enclosed-letter symbols (Ⓜ, 🅿) that have the
+/// Alphabetic property, which unicode61 does not index.
 fn has_text(s: &str) -> bool {
-    s.chars().any(char::is_alphanumeric)
+    s.chars().any(|c| (c.is_alphanumeric() && !c.is_mark() && !c.is_symbol()) || c.is_other_private_use())
 }
 
 fn phrase(p: &str) -> Option<String> {
@@ -145,16 +161,21 @@ fn phrase(p: &str) -> Option<String> {
 }
 
 /// A word's searched text and whether the user ended it with `*`: one trailing `*`, then
-/// trailing `/` and `?`, are removed. An apostrophe stays: the tokenizer splits `O'Brien` into
-/// `o` and `brien`, and the quoted word searches them as a phrase.
+/// trailing `/` and `?`, then one possessive `'s` are removed. Any other apostrophe stays: the
+/// tokenizer splits `O'Brien` into `o` and `brien`, and the quoted word searches them as a phrase.
+/// `John's` searches `John`, which (stemmed) also finds "John's".
 fn prepare_word(w: &str) -> Option<(String, bool)> {
     let (w, star) = match w.strip_suffix('*') {
         Some(rest) => (rest, true),
         None => (w, false),
     };
-    let core = w.trim_end_matches(['/', '?']).to_string();
+    let w = w.trim_end_matches(['/', '?']);
+    let core = POSSESSIVES.iter().find_map(|p| w.strip_suffix(p)).unwrap_or(w).to_string();
     has_text(&core).then_some((core, star))
 }
+
+/// A possessive ending, with a straight or a typographic apostrophe.
+const POSSESSIVES: [&str; 4] = ["'s", "'S", "\u{2019}s", "\u{2019}S"];
 
 /// Only a plain word the user did not star expands to its synonyms.
 fn expands(core: &str, star: bool, synonyms: &SynonymLookup) -> bool {
@@ -162,7 +183,7 @@ fn expands(core: &str, star: bool, synonyms: &SynonymLookup) -> bool {
 }
 
 fn has_punctuation(core: &str) -> bool {
-    core.chars().any(|c| !c.is_alphanumeric() && c != '_')
+    core.chars().any(|c| !c.is_alphanumeric() && c != '_' && !c.is_other_private_use())
 }
 
 fn word(w: &str, use_synonyms: bool, has_or_groups: bool, synonyms: &SynonymLookup) -> Option<String> {
@@ -193,7 +214,9 @@ mod tests {
         assert_eq!(build("50% off", &[]), r#""50%"* "off""#);
         assert_eq!(build("NOT (budget", &[]), r#""(budget"*"#);
         assert_eq!(build(r#"say "hi there"#, &[]), r#""say" "hi there""#);
-        assert_eq!(build("it's gone?", &[]), r#""it's"* "gone"*"#);
+        // One possessive 's is removed; any other apostrophe stays.
+        assert_eq!(build("it's gone?", &[]), r#""it" "gone"*"#);
+        assert_eq!(build("Sarah\u{2019}s O'Brien's don't", &[]), r#""Sarah"* "O'Brien"* "don't"*"#);
         assert_eq!(build("budg*", &[]), r#""budg"*"#);
         // A user's star keeps a short word a prefix, and a starred word never expands.
         assert_eq!(build("ab*", &[]), r#""ab"*"#);
@@ -203,6 +226,10 @@ mod tests {
         // A NUL separates words.
         assert_eq!(build("ab\u{0}cd", &[]), r#""ab" "cd""#);
         assert_eq!(build(r#"-- "" _ ?"#, &[]), "");
+        // Text the tokenizer does not index is dropped: enclosed-letter symbols and lone marks.
+        // Private-use characters are indexed, so they stay.
+        assert_eq!(build("\u{24d0} \u{1f17f}\u{fe0f} \u{0301} \u{93e}", &[]), "");
+        assert_eq!(build("\u{e000}", &[]), "\"\u{e000}\"");
     }
 
     #[test]
@@ -239,8 +266,11 @@ mod tests {
     fn synonym_groups_are_joined_with_and() {
         let q = build(r#"meeting "budget plan" from:alice"#, COLUMNS);
         assert!(q.starts_with('(') && q.contains(" OR meeting OR "), "{q}");
-        // With groups present no word gets an automatic star.
-        assert!(q.ends_with(r#") AND "budget plan" AND from_:"alice""#), "{q}");
+        // No word in a group's run of words (between quoted phrases) gets an automatic star;
+        // a word in another run does.
+        assert!(q.ends_with(r#") AND "budget plan" AND from_:"alice"*"#), "{q}");
+        let q = build(r#"notes "Jane Doe" roadmapping meeting"#, COLUMNS);
+        assert!(q.starts_with(r#""notes"* AND "Jane Doe" AND "roadmapping" AND ("#), "{q}");
         // The user's star survives beside a group.
         let q = build("meeting budg*", COLUMNS);
         assert!(q.starts_with('(') && q.ends_with(r#") AND "budg"*"#), "{q}");

@@ -1525,6 +1525,10 @@ pub(crate) mod tests {
         // A word with no letter or digit beside a word with synonyms (an AND join).
         assert_eq!(found("budget ?"), 1);
         assert_eq!(found("budget -- \"\""), 1);
+        // Letters the tokenizer does not index (enclosed-letter symbols, a lone mark) too.
+        for q in ["budget \u{24d0}", "budget \u{1f17f}\u{fe0f}", "\"\u{24d0}\" budget", "budget AND \u{24d0}", "budget \u{93e}"] {
+            assert_eq!(found(q), 1, "{q:?}");
+        }
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1535,7 +1539,10 @@ pub(crate) mod tests {
     fn memory_search_finds_words_with_apostrophes() {
         let (dir, mut conn) = temp_memory_db("apostrophe");
         let rows: Vec<_> = ["[USER]: lunch with O'Brien\n\n[AGENT]: Don't forget the receipts.",
-            "[USER]: lunch with OBrien\n\n[AGENT]: Dont forget the receipts."]
+            "[USER]: lunch with OBrien\n\n[AGENT]: Dont forget the receipts.",
+            "[USER]: what is the team budget?\n\n[AGENT]: Notesheet from Jane Doe: roadmapping for the meeting.",
+            "[USER]: plan \u{e000} launch\n\n[AGENT]: Noted.",
+            "[USER]: plan launch\n\n[AGENT]: Noted."]
             .iter()
             .enumerate()
             .map(|(i, content)| serde_json::json!({
@@ -1552,6 +1559,14 @@ pub(crate) mod tests {
                 .unwrap_or_else(|e| panic!("memory search for {q:?} failed: {e:?}"));
             let ids: Vec<_> = found.iter().map(|r| r["memId"].as_str().unwrap_or_default()).collect();
             assert_eq!(ids, ["turn:0"], "{q:?}");
+        }
+        // A possessive finds what it names; a word in a run without synonyms keeps its prefix
+        // star (`notes` finds "Notesheet"); a private-use character is indexed and kept.
+        for (q, want) in [("team's budget", "turn:2"), ("notes \"Jane Doe\" roadmapping budget", "turn:2"), ("plan \u{e000}", "turn:3")] {
+            let found = memory_search(&conn, q, &params, &synonyms, None)
+                .unwrap_or_else(|e| panic!("memory search for {q:?} failed: {e:?}"));
+            let ids: Vec<_> = found.iter().map(|r| r["memId"].as_str().unwrap_or_default()).collect();
+            assert_eq!(ids, [want], "{q:?}");
         }
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);

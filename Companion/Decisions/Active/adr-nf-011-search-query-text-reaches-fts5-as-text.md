@@ -18,8 +18,9 @@ expression. It put most words in bare, quoting only words with `- @ : + .`, so:
 - The alias and `field:"value"` scanners copied the query byte by byte into chars, so non-ASCII
   text was corrupted: `café` searched for `cafÃ©` and found nothing.
 - Apostrophes were deleted from every word, so `O'Brien` searched `obrien` and `don't` searched
-  `dont`, while the tokenizer indexes the text as `o brien` and `don t`: a word with an apostrophe
-  never found the mail it was written in, and found mail that spelled it without one.
+  `dont`, while the tokenizer indexes the text as `o brien` and `don t`: such a word never found
+  the mail it was written in, and found mail that spelled it without one. (A possessive worked by
+  accident: `Sarah's` searched `sarahs`, which the porter stemmer reduces to `sarah`.)
 - FTS5 rejects an implicit AND beside a parenthesised group, so a quoted phrase next to a word
   with synonyms (`meeting "budget plan"`) was a syntax error.
 
@@ -32,12 +33,17 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
    whitespace, no `"`) and `"phrases"` (an unclosed quote runs to the end), on `&str` so text stays
    whole.
 2. Every word and phrase is written as an FTS5 string (`"word"`, with a prefix `*` for a user `*`,
-   a word with punctuation, or a plain word of 4+ bytes when there are no synonym groups in the
-   query; the old builder decided the last per quote-delimited segment, now it is query-wide). Apart from
-   the operators of point 4, no query text is ever FTS5 syntax. A word or phrase with no letter or digit is dropped (an empty
-   string inside an AND matches nothing). A word keeps its apostrophes: quoted, `O'Brien` is the
-   phrase `o brien` the tokenizer indexed (only one trailing `*`, then trailing `/` and `?`, are
-   removed from a word).
+   a word with punctuation, or a plain word of 4+ bytes when no word in its run of words between
+   quoted phrases has synonyms, as the old builder decided it per quote-delimited segment). Apart from
+   the operators of point 4, no query text is ever FTS5 syntax. A word or phrase with nothing the tokenizer indexes is dropped (an
+   empty string inside an AND matches nothing). That is unicode61's own rule, letters, numbers and
+   private-use characters (`L* N* Co`), read from the `unicode_categories` crate (already built
+   for `tokenizers`): Rust's `is_alphanumeric` also counts marks and enclosed-letter symbols
+   (Ⓜ, 🅿) the tokenizer does not index, and misses private-use characters it does. A word keeps
+   its apostrophes, except one possessive `'s` (straight or typographic), which is removed:
+   quoted, `O'Brien` is the phrase `o brien` the tokenizer indexed, and `John's` searches `John`,
+   as 0.11.8 effectively did (only one trailing `*`, then trailing `/` and `?`, then the
+   possessive are removed from a word).
 3. A word expanding to synonyms becomes the generated `(a OR b …)` group; when any group is
    present every term is joined with an explicit `AND`. Whether a
    group is present is read from the terms as written (only a group starts with `(`), so it can't
@@ -48,7 +54,11 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
    to:"a@example.com"`, `"budget plan" OR greetings`, `alice NOT carol`. One that is first, last,
    after another operator, or left with no written term after it is dropped (`NOT budget` searches
    `budget`), so it can never be a syntax error. Lowercase, quoted or a field's value, it is text.
-   The hybrid column filter keeps joining the scoped terms with a space, as before.
+   The hybrid column filter keeps joining the scoped terms with a space, as before, so a kept
+   `NOT` is not applied to hybrid vector candidates: `budget NOT from:bob@example.com` (an FTS5
+   error in 0.11.8, as `budget` has synonyms) returns bob's mail through the vector side, as
+   `numbers NOT from:bob@example.com` already did in 0.11.8. Tracked as native-fts #21, to land
+   before this helper is released.
 5. Column scoping is the caller's list: `build_fts_match(q, columns, …)`. Mail search passes
    `QUERY_COLUMNS` (the documented `subject from to cc bcc body`, plus `from_ to_`), matched
    case-insensitively and written as the shard column; `name:word`, `name:"phrase"` and
@@ -81,12 +91,17 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
   letter or digit beside a synonym group hides no match;
   `db::tests::test_search_finds_words_with_apostrophes` and its memory twin find `O'Brien` and
   `don't forget` in the mail that has them and not in the one spelling `OBrien` / `Dont` (red
-  with the apostrophe strip restored: each finds only the other row); `test_rust_process_parity` `test_scoped_search_with_embeddings_finds_only_the_field` checks the
+  with the apostrophe strip restored: each finds only the other row), and `Sarah's`,
+  `Sarah’s invoice`, `John's flight`, `team's budget` find what they name (red without the
+  possessive strip); `db::tests::test_search_prefix_star_is_decided_per_run_of_words` and the
+  memory twin (red with a query-wide star rule); the text-less tests include enclosed letters and
+  a lone mark, and `test_search_keeps_private_use_characters` is two-sided (red with
+  `is_alphanumeric`); `test_rust_process_parity` `test_scoped_search_with_embeddings_finds_only_the_field` checks the
   same with the embedding model loaded.
 - A differential against the released 0.11.8 helper (Thunderbird-shaped `search` and
   `memorySearch`, with and without the embedding model, 2026-10-21) found no query that newly
-  fails; every difference is an error that now succeeds or one of the fixes above (non-ASCII,
-  whitespace separators, apostrophes).
+  fails. The round-6 review then measured possessives (`John's flight`), a query-wide star rule
+  and non-indexed letters losing matches 0.11.8 found; all three were corrected as above.
 - `role:` / `content:` no longer scope in memory search, and `msgId:` / `attachmentNames:` no longer
   scope in mail search (all undocumented and unused by any client).
 - Both behaviour changes (`from :` with a space before the colon no longer scopes; memory search has
