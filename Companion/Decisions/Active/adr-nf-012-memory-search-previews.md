@@ -1,7 +1,7 @@
 # ADR-NF-012: Memory Search Can Return Previews
 
-**Status:** Accepted (owner, 2026-10-20). Caller: Thunderbird's `memory_search` chat tool and its
-Chat History clean-up. TabMail Voice does not send it (its pipe to the helper has no size cap).
+**Status:** Accepted (owner, 2026-10-20). Caller: Thunderbird's `memory_search` chat tool (its
+Chat History clean-up still asks for whole rows, Thunderbird #147). TabMail Voice does not send it (its pipe to the helper has no size cap).
 ADR-NF-011 is taken by the FTS query change on its own branch.
 
 ## Context
