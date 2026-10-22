@@ -39,8 +39,10 @@ backwards for `dateMs DESC`; SQLite leaves the order of tied rows to the plan. T
 unchanged.
 
 **Compatibility:** an older helper (or Voice's bundled one) opening a memory with the index keeps it
-up to date. Its own dated listing and `memoryRead` use the index too, so after a downgrade its dated
-listing returns entries sharing a millisecond in reverse write order (it has no tiebreak). Its
+up to date, and its queries may use it, with no tiebreak. After a downgrade to 0.11.8 (Voice's pin
+and Thunderbird's latest release), only its listing with both `from` and `to` returns entries
+sharing a millisecond in reverse write order; its other listings and its `memoryRead` keep their
+order. Unreleased builds from #34 on reverse ties in every listing shape. Its
 memoryClear recreates the memory without the index, and the next newer helper's open builds it. No schema version is involved (`SCHEMA_VERSION` is the email
 index's).
 
@@ -51,8 +53,8 @@ index's).
   at 20,000 without the index). Tests:
   - `a_read_by_date_costs_the_same_whatever_the_memorys_size` (on memories memoryClear rebuilt)
   - `a_memory_written_before_the_date_index_gets_it_on_open`
-  - `entries_sharing_a_millisecond_keep_the_order_they_were_written_in` (listing and `memoryRead`,
-    pages cut inside a group of tied entries)
+  - `entries_sharing_a_millisecond_keep_the_order_they_were_written_in` (listing and `memoryRead`;
+    listing pages cut inside a group of tied entries)
   - `a_memory_whose_creation_stopped_after_its_first_table_opens_and_works`
 - **Build cost on an existing memory:** once, on the first open. It reads the dates alone: about
   0.1 s for 300,000 dates on an Apple Silicon Mac.

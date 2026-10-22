@@ -2621,7 +2621,7 @@ pub(crate) mod tests {
     }
 
     /// Entries that share a millisecond come back in the order they were written, in the listing
-    /// (newest millisecond first) and in memoryRead (oldest first), whichever page cuts the group.
+    /// (newest millisecond first, whichever page cuts the group) and in memoryRead (oldest first).
     #[test]
     fn entries_sharing_a_millisecond_keep_the_order_they_were_written_in() {
         let t = chrono::Utc::now().timestamp_millis();
