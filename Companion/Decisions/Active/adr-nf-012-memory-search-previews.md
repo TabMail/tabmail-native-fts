@@ -1,7 +1,8 @@
 # ADR-NF-012: Memory Search Can Return Previews
 
-**Status:** Accepted (owner, 2026-10-20). Caller: Thunderbird's `memory_search` chat tool (its
-Chat History clean-up still asks for whole rows, Thunderbird #147). TabMail Voice does not send it (its pipe to the helper has no size cap).
+**Status:** Accepted (owner, 2026-10-20). Callers: Thunderbird's `memory_search` chat tool, its
+Chat History tab (search and "delete old", Thunderbird #147) and its `memory_read` chat tool, which
+lists a window with previews and then reads each entry whole at its own millisecond (#151). TabMail Voice does not send it (its pipe to the helper has no size cap).
 ADR-NF-011 is taken by the FTS query change on its own branch.
 
 ## Context
@@ -73,6 +74,17 @@ matches (it asked for 2,000). Review of that change found two helper defects it 
    rows in the same order. The join is a `CROSS JOIN`, which SQLite keeps in the order written: with a
    plain `JOIN` it scanned `memory_fts` and looked each row up in the page, still reading every row's
    content (a page of 3 of 100 long rows read 130 pages from disk; now 9). No index or schema change.
+3. **Each `memoryRead` read the whole memory (2026-10-21).** `memory_read_by_timestamp` joined from
+   `memory_fts` the same way, so even a read of one millisecond (`toleranceMs` 0) scanned every row's
+   content: about 0.13 s at 1 GB warm, 2 s cold. Thunderbird's `memory_read` (#151) and Chat History
+   now read each entry they show at its own millisecond, up to 20 or 50 reads a call, so a call held
+   the reader thread email search also uses for seconds. Now the rows are chosen from `memory_meta`
+   by date first (the oldest 50 within the dates, as before) and only their content is read, through
+   the listing's `CROSS JOIN`: the same rows in the same order (one of 100 long rows read 130 pages
+   from disk; now a few). Thunderbird's release with #151 needs this helper. `memory_meta` has no
+   index on `dateMs`, so each read still scans every entry's date (about 300 pages at 40k entries,
+   2,400 at 300k: linear, but dates only, far below the content scan it replaces); an index would be
+   a schema change for every Thunderbird and Voice memory, and was left out as for the listing.
 
 Still open (not here): a search's `limit` times `CANDIDATE_MULTIPLIER` over 4,096 still fails the
 vector search silently, for email and memory searches alike (#20; Thunderbird's email search and Voice's
@@ -93,6 +105,16 @@ query and the new; red with the inner order reversed and with `from` ignored. (D
 promise it, so the outer order stays.)
 `memory_listing_reads_only_its_pages_content` (unit: that page, on a cold reader) is red with the
 plain `JOIN`.
+`memory_read_gives_the_entries_within_the_dates_and_reads_only_their_content` (unit: both bounds
+inclusive, oldest first, each field whole, at most 50, the oldest within the dates with the entries
+written against date order; on a cold reader, a read of one entry of 200 reads under 30 pages and a
+read of 50 of them under 130, against 252 for the whole window) is red with the old query, with the
+inner order reversed or removed, and with the `LIMIT` moved out of the subquery. A plain `JOIN` on
+the date subquery stays green on the bundled SQLite 3.46.0, the same plan: SQLite does not flatten a
+subquery with `LIMIT` into a join, and the small row estimate from the constant `LIMIT 50` keeps it
+outside (with a bound `LIMIT ?` it reorders and scans `memory_fts`). `CROSS JOIN` makes that order a
+rule rather than a planner estimate. Dropping the outer `ORDER BY` also stays green, as for the
+listing.
 `test_memory_search_with_dates_keeps_the_matches_within_them` (process, model loaded: 20 entries
 nearer the query before the dates and 20 after, 6 matches inside with one at each bound, 300 others)
 returns the 6; red on the old code (it returned 4 of them) and with `to` not enforced.
