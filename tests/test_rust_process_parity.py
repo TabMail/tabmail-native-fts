@@ -384,6 +384,68 @@ class TestRustHelperProcess(unittest.TestCase):
         finally:
             self._close(proc)
 
+    def test_searches_at_the_callers_limit_are_hybrid(self):
+        """With the embedding model loaded, the searches Thunderbird and TabMail Voice send
+        (limit 2,000, so k = 8,000 asked of sqlite-vec, which answers at most 4,096) still find
+        a match by meaning alone, with dates or without, and a search scoped to a field does at
+        a limit of 1,000 (k = 8,000 too)."""
+        proc = subprocess.Popen(
+            [self.rust_helper_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            _send_message(proc, {"id": "1", "method": "hello", "params": {"addonVersion": "1.2.1"}})
+            self.assert_success(_read_message(proc), "hello")
+            _send_message(proc, {"id": "2", "method": "init", "params": {"profilePath": self.temp_dir}})
+            self.assert_success(_read_message(proc), "init")
+
+            day = 86_400_000
+            now = int(time.time() * 1000)
+            emails = _filler_rows("callers-limit") + [
+                {"msgId": "found", "subject": "Vacation", "from_": "agent@example.com", "to_": "me@example.com",
+                 "body": "Here is the vacation itinerary", "dateMs": now, "hasAttachments": False},
+                {"msgId": "outside", "subject": "Vacation", "from_": "agent@example.com", "to_": "me@example.com",
+                 "body": "Here is the vacation itinerary again", "dateMs": now - 10 * day, "hasAttachments": False},
+            ]
+            _send_message(proc, {"id": "3", "method": "indexBatch", "params": {"rows": emails}})
+            self.assert_success(_read_message(proc), "indexBatch")
+            memories = [
+                {"memId": "found", "role": "session", "content": "Here is the vacation itinerary",
+                 "sessionId": "persistent_chat", "dateMs": now, "turnIndex": 0},
+            ]
+            _send_message(proc, {"id": "4", "method": "memoryIndexBatch", "params": {"rows": memories}})
+            self.assert_success(_read_message(proc), "memoryIndexBatch")
+            # The model is loaded: every row has its vector, so the searches are hybrid.
+            for request_id, method, count in (("5", "stats", len(emails)), ("6", "memoryStats", len(memories))):
+                _send_message(proc, {"id": request_id, "method": method, "params": {}})
+                stats = _read_message(proc)
+                self.assert_success(stats, method)
+                self.assertEqual(stats["result"]["vecDocs"], count)
+
+            ids = iter(range(7, 1000))
+
+            def search(method, params):
+                _send_message(proc, {"id": str(next(ids)), "method": method, "params": params})
+                response = _read_message(proc)
+                self.assert_success(response, f"{method} {params}")
+                return response["result"]
+
+            query = "plan the vacation itinerary"
+            undated = search("search", {"q": query, "limit": 2000, "ignoreDate": True})
+            self.assertEqual(sorted(r["uniqueId"] for r in undated), ["found", "outside"])
+            self.assertTrue(all(r["snippet"] == "" for r in undated), "found by meaning, not by their words")
+            dated = search("search", {"q": query, "limit": 2000, "from": now - day, "to": now + day})
+            self.assertEqual([r["uniqueId"] for r in dated], ["found"])
+            scoped = search("search", {"q": "subject:vacation plan the itinerary", "limit": 1000, "ignoreDate": True})
+            self.assertEqual(sorted(r["uniqueId"] for r in scoped), ["found", "outside"])
+            memory = search("memorySearch", {"q": query, "limit": 2000, "ignoreDate": True})
+            self.assertEqual([r["memId"] for r in memory], ["found"])
+            self.assertEqual(memory[0]["snippet"], "")
+        finally:
+            self._close(proc)
+
     def test_rebuild_embeddings_batch(self):
         """Test the batch-based rebuildEmbeddings workflow:
         rebuildEmbeddingsStart → rebuildEmbeddingsBatch loop → verify via stats.

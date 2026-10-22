@@ -155,7 +155,11 @@ archives of any size.
 
 ## ADR-NF-012: Memory Search Can Return Previews
 
-- **[Full ADR](Companion/Decisions/Active/adr-nf-012-memory-search-previews.md)** — `memorySearch` `previewChars` cuts `content`/`snippet` in the reply only (Thunderbird refuses a native message over 1 MiB); stored rows and `memoryRead` whole; no capability flag. Amended 2026-10-21: dated hybrid search filters vector candidates by date before the merge; listing picks rowids from `memory_meta` first; a memory search runs in one read transaction (rowid reuse). Open: limit x 4 > 4,096 fails the vector search silently (#20).
+- **[Full ADR](Companion/Decisions/Active/adr-nf-012-memory-search-previews.md)** — `memorySearch` `previewChars` cuts `content`/`snippet` in the reply only (Thunderbird refuses a native message over 1 MiB); stored rows and `memoryRead` whole; no capability flag. Amended 2026-10-21: dated hybrid search filters vector candidates by date before the merge; listing picks rowids from `memory_meta` first; a memory search runs in one read transaction (rowid reuse). Open: limit x 4 > 4,096 fails the vector search silently (#20); fixed by ADR-NF-013.
+
+## ADR-NF-013: A Hybrid Search Asks sqlite-vec for at Most Its Maximum, and Email Search Keeps Its Dated Matches
+
+- **[Full ADR](Companion/Decisions/Active/adr-nf-013-hybrid-search-asks-sqlite-vec-for-at-most-its-maximum.md)** — #20: sqlite-vec refuses k > 4,096 (`SQLITE_VEC_VEC0_K_MAX`); `limit` x `CANDIDATE_MULTIPLIER` (x2 with a `from:`/`subject:` field) over it made every email/memory search with limit > 1,024 (512 scoped) keyword-only, silently (Thunderbird and Voice ask for 2,000). `search_vec_candidates` clamps k to `VEC_K_MAX` and logs it; a failed vector leg still falls back to keyword-only, now with a warning. Email search, as memory (ADR-NF-012 amendment): vector candidates filtered by date BEFORE the merge (`vec_candidates_within_dates`, shared), the post-merge date check deleted, one read transaction (`search` wraps `search_rows`; `message_ids` rowid reuse). Consequence: those callers now get hybrid ranking with `MIN_SCORE`, so possibly fewer results than keyword-only. Open: date/field filters still run on the nearest k over the whole archive.
 
 ---
 

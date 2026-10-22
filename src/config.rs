@@ -139,6 +139,10 @@ pub mod hybrid {
     // Fetch N× candidates from each engine, merge to final limit.
     pub const CANDIDATE_MULTIPLIER: i64 = 4;
 
+    // The most nearest vectors sqlite-vec answers in one query (`SQLITE_VEC_VEC0_K_MAX`): it
+    // refuses a larger k, so a search asks for at most this many vector candidates.
+    pub const VEC_K_MAX: i64 = 4096;
+
     // Minimum combined score to return (filters noise).
     pub const MIN_SCORE: f64 = 0.1;
 

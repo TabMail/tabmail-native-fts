@@ -984,6 +984,23 @@ pub fn search(
     engine: Option<&EmbeddingEngine>,
     known_years: &HashSet<i32>,
 ) -> anyhow::Result<Vec<Value>> {
+    // One read transaction, so the search's queries all read the archive as it was when it began:
+    // a write landing between them (a message removed and its rowid reused) can't put another
+    // message, or one outside the dates, in its results.
+    let tx = conn.unchecked_transaction()?;
+    let results = search_rows(&tx, q, params, synonyms, engine, known_years)?;
+    drop(tx);
+    Ok(results)
+}
+
+fn search_rows(
+    conn: &Connection,
+    q: &str,
+    params: &Value,
+    synonyms: &SynonymLookup,
+    engine: Option<&EmbeddingEngine>,
+    known_years: &HashSet<i32>,
+) -> anyhow::Result<Vec<Value>> {
     let query = q.trim();
     if query.is_empty() {
         return Ok(vec![]);
@@ -1043,8 +1060,10 @@ pub fn search(
     let query_embedding = engine.embed(query)?;
     let query_blob = f32_vec_to_blob(&query_embedding);
     let vec_limit = if eligible_rowids.is_some() { candidate_limit * 2 } else { candidate_limit };
-    let all_vec = search_vec_candidates(conn, "messages_vec", &query_blob, vec_limit)
-        .unwrap_or_default(); // empty vec table during rebuild → graceful empty
+    let all_vec = search_vec_candidates(conn, "messages_vec", &query_blob, vec_limit).unwrap_or_else(|e| {
+        log::warn!("Vector search failed, searching by keyword only: {e}");
+        vec![]
+    });
 
     // Filter vector candidates to eligible set when column-scoped
     let vec_candidates: Vec<(i64, f64)> = if let Some(ref eligible) = eligible_rowids {
@@ -1059,6 +1078,10 @@ pub fn search(
         log::info!("No vector candidates (vec table may be empty), falling back to FTS-only search");
         return search_fts_only(conn, query, params, synonyms, limit, known_years);
     }
+
+    // Keep only the vector candidates within the dates asked, before the merge keeps the best
+    // `limit` (the FTS candidates are filtered by date in their query).
+    let vec_candidates = vec_candidates_within_dates(conn, "message_meta", vec_candidates, from_ts, to_ts)?;
 
     // --- Merge ---
     let text_pairs: Vec<(i64, f64)> = fts_candidates.iter().map(|c| (c.rowid, c.rank)).collect();
@@ -1088,18 +1111,8 @@ pub fn search(
                 "rank": -hr.final_score
             }));
         } else {
-            // Vector-only result — fetch metadata, apply date filter
+            // Vector-only result (within the dates: filtered before the merge)
             if let Some(meta) = fetch_message_meta(conn, hr.rowid)? {
-                if let Some(from) = from_ts {
-                    if meta.date_ms < from {
-                        continue;
-                    }
-                }
-                if let Some(to) = to_ts {
-                    if meta.date_ms > to {
-                        continue;
-                    }
-                }
                 results.push(serde_json::json!({
                     "uniqueId": meta.msg_id,
                     "author": meta.from_,
@@ -1308,21 +1321,51 @@ fn search_fts_candidates(
     Ok(candidates)
 }
 
-/// Get vector similarity candidates from a vec0 table.
+/// Get the `limit` nearest vectors from a vec0 table, at most `VEC_K_MAX`: sqlite-vec refuses a
+/// larger k, which left a search with a large `limit` no vector candidates at all.
 pub(crate) fn search_vec_candidates(
     conn: &Connection,
     table: &str,
     query_blob: &[u8],
     limit: i64,
 ) -> anyhow::Result<Vec<(i64, f64)>> {
+    let k = limit.min(config::hybrid::VEC_K_MAX);
+    if k < limit {
+        log::info!("Vector candidates: {limit} asked, sqlite-vec's most is {k}");
+    }
     let sql = format!(
         "SELECT rowid, distance FROM {table} WHERE embedding MATCH ?1 AND k = ?2"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![query_blob, limit], |r| {
+    let rows = stmt.query_map(params![query_blob, k], |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// The vector candidates whose row in `meta_table` is dated within the dates asked (either bound
+/// alone, or both, each inclusive), in their order. A hybrid search filters them before its merge
+/// keeps the best `limit`: dropped after it, nearer rows outside the dates would take the places
+/// of matches inside them.
+pub(crate) fn vec_candidates_within_dates(
+    conn: &Connection,
+    meta_table: &str,
+    candidates: Vec<(i64, f64)>,
+    from_ts: Option<i64>,
+    to_ts: Option<i64>,
+) -> anyhow::Result<Vec<(i64, f64)>> {
+    if from_ts.is_none() && to_ts.is_none() {
+        return Ok(candidates);
+    }
+    let mut date_of = conn.prepare(&format!("SELECT dateMs FROM {meta_table} WHERE rowid = ?1"))?;
+    let mut kept = Vec::with_capacity(candidates.len());
+    for (rowid, distance) in candidates {
+        let date_ms: Option<i64> = date_of.query_row(params![rowid], |r| r.get(0)).optional()?;
+        if date_ms.is_some_and(|d| from_ts.is_none_or(|from| d >= from) && to_ts.is_none_or(|to| d <= to)) {
+            kept.push((rowid, distance));
+        }
+    }
+    Ok(kept)
 }
 
 /// Fetch metadata for a single message by rowid (used for vector-only results).
@@ -4171,5 +4214,270 @@ mod tests {
             }
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    // --- hybrid search: sqlite-vec's k, dates, one read transaction ---
+
+    use crate::fts::memory_db::tests::embedding_engine;
+
+    /// An email database in its own folder, with sqlite-vec registered as main() does.
+    fn temp_email_db(name: &str) -> (PathBuf, PathBuf, Connection, HashSet<i32>) {
+        // Registering twice is a no-op.
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+        let profile = std::env::temp_dir().join(format!("tabmail-fts-hybrid-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&profile);
+        std::fs::create_dir_all(&profile).unwrap();
+        let (path, conn, known_years) = open_or_create_db(&profile).unwrap();
+        (profile, path, conn, known_years)
+    }
+
+    fn email_row(msg_id: &str, subject: &str, body: &str, date_ms: i64) -> Value {
+        serde_json::json!({ "msgId": msg_id, "subject": subject, "from": "sender@example.com", "body": body, "dateMs": date_ms })
+    }
+
+    fn result_ids(results: &[Value]) -> Vec<String> {
+        results.iter().map(|r| r["uniqueId"].as_str().unwrap().to_string()).collect()
+    }
+
+    /// sqlite-vec answers at most VEC_K_MAX nearest vectors and refuses a larger k: asked for more,
+    /// the candidates are the VEC_K_MAX nearest, not an error.
+    #[test]
+    fn vec_candidates_over_sqlite_vecs_most_are_its_most() {
+        let (profile, _path, conn, _years) = temp_email_db("k-max");
+        let dims = config::embedding::EMBEDDING_DIMS;
+        let vector = |i: usize| {
+            let mut v = vec![0.0f32; dims];
+            v[0] = 1.0;
+            v[1 + i % (dims - 1)] = (i as f32) / 10_000.0;
+            f32_vec_to_blob(&v)
+        };
+        let rows = config::hybrid::VEC_K_MAX as usize + 10;
+        let tx = conn.unchecked_transaction().unwrap();
+        for i in 0..rows {
+            tx.execute("INSERT INTO messages_vec (rowid, embedding) VALUES (?1, ?2)", params![i as i64 + 1, vector(i)]).unwrap();
+        }
+        tx.commit().unwrap();
+        let query = vector(0);
+        for limit in [config::hybrid::VEC_K_MAX - 1, config::hybrid::VEC_K_MAX, config::hybrid::VEC_K_MAX + 1, 8_000] {
+            let found = search_vec_candidates(&conn, "messages_vec", &query, limit).unwrap();
+            assert_eq!(found.len() as i64, limit.min(config::hybrid::VEC_K_MAX), "asked for {limit}");
+            assert!(found.iter().any(|c| c.0 == 1), "the nearest is among them");
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    /// The vector candidates kept for a search with dates are those dated within them, either bound
+    /// alone or both, each inclusive, in their order; one with no metadata row is not kept. Without
+    /// dates, every candidate is kept.
+    #[test]
+    fn vec_candidates_within_dates_keeps_those_dated_within_them() {
+        let (conn, _years) = setup_test_db();
+        for (rowid, date_ms) in [(1, 100), (2, 200), (3, 300), (4, 400)] {
+            conn.execute("INSERT INTO message_meta (rowid, dateMs, hasAttachments, shardYear) VALUES (?1, ?2, 0, 2000)", params![rowid, date_ms]).unwrap();
+        }
+        // Nearest first, as sqlite-vec gives them; rowid 9 has no metadata.
+        let candidates = vec![(3, 0.1), (9, 0.2), (1, 0.3), (4, 0.4), (2, 0.5)];
+        let kept = |from: Option<i64>, to: Option<i64>| {
+            vec_candidates_within_dates(&conn, "message_meta", candidates.clone(), from, to).unwrap().iter().map(|c| c.0).collect::<Vec<_>>()
+        };
+        assert_eq!(kept(None, None), [3, 9, 1, 4, 2]);
+        assert_eq!(kept(Some(200), Some(300)), [3, 2]);
+        assert_eq!(kept(Some(300), None), [3, 4]);
+        assert_eq!(kept(None, Some(200)), [1, 2]);
+        assert_eq!(kept(Some(500), None), Vec::<i64>::new());
+    }
+
+    /// A hybrid search asks sqlite-vec for `limit` x CANDIDATE_MULTIPLIER nearest vectors (twice as
+    /// many with a field in the query), more than it answers once `limit` is past 1,024 (512 with a
+    /// field). At any `limit`, a match by meaning alone is still found: the search stays hybrid.
+    #[test]
+    fn search_with_a_large_limit_finds_a_match_by_meaning() {
+        let Some(engine) = embedding_engine() else { return };
+        let (profile, _path, mut conn, mut known_years) = temp_email_db("large-limit");
+        let now = chrono::Utc::now().timestamp_millis();
+        let found = email_row("acc:/:found", "Vacation", "Here is the vacation itinerary", now);
+        index_batch(&mut conn, &[found], Some(&engine), &mut known_years).unwrap();
+        let most = config::hybrid::VEC_K_MAX / config::hybrid::CANDIDATE_MULTIPLIER;
+        for (q, scoped_most) in [("plan the vacation itinerary", most), ("subject:vacation plan the itinerary", most / 2)] {
+            for limit in [10, scoped_most, scoped_most + 1, 2_000] {
+                let params = serde_json::json!({ "ignoreDate": true, "limit": limit });
+                let results = search(&conn, q, &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap();
+                assert_eq!(result_ids(&results), ["acc:/:found"], "{q} at limit {limit}");
+                assert_eq!(results[0]["snippet"], "", "found by meaning, not by its words");
+            }
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    /// A search with dates returns its best matches within them however many nearer messages lie
+    /// before or after them, either bound alone keeping those on its side.
+    #[test]
+    fn search_with_dates_keeps_the_matches_within_them() {
+        let Some(engine) = embedding_engine() else { return };
+        let (profile, _path, mut conn, mut known_years) = temp_email_db("dates");
+        let day = 86_400_000;
+        let start = chrono::Utc::now().timestamp_millis() - 30 * day;
+        let end = start + day;
+        let mut rows = Vec::new();
+        // Nearer the query than the matches within the dates.
+        for (side, at) in [("before", start - 2 * day), ("after", end + day)] {
+            for i in 0..8 {
+                rows.push(email_row(&format!("acc:/:{side}-{i}"), "Trip itinerary", &format!("trip itinerary {i}"), at + i * 1000));
+            }
+        }
+        // Within the dates, one at each bound: messages that name it once in a long body, so they
+        // score below the nearer ones (above MIN_SCORE).
+        let inside: Vec<String> = [start, start + 1000, end].iter().enumerate().map(|(i, &at)| {
+            let id = format!("acc:/:inside-{i}");
+            rows.push(email_row(&id, &format!("Lunch order {i}"), &format!("lunch order {i}, soup and sandwich, then the trip itinerary, {}", "the quarterly budget review, the weather, the parking. ".repeat(50)), at));
+            id
+        }).collect();
+        // Unrelated messages within the dates, so the word is rare and a keyword match scores.
+        for i in 0..100 {
+            rows.push(email_row(&format!("acc:/:filler-{i}"), &format!("Weather report {i}"), &format!("sunny on day {i}"), start + 100_000 + i * 1000));
+        }
+        index_batch(&mut conn, &rows, Some(&engine), &mut known_years).unwrap();
+        let search_with = |params: Value| {
+            let mut ids = result_ids(&search(&conn, "trip itinerary", &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap());
+            ids.sort();
+            ids
+        };
+
+        // The nearer messages outside the dates are found without them.
+        let undated = search_with(serde_json::json!({ "ignoreDate": true, "limit": 50 }));
+        assert!(undated.contains(&"acc:/:before-0".to_string()) && undated.contains(&"acc:/:after-0".to_string()), "{undated:?}");
+        assert_eq!(search_with(serde_json::json!({ "from": start, "to": end, "limit": inside.len() })), inside);
+        // One bound alone: the matches within it, and the nearer messages on its side, nothing else.
+        let after: Vec<String> = (0..8).map(|i| format!("acc:/:after-{i}")).collect();
+        let before: Vec<String> = (0..8).map(|i| format!("acc:/:before-{i}")).collect();
+        let mut from_only = [inside.clone(), after].concat();
+        from_only.sort();
+        let mut to_only = [inside.clone(), before].concat();
+        to_only.sort();
+        assert_eq!(search_with(serde_json::json!({ "from": start, "limit": from_only.len() })), from_only);
+        assert_eq!(search_with(serde_json::json!({ "to": end, "limit": to_only.len() })), to_only);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    struct WriteDuringSearch {
+        writer: Connection,
+        known_years: HashSet<i32>,
+        engine: *const EmbeddingEngine,
+        at: usize,
+        steps: usize,
+        written: bool,
+    }
+
+    extern "C" fn write_during_search(state: *mut c_void) -> c_int {
+        let state = unsafe { &mut *(state as *mut WriteDuringSearch) };
+        state.steps += 1;
+        if state.steps == state.at {
+            state.written = true;
+            let engine = unsafe { &*state.engine };
+            let tomorrow = chrono::Utc::now().timestamp_millis() + 86_400_000;
+            let replacement = email_row("acc:/:replacement", "Unrelated", "A completely unrelated message", tomorrow);
+            assert_eq!(remove_batch(&mut state.writer, &[serde_json::json!("acc:/:found")]).unwrap().count, 1);
+            index_batch(&mut state.writer, &[replacement], Some(engine), &mut state.known_years).unwrap();
+        }
+        0
+    }
+
+    /// A search answers from the archive as it was when it began: wherever in it a write lands, it
+    /// gives the message it found, never one that took its rowid meanwhile, outside the dates. With
+    /// dates or without: a search without them could give that other message the same way.
+    #[test]
+    fn search_answers_from_the_archive_as_it_began() {
+        let Some(engine) = embedding_engine() else { return };
+        let (profile, path, mut conn, mut known_years) = temp_email_db("snapshot");
+        let synonyms = SynonymLookup::new();
+        let now = chrono::Utc::now().timestamp_millis();
+        let found = email_row("acc:/:found", "Vacation", "Here is the vacation itinerary", now);
+        let query = "plan the vacation itinerary";
+        let mut state = WriteDuringSearch {
+            writer: open_writer_connection(&path).unwrap(),
+            known_years: known_years.clone(),
+            engine: &engine,
+            at: 0,
+            steps: 0,
+            written: false,
+        };
+        let search_with_write_at = |conn: &Connection, known_years: &HashSet<i32>, state: &mut WriteDuringSearch, params: &Value, at: usize| {
+            (state.at, state.steps, state.written) = (at, 0, false);
+            unsafe { ffi::sqlite3_progress_handler(conn.handle(), 1, Some(write_during_search), state as *mut WriteDuringSearch as *mut c_void) };
+            let rows = search(conn, query, params, &synonyms, Some(&engine), known_years).unwrap();
+            unsafe { ffi::sqlite3_progress_handler(conn.handle(), 0, None, std::ptr::null_mut()) };
+            rows
+        };
+
+        index_batch(&mut conn, &[found.clone()], Some(&engine), &mut known_years).unwrap();
+        for params in [serde_json::json!({ "from": now - 1, "to": now + 1, "limit": 10 }), serde_json::json!({ "ignoreDate": true, "limit": 10 })] {
+            // Found by meaning only (no keyword match), so the vector leg answers it.
+            let before = search_with_write_at(&conn, &known_years, &mut state, &params, 0);
+            assert_eq!(result_ids(&before), ["acc:/:found"], "{params}");
+            assert_eq!(before[0]["snippet"], "");
+            // From past the transaction's start to the search's last step. How many steps a search
+            // takes changes with the writes before it, so it is counted before each (on the second
+            // search: the first after a write takes a few more).
+            for point in 0..=40 {
+                search_with_write_at(&conn, &known_years, &mut state, &params, 0);
+                search_with_write_at(&conn, &known_years, &mut state, &params, 0);
+                let steps = state.steps;
+                assert!(steps > 100, "a search took {steps} steps");
+                let at = 20 + (steps - 20) * point / 40;
+                let during = search_with_write_at(&conn, &known_years, &mut state, &params, at);
+                assert!(state.written, "the write landed at step {at} of {steps}");
+                assert_eq!(result_ids(&during), ["acc:/:found"], "with the write at step {at} of {steps}, {params}");
+                assert_eq!(during[0]["dateMs"], now);
+                // The write took the found message's rowid.
+                let reused: i64 = conn.query_row("SELECT rowid FROM message_ids WHERE msgId = 'acc:/:replacement'", [], |r| r.get(0)).unwrap();
+                assert_eq!(reused, 1);
+                // As it was, for the next step.
+                known_years.extend(state.known_years.iter().copied());
+                assert_eq!(remove_ids(&mut conn, &["acc:/:replacement"]).unwrap().count, 1);
+                index_batch(&mut conn, &[found.clone()], Some(&engine), &mut known_years).unwrap();
+            }
+        }
+        drop(state);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    /// Refuses every read of message_meta, counting them.
+    extern "C" fn deny_message_meta_reads(
+        denied: *mut c_void,
+        action: c_int,
+        table: *const std::os::raw::c_char,
+        _column: *const std::os::raw::c_char,
+        _db: *const std::os::raw::c_char,
+        _trigger: *const std::os::raw::c_char,
+    ) -> c_int {
+        if action == ffi::SQLITE_READ && !table.is_null() && unsafe { CStr::from_ptr(table) }.to_bytes() == b"message_meta" {
+            unsafe { *(denied as *mut usize) += 1 };
+            return ffi::SQLITE_DENY;
+        }
+        ffi::SQLITE_OK
+    }
+
+    /// A search that fails part way ends its read transaction: the next request on the connection
+    /// is answered.
+    #[test]
+    fn search_after_a_failed_one_is_answered() {
+        let (mut conn, mut known_years) = setup_test_db();
+        index_batch(&mut conn, &[email_row("acc:/:budget", "Budget", "the quarterly budget", 0)], None, &mut known_years).unwrap();
+        let params = serde_json::json!({ "ignoreDate": true });
+        let mut denied = 0usize;
+        unsafe { ffi::sqlite3_set_authorizer(conn.handle(), Some(deny_message_meta_reads), &mut denied as *mut usize as *mut c_void) };
+        let failed = search(&conn, "budget", &params, &SynonymLookup::new(), None, &known_years);
+        unsafe { ffi::sqlite3_set_authorizer(conn.handle(), None, std::ptr::null_mut()) };
+        assert!(denied > 0 && failed.is_err(), "the search failed on a read inside it");
+        let next = search(&conn, "budget", &params, &SynonymLookup::new(), None, &known_years).unwrap();
+        assert_eq!(result_ids(&next), ["acc:/:budget"]);
     }
 }
