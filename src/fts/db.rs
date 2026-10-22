@@ -4555,18 +4555,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(profile);
     }
 
-    /// A search returns at most SEARCH_LIMIT_MAX results, whatever `limit` it is given: the most at
-    /// which its vector side still gets CANDIDATE_MULTIPLIER candidates a result.
+    /// A search returns at most 512 results, whatever `limit` it is given (owner 2026-10-21; the
+    /// expected counts are the decided numbers, not derived from the config they pin).
     #[test]
     fn search_returns_at_most_search_limit_max_results() {
         let (mut conn, mut known_years) = setup_test_db();
-        let most = config::hybrid::SEARCH_LIMIT_MAX;
-        let rows: Vec<Value> = (0..most + 76).map(|i| email_row(&format!("acc:/:budget-{i}"), "Budget", "the quarterly budget", i)).collect();
+        let rows: Vec<Value> = (0..600).map(|i| email_row(&format!("acc:/:budget-{i}"), "Budget", "the quarterly budget", i)).collect();
         index_batch(&mut conn, &rows, None, &mut known_years).unwrap();
-        for limit in [10, most, most + 1, 4_000] {
+        for (limit, expected) in [(10, 10), (512, 512), (513, 512), (2_000, 512), (4_000, 512)] {
             let params = serde_json::json!({ "ignoreDate": true, "limit": limit });
             let results = search(&conn, "budget", &params, &SynonymLookup::new(), None, &known_years).unwrap();
-            assert_eq!(results.len() as i64, limit.min(most), "at limit {limit}");
+            assert_eq!(results.len(), expected, "at limit {limit}");
         }
     }
 

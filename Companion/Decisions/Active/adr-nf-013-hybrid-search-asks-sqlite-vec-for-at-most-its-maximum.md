@@ -91,9 +91,10 @@ Each test below was checked against a mutated build. "Red" means it fails there.
   answers k = 4,095 and 4,096 and refuses 4,097; a search at `SEARCH_LIMIT_MAX` with a field asks
   for no more than 4,096. Red with the cap at 1,024.
 - `search_returns_at_most_search_limit_max_results` and
-  `memory_search_returns_at_most_search_limit_max_results` (unit, no model: 588 keyword matches):
-  limits 10, 512, 513 and 4,000 return 10, 512, 512, 512; a memory listing returns the 588 it asks
-  for. Red with no cap (email and memory each).
+  `memory_search_returns_at_most_search_limit_max_results` (unit, no model: 600 keyword matches):
+  limits 10, 512, 513, 2,000 and 4,000 return 10, 512, 512, 512, 512 (the decided numbers, not
+  derived from the config); a memory listing returns the 600 it asks for. Red with no cap (email and
+  memory each) and with `FIELD_VEC_MULTIPLIER` at 1 (the cap drifting to 1,024).
 - `search_with_a_large_limit_finds_a_match_by_meaning` (unit, model loaded): limits 10, 512, 513,
   2,000 and 4,000, plain and with `subject:`, all find the match by meaning alone; the plain search
   also finds a match by meaning whose subject is another, and the `subject:` search leaves it out.

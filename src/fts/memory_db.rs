@@ -2227,25 +2227,25 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A memory search with a query returns at most SEARCH_LIMIT_MAX results, whatever `limit` it is
-    /// given; a listing (no query) returns the page it asks for.
+    /// A memory search with a query returns at most 512 results, whatever `limit` it is given (owner
+    /// 2026-10-21; the expected counts are the decided numbers, not derived from the config they
+    /// pin); a listing (no query) returns the page it asks for.
     #[test]
     fn memory_search_returns_at_most_search_limit_max_results() {
         let (dir, mut conn) = temp_memory_db("limit-max");
-        let most = config::hybrid::SEARCH_LIMIT_MAX;
         let now = chrono::Utc::now().timestamp_millis();
-        let rows: Vec<Value> = (0..most + 76)
+        let rows: Vec<Value> = (0..600)
             .map(|i| serde_json::json!({ "memId": format!("turn:{i}"), "role": "session", "sessionId": "persistent_chat",
                 "content": "the quarterly budget", "dateMs": now + i, "turnIndex": i }))
             .collect();
         memory_index_batch(&mut conn, &rows, None).unwrap();
-        for limit in [10, most, most + 1, 4_000] {
+        for (limit, expected) in [(10, 10), (512, 512), (513, 512), (2_000, 512), (4_000, 512)] {
             let params = serde_json::json!({ "ignoreDate": true, "limit": limit });
             let results = memory_search(&conn, "budget", &params, &SynonymLookup::new(), None).unwrap();
-            assert_eq!(results.len() as i64, limit.min(most), "at limit {limit}");
+            assert_eq!(results.len(), expected, "at limit {limit}");
         }
-        let listing = memory_search(&conn, "", &serde_json::json!({ "ignoreDate": true, "limit": most + 76 }), &SynonymLookup::new(), None).unwrap();
-        assert_eq!(listing.len() as i64, most + 76);
+        let listing = memory_search(&conn, "", &serde_json::json!({ "ignoreDate": true, "limit": 600 }), &SynonymLookup::new(), None).unwrap();
+        assert_eq!(listing.len(), 600);
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }
