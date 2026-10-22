@@ -1121,14 +1121,20 @@ pub fn memory_read_by_timestamp(
         to_ms
     );
 
+    // The rows are chosen from memory_meta (dates only) before any content is read, as the listing
+    // does: with a plain JOIN SQLite scans memory_fts, reading the whole memory's content for each
+    // read (Thunderbird reads each entry it shows at its own millisecond). CROSS JOIN keeps that order.
     let mut stmt = conn.prepare(
         r#"
         SELECT fts.memId, fts.role, fts.content, fts.sessionId, meta.dateMs
-        FROM memory_fts fts
-        JOIN memory_meta meta ON fts.rowid = meta.rowid
-        WHERE meta.dateMs >= ?1 AND meta.dateMs <= ?2
+        FROM (
+            SELECT rowid, dateMs FROM memory_meta
+            WHERE dateMs >= ?1 AND dateMs <= ?2
+            ORDER BY dateMs ASC
+            LIMIT 50
+        ) meta
+        CROSS JOIN memory_fts fts ON fts.rowid = meta.rowid
         ORDER BY meta.dateMs ASC
-        LIMIT 50
         "#,
     )?;
 
@@ -2223,6 +2229,51 @@ pub(crate) mod tests {
         assert_eq!(page[0]["content"], rows[99]["content"]);
         assert!(read > 0, "the cold reader read from disk");
         assert!(read < 30, "a three-row page read {read} pages");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A read gives the entries within the dates, oldest first, each whole, at most 50, and reads
+    /// only those entries' content, not the whole memory's: one of a hundred long ones reads a few
+    /// pages from disk, well under the hundred they take.
+    #[test]
+    fn memory_read_gives_the_entries_within_the_dates_and_reads_only_their_content() {
+        let (dir, mut conn) = temp_memory_db("read-reads");
+        let now = chrono::Utc::now().timestamp_millis();
+        let rows: Vec<Value> = (0..100)
+            .map(|i| serde_json::json!({ "memId": format!("turn:{i}"), "role": "session", "sessionId": "persistent_chat",
+                "content": format!("exchange {i} {}", "word ".repeat(1000)), "dateMs": now + i, "turnIndex": i }))
+            .collect();
+        memory_index_batch(&mut conn, &rows, None).unwrap();
+        let ids = |read: &[Value]| read.iter().map(|r| r["memId"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        // Both bounds inclusive, oldest first, each whole.
+        let window = memory_read_by_timestamp(&conn, now + 10, 2).unwrap();
+        assert_eq!(ids(&window), ["turn:8", "turn:9", "turn:10", "turn:11", "turn:12"]);
+        for (row, i) in window.iter().zip(8..) {
+            assert_eq!(row["content"], rows[i]["content"]);
+            assert_eq!(row["sessionId"], "persistent_chat");
+            assert_eq!(row["role"], "session");
+            assert_eq!(row["dateMs"], now + i as i64);
+        }
+        // At most 50, the oldest within the dates.
+        let wide = memory_read_by_timestamp(&conn, now + 50, 1000).unwrap();
+        assert_eq!(ids(&wide), (0..50).map(|i| format!("turn:{i}")).collect::<Vec<_>>());
+        drop(conn);
+        // A cold reader with a tiny cache and no memory map, so each page it needs is a miss.
+        let conn = open_read_only_memory_connection(&dir.join("memory.db")).unwrap();
+        conn.execute_batch("PRAGMA mmap_size = 0; PRAGMA cache_size = 8;").unwrap();
+        let misses = || {
+            let (mut current, mut high) = (0, 0);
+            assert_eq!(unsafe { rusqlite::ffi::sqlite3_db_status(conn.handle(), rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS, &mut current, &mut high, 0) }, rusqlite::ffi::SQLITE_OK);
+            current
+        };
+        let before = misses();
+        let one = memory_read_by_timestamp(&conn, now + 42, 0).unwrap();
+        let read = misses() - before;
+        assert_eq!(ids(&one), ["turn:42"]);
+        assert_eq!(one[0]["content"], rows[42]["content"]);
+        assert!(read > 0, "the cold reader read from disk");
+        assert!(read < 30, "a read of one entry read {read} pages");
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }
