@@ -2620,6 +2620,58 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// An index build that fails (here: the disk is full) fails init visibly, keeps every entry,
+    /// and the next init builds it.
+    #[test]
+    fn a_new_memory_whose_date_index_cannot_be_built_fails_init_and_keeps_its_entries() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let (dir, mut conn) = temp_memory_db("date-index-full");
+        short_entries(&mut conn, now, 200);
+        conn.execute_batch("DROP INDEX memory_meta_dateMs; VACUUM;").unwrap();
+        let pages: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap();
+        let free: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0)).unwrap();
+        assert_eq!(free, 0, "no free page the index could use");
+        conn.execute_batch(&format!("PRAGMA max_page_count={pages}")).unwrap();
+        let error = init_memory_database(&conn).expect_err("init without the date index").to_string();
+        assert!(error.contains("full"), "{error}");
+        assert_eq!(memory_db_count(&conn).unwrap(), 200);
+        assert_eq!(memory_read_by_timestamp(&conn, now + 100, 0).unwrap()[0]["content"], "exchange 100");
+        conn.execute_batch(&format!("PRAGMA max_page_count={}", pages + 100)).unwrap();
+        init_memory_database(&conn).unwrap();
+        drop(conn);
+        let (_path, conn) = open_or_create_memory_db(&dir).unwrap();
+        assert_eq!(memory_db_count(&conn).unwrap(), 200);
+        assert_eq!(memory_read_by_timestamp(&conn, now + 100, 0).unwrap()[0]["content"], "exchange 100");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// When an older memory's index cannot be built on open, the open fails visibly and keeps
+    /// every entry, and the next open builds it.
+    #[test]
+    fn an_older_memory_whose_date_index_cannot_be_built_fails_open_and_the_next_open_builds_it() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let n = 20_000;
+        let (dir, mut conn) = temp_memory_db("date-index-open-fails");
+        short_entries(&mut conn, now, n);
+        // A table holding the index's name makes the build fail.
+        conn.execute_batch("DROP INDEX memory_meta_dateMs; CREATE TABLE memory_meta_dateMs (x);").unwrap();
+        drop(conn);
+        let db = dir.join("memory.db");
+        let (before_read, before_listed) = cold_reads_by_date(&db, now, n);
+        let error = open_or_create_memory_db(&dir).err().expect("open without the date index").to_string();
+        assert!(error.contains("memory_meta_dateMs"), "{error}");
+        Connection::open(&db).unwrap().execute_batch("DROP TABLE memory_meta_dateMs;").unwrap();
+        let (_path, conn) = open_or_create_memory_db(&dir).unwrap();
+        assert_eq!(memory_db_count(&conn).unwrap(), n);
+        assert_eq!(memory_read_by_timestamp(&conn, now + n / 2, 0).unwrap()[0]["content"], format!("exchange {}", n / 2));
+        drop(conn);
+        let (read, listed) = cold_reads_by_date(&db, now, n);
+        assert!(read * 5 < before_read, "a one-entry read: {before_read} pages before, {read} after");
+        assert!(listed * 5 < before_listed, "a listing page: {before_listed} pages before, {listed} after");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Entries that share a millisecond come back in the order they were written, in the listing
     /// (newest millisecond first, whichever page cuts the group) and in memoryRead (oldest first).
     #[test]

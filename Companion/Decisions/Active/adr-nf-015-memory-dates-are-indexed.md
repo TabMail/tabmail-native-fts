@@ -28,9 +28,11 @@ whose `IF NOT EXISTS` statements complete it, instead of failing the index, and 
   - `memoryRead`'s date subquery: a covering-index range search.
   - The listing, with and without dates.
   - The oldest-first removal (`ORDER BY dateMs ASC, rowid ASC`; the index carries the rowid).
+  - The hybrid search's vector date filter (ADR-NF-016, #26): its eligible rowids come from a
+    `memory_meta` date range, now a covering-index range search.
 - **Queries whose plan is unchanged:** the keyword searches with dates still start from the
-  `memory_fts` MATCH and look up `memory_meta` by rowid, and the vector date filter looks up by
-  rowid. `memoryDebugSample` still scans `memory_fts` (#32).
+  `memory_fts` MATCH and look up `memory_meta` by rowid. `memoryDebugSample` still scans
+  `memory_fts` (#32).
 
 Results are unchanged, including the order of entries sharing a millisecond: the listing and
 `memoryRead` now order them by `rowid` (the order they were written), as the oldest-first removal
@@ -56,6 +58,15 @@ index's).
   - `entries_sharing_a_millisecond_keep_the_order_they_were_written_in` (listing and `memoryRead`;
     listing pages cut inside a group of tied entries)
   - `a_memory_whose_creation_stopped_after_its_first_table_opens_and_works`
+  - `a_new_memory_whose_date_index_cannot_be_built_fails_init_and_keeps_its_entries` and
+    `an_older_memory_whose_date_index_cannot_be_built_fails_open_and_the_next_open_builds_it`
+    (a failed build fails init or the open visibly, keeps every entry, and the next one builds it)
+- **A build that fails stops init**, as any init statement does: the helper exits, and the next
+  start tries again. If a `memory_meta` page is already corrupt at the first open of an older
+  memory, every start fails until the memory is removed (Thunderbird's Clear chat history runs
+  through the helper, so it cannot help; Voice's clear deletes the folder). No TabMail code writes
+  such a page, and a corrupt `memory_fts` page already stops init. The owner chose to ship this
+  as is on 2026-10-22; tracked in #41.
 - **Build cost on an existing memory:** once, on the first open. It reads the dates alone: about
   0.1 s for 300,000 dates on an Apple Silicon Mac.
 - **Ongoing cost:** each memory write and removal also updates the index. The index takes about 15
