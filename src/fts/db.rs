@@ -4619,10 +4619,10 @@ mod tests {
         let mut expected = budget(0..30);
         expected.sort();
         assert_eq!(found, expected);
-        // Within dates: only the matches within them.
-        let mut dated = search_with(serde_json::json!({ "from": now - 9 * hour - hour / 2, "to": now + hour, "limit": 100 }));
+        // Within dates: only the matches within them, with matches both before and after them.
+        let mut dated = search_with(serde_json::json!({ "from": now - 9 * hour - hour / 2, "to": now - 4 * hour - hour / 2, "limit": 100 }));
         dated.sort();
-        let mut expected = budget(0..10);
+        let mut expected = budget(5..10);
         expected.sort();
         assert_eq!(dated, expected);
         // Fewer than the matches: the newest `limit`, newest first.
@@ -4647,6 +4647,27 @@ mod tests {
         let mut found = result_ids(&search(&conn, "plan the vacation itinerary", &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap());
         found.sort();
         assert_eq!(found, vec!["acc:/:meaning".to_string(), "acc:/:words".to_string()]);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    /// A merge that keeps a single result is the answer too: the words of the query are in 30
+    /// messages but past the embedding input, so they score about 0 both ways, and one message
+    /// without the words is kept by meaning.
+    #[test]
+    fn search_whose_merge_keeps_one_result_answers_by_it() {
+        let Some(engine) = embedding_engine() else { return };
+        let (profile, _path, mut conn, mut known_years) = temp_email_db("merge-keeps-one");
+        let now = chrono::Utc::now().timestamp_millis();
+        let query = "plan the vacation itinerary";
+        let long = format!("{} {query}", "rain tomorrow ".repeat(160));
+        let mut rows: Vec<Value> = (0..30).map(|i| email_row(&format!("acc:/:words-{i}"), "Weather", &long, now - i)).collect();
+        rows.extend((0..10).map(|i| email_row(&format!("acc:/:other-{i}"), "Weather", "rain tomorrow", now - 100 - i)));
+        rows.push(email_row("acc:/:meaning", "Vacation", "Here is the vacation itinerary", now - 200));
+        index_batch(&mut conn, &rows, Some(&engine), &mut known_years).unwrap();
+        let params = serde_json::json!({ "ignoreDate": true, "limit": 100 });
+        let found = result_ids(&search(&conn, query, &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap());
+        assert_eq!(found, vec!["acc:/:meaning".to_string()]);
         drop(conn);
         let _ = std::fs::remove_dir_all(profile);
     }

@@ -2309,10 +2309,10 @@ pub(crate) mod tests {
         let mut expected = turns(0..30);
         expected.sort();
         assert_eq!(found, expected);
-        // Within dates: only the matches within them.
-        let mut dated = search_with(serde_json::json!({ "from": now - 9 * hour - hour / 2, "to": now + hour, "limit": 100 }));
+        // Within dates: only the matches within them, with matches both before and after them.
+        let mut dated = search_with(serde_json::json!({ "from": now - 9 * hour - hour / 2, "to": now - 4 * hour - hour / 2, "limit": 100 }));
         dated.sort();
-        let mut expected = turns(0..10);
+        let mut expected = turns(5..10);
         expected.sort();
         assert_eq!(dated, expected);
         // Fewer than the matches: `limit` of them, best keyword match first (equal here, so newest first).
@@ -2337,6 +2337,30 @@ pub(crate) mod tests {
             .iter().map(|r| r["memId"].as_str().unwrap().to_string()).collect();
         found.sort();
         assert_eq!(found, vec!["turn:0".to_string(), "turn:1".to_string()]);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A merge that keeps a single result is the answer too: the words of the query are in 30
+    /// entries but past the embedding input, so they score about 0 both ways, and one entry without
+    /// the words is kept by meaning.
+    #[test]
+    fn memory_search_whose_merge_keeps_one_result_answers_by_it() {
+        let Some(engine) = embedding_engine() else { return };
+        let (dir, mut conn) = temp_memory_db("merge-keeps-one");
+        let now = chrono::Utc::now().timestamp_millis();
+        let query = "plan the vacation itinerary";
+        let long = format!("{} {query}", "rain tomorrow ".repeat(160));
+        let turn = |i: i64, content: &str| serde_json::json!({ "memId": format!("turn:{i}"), "role": "session",
+            "sessionId": "persistent_chat", "content": content, "dateMs": now - i, "turnIndex": i });
+        let mut rows: Vec<Value> = (0..30).map(|i| turn(i, &long)).collect();
+        rows.extend((30..40).map(|i| turn(i, "rain tomorrow")));
+        rows.push(turn(40, "Here is the vacation itinerary"));
+        memory_index_batch(&mut conn, &rows, Some(&engine)).unwrap();
+        let params = serde_json::json!({ "ignoreDate": true, "limit": 100 });
+        let found: Vec<String> = memory_search(&conn, query, &params, &SynonymLookup::new(), Some(&engine)).unwrap()
+            .iter().map(|r| r["memId"].as_str().unwrap().to_string()).collect();
+        assert_eq!(found, vec!["turn:40".to_string()]);
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }

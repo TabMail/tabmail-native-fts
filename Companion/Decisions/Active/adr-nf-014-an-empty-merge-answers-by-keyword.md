@@ -80,8 +80,9 @@ RRF is weighted reciprocal-rank fusion with the vector threshold; "RRF, all" is 
 
 - `search_whose_merge_keeps_nothing_answers_by_keyword` (unit, model loaded: 30 messages with
   "budget" an hour apart and 10 without, all with vectors): the query `budget` returns the 30; within
-  dates covering 10 of them, those 10; with limit 5, the newest 5, newest first. Red without the guard
-  (none returned), with the fallback ignoring the dates, and with it returning 4 times the limit.
+  dates covering 5 of them, with matches before and after, those 5; with limit 5, the newest 5, newest
+  first. Red without the guard (none returned), with the fallback ignoring the dates or only the end
+  date, and with it returning 4 times the limit.
 - `memory_search_whose_merge_keeps_nothing_answers_by_keyword` (unit, model loaded: 30 turns naming
   "budget" once in a long sentence, an hour apart, and 10 without): the same three searches and the
   same three reds.
@@ -89,3 +90,8 @@ RRF is weighted reciprocal-rank fusion with the vector threshold; "RRF, all" is 
   `memory_search_whose_merge_keeps_results_answers_by_meaning_too` (unit, model loaded: one row with
   the words of `plan the vacation itinerary`, one about a vacation itinerary without "plan"): both are
   returned. Red with the guard firing whenever the keyword leg matched (only the row with the words).
+- `search_whose_merge_keeps_one_result_answers_by_it` and
+  `memory_search_whose_merge_keeps_one_result_answers_by_it` (unit, model loaded: 30 rows with the
+  words of the query past the embedding input, 10 without, one about a vacation itinerary without
+  "plan"): only that one row is returned. Red with the guard firing when the merge keeps one result
+  (the 30 keyword rows instead).
