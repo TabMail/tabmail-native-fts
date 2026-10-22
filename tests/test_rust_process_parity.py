@@ -386,9 +386,9 @@ class TestRustHelperProcess(unittest.TestCase):
 
     def test_searches_at_the_callers_limit_are_hybrid(self):
         """With the embedding model loaded, the searches Thunderbird and TabMail Voice send
-        (limit 2,000, so k = 8,000 asked of sqlite-vec, which answers at most 4,096) still find
-        a match by meaning alone, with dates or without, and a search scoped to a field does at
-        a limit of 1,000 (k = 8,000 too)."""
+        (limit 2,000) and larger ones (4,000) still find a match by meaning alone, with dates or
+        without, and with a field in the query: the helper caps the limit so the vector candidates
+        it asks for stay within the 4,096 sqlite-vec answers."""
         proc = subprocess.Popen(
             [self.rust_helper_path],
             stdin=subprocess.PIPE,
@@ -433,16 +433,18 @@ class TestRustHelperProcess(unittest.TestCase):
                 return response["result"]
 
             query = "plan the vacation itinerary"
-            undated = search("search", {"q": query, "limit": 2000, "ignoreDate": True})
-            self.assertEqual(sorted(r["uniqueId"] for r in undated), ["found", "outside"])
-            self.assertTrue(all(r["snippet"] == "" for r in undated), "found by meaning, not by their words")
+            for limit in (2000, 4000):
+                undated = search("search", {"q": query, "limit": limit, "ignoreDate": True})
+                self.assertEqual(sorted(r["uniqueId"] for r in undated), ["found", "outside"], limit)
+                self.assertTrue(all(r["snippet"] == "" for r in undated), "found by meaning, not by their words")
             dated = search("search", {"q": query, "limit": 2000, "from": now - day, "to": now + day})
             self.assertEqual([r["uniqueId"] for r in dated], ["found"])
-            scoped = search("search", {"q": "subject:vacation plan the itinerary", "limit": 1000, "ignoreDate": True})
+            scoped = search("search", {"q": "subject:vacation plan the itinerary", "limit": 4000, "ignoreDate": True})
             self.assertEqual(sorted(r["uniqueId"] for r in scoped), ["found", "outside"])
-            memory = search("memorySearch", {"q": query, "limit": 2000, "ignoreDate": True})
-            self.assertEqual([r["memId"] for r in memory], ["found"])
-            self.assertEqual(memory[0]["snippet"], "")
+            for limit in (2000, 4000):
+                memory = search("memorySearch", {"q": query, "limit": limit, "ignoreDate": True})
+                self.assertEqual([r["memId"] for r in memory], ["found"], limit)
+                self.assertEqual(memory[0]["snippet"], "")
         finally:
             self._close(proc)
 

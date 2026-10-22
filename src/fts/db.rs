@@ -1006,10 +1006,12 @@ fn search_rows(
         return Ok(vec![]);
     }
 
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(config::sqlite::SEARCH_DEFAULT_LIMIT);
+    let limit = cap_search_limit(
+        params
+            .get("limit")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(config::sqlite::SEARCH_DEFAULT_LIMIT),
+    );
 
     // Fall back to FTS-only when no embedding engine
     let engine = match engine {
@@ -1059,7 +1061,7 @@ fn search_rows(
     // --- Vector candidates ---
     let query_embedding = engine.embed(query)?;
     let query_blob = f32_vec_to_blob(&query_embedding);
-    let vec_limit = if eligible_rowids.is_some() { candidate_limit * 2 } else { candidate_limit };
+    let vec_limit = if eligible_rowids.is_some() { candidate_limit * config::hybrid::FIELD_VEC_MULTIPLIER } else { candidate_limit };
     let all_vec = search_vec_candidates(conn, "messages_vec", &query_blob, vec_limit).unwrap_or_else(|e| {
         log::warn!("Vector search failed, searching by keyword only: {e}");
         vec![]
@@ -1072,16 +1074,17 @@ fn search_rows(
         all_vec
     };
 
-    // Fall back to FTS-only when vec table is empty (e.g., during embedding rebuild).
-    // Without this, hybrid weights (text_weight=0.3) penalize text-only results below MIN_SCORE.
-    if vec_candidates.is_empty() {
-        log::info!("No vector candidates (vec table may be empty), falling back to FTS-only search");
-        return search_fts_only(conn, query, params, synonyms, limit, known_years);
-    }
-
     // Keep only the vector candidates within the dates asked, before the merge keeps the best
     // `limit` (the FTS candidates are filtered by date in their query).
     let vec_candidates = vec_candidates_within_dates(conn, "message_meta", vec_candidates, from_ts, to_ts)?;
+
+    // Fall back to FTS-only when no vector candidates are left: the vec table is empty (e.g., during
+    // embedding rebuild), or none of them is within the dates.
+    // Without this, hybrid weights (text_weight=0.3) penalize text-only results below MIN_SCORE.
+    if vec_candidates.is_empty() {
+        log::info!("No vector candidates (vec table may be empty, or none within the dates), falling back to FTS-only search");
+        return search_fts_only(conn, query, params, synonyms, limit, known_years);
+    }
 
     // --- Merge ---
     let text_pairs: Vec<(i64, f64)> = fts_candidates.iter().map(|c| (c.rowid, c.rank)).collect();
@@ -1321,23 +1324,28 @@ fn search_fts_candidates(
     Ok(candidates)
 }
 
-/// Get the `limit` nearest vectors from a vec0 table, at most `VEC_K_MAX`: sqlite-vec refuses a
-/// larger k, which left a search with a large `limit` no vector candidates at all.
+/// A search's `limit`, at most `SEARCH_LIMIT_MAX`: past it, the vector candidates the search asks for
+/// are more than sqlite-vec answers, and it would search by keyword only.
+pub(crate) fn cap_search_limit(limit: i64) -> i64 {
+    if limit > config::hybrid::SEARCH_LIMIT_MAX {
+        log::info!("Search limit {limit} capped to {}", config::hybrid::SEARCH_LIMIT_MAX);
+    }
+    limit.min(config::hybrid::SEARCH_LIMIT_MAX)
+}
+
+/// Get the `limit` nearest vectors from a vec0 table. sqlite-vec refuses a `limit` over `VEC_K_MAX`,
+/// which `cap_search_limit` keeps a search's within.
 pub(crate) fn search_vec_candidates(
     conn: &Connection,
     table: &str,
     query_blob: &[u8],
     limit: i64,
 ) -> anyhow::Result<Vec<(i64, f64)>> {
-    let k = limit.min(config::hybrid::VEC_K_MAX);
-    if k < limit {
-        log::info!("Vector candidates: {limit} asked, sqlite-vec's most is {k}");
-    }
     let sql = format!(
         "SELECT rowid, distance FROM {table} WHERE embedding MATCH ?1 AND k = ?2"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![query_blob, k], |r| {
+    let rows = stmt.query_map(params![query_blob, limit], |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -4243,10 +4251,10 @@ mod tests {
         results.iter().map(|r| r["uniqueId"].as_str().unwrap().to_string()).collect()
     }
 
-    /// sqlite-vec answers at most VEC_K_MAX nearest vectors and refuses a larger k: asked for more,
-    /// the candidates are the VEC_K_MAX nearest, not an error.
+    /// sqlite-vec answers at most VEC_K_MAX nearest vectors and refuses a larger k, and a search at
+    /// SEARCH_LIMIT_MAX asks for no more than that (FIELD_VEC_MULTIPLIER times more with a field).
     #[test]
-    fn vec_candidates_over_sqlite_vecs_most_are_its_most() {
+    fn sqlite_vec_answers_at_most_vec_k_max() {
         let (profile, _path, conn, _years) = temp_email_db("k-max");
         let dims = config::embedding::EMBEDDING_DIMS;
         let vector = |i: usize| {
@@ -4262,11 +4270,14 @@ mod tests {
         }
         tx.commit().unwrap();
         let query = vector(0);
-        for limit in [config::hybrid::VEC_K_MAX - 1, config::hybrid::VEC_K_MAX, config::hybrid::VEC_K_MAX + 1, 8_000] {
+        for limit in [config::hybrid::VEC_K_MAX - 1, config::hybrid::VEC_K_MAX] {
             let found = search_vec_candidates(&conn, "messages_vec", &query, limit).unwrap();
-            assert_eq!(found.len() as i64, limit.min(config::hybrid::VEC_K_MAX), "asked for {limit}");
+            assert_eq!(found.len() as i64, limit, "asked for {limit}");
             assert!(found.iter().any(|c| c.0 == 1), "the nearest is among them");
         }
+        assert!(search_vec_candidates(&conn, "messages_vec", &query, config::hybrid::VEC_K_MAX + 1).is_err());
+        let most_asked = config::hybrid::SEARCH_LIMIT_MAX * config::hybrid::CANDIDATE_MULTIPLIER * config::hybrid::FIELD_VEC_MULTIPLIER;
+        assert!(most_asked <= config::hybrid::VEC_K_MAX);
         drop(conn);
         let _ = std::fs::remove_dir_all(profile);
     }
@@ -4293,8 +4304,9 @@ mod tests {
     }
 
     /// A hybrid search asks sqlite-vec for `limit` x CANDIDATE_MULTIPLIER nearest vectors (twice as
-    /// many with a field in the query), more than it answers once `limit` is past 1,024 (512 with a
-    /// field). At any `limit`, a match by meaning alone is still found: the search stays hybrid.
+    /// many with a field in the query), which it refuses past VEC_K_MAX; the `limit` is capped at
+    /// SEARCH_LIMIT_MAX to keep within it. At any `limit` asked, a match by meaning alone is still
+    /// found: the search stays hybrid.
     #[test]
     fn search_with_a_large_limit_finds_a_match_by_meaning() {
         let Some(engine) = embedding_engine() else { return };
@@ -4302,9 +4314,9 @@ mod tests {
         let now = chrono::Utc::now().timestamp_millis();
         let found = email_row("acc:/:found", "Vacation", "Here is the vacation itinerary", now);
         index_batch(&mut conn, &[found], Some(&engine), &mut known_years).unwrap();
-        let most = config::hybrid::VEC_K_MAX / config::hybrid::CANDIDATE_MULTIPLIER;
-        for (q, scoped_most) in [("plan the vacation itinerary", most), ("subject:vacation plan the itinerary", most / 2)] {
-            for limit in [10, scoped_most, scoped_most + 1, 2_000] {
+        let most = config::hybrid::SEARCH_LIMIT_MAX;
+        for q in ["plan the vacation itinerary", "subject:vacation plan the itinerary"] {
+            for limit in [10, most, most + 1, 2_000, 4_000] {
                 let params = serde_json::json!({ "ignoreDate": true, "limit": limit });
                 let results = search(&conn, q, &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap();
                 assert_eq!(result_ids(&results), ["acc:/:found"], "{q} at limit {limit}");
@@ -4534,6 +4546,44 @@ mod tests {
         assert_ne!(memories[0]["snippet"], "", "found by its words");
         drop(conn);
         drop(memory);
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    /// A search returns at most SEARCH_LIMIT_MAX results, whatever `limit` it is given: the most at
+    /// which its vector side still gets CANDIDATE_MULTIPLIER candidates a result.
+    #[test]
+    fn search_returns_at_most_search_limit_max_results() {
+        let (mut conn, mut known_years) = setup_test_db();
+        let most = config::hybrid::SEARCH_LIMIT_MAX;
+        let rows: Vec<Value> = (0..most + 76).map(|i| email_row(&format!("acc:/:budget-{i}"), "Budget", "the quarterly budget", i)).collect();
+        index_batch(&mut conn, &rows, None, &mut known_years).unwrap();
+        for limit in [10, most, most + 1, 4_000] {
+            let params = serde_json::json!({ "ignoreDate": true, "limit": limit });
+            let results = search(&conn, "budget", &params, &SynonymLookup::new(), None, &known_years).unwrap();
+            assert_eq!(results.len() as i64, limit.min(most), "at limit {limit}");
+        }
+    }
+
+    /// A search with dates whose vector candidates are all outside them answers by keyword, as it
+    /// does with no vectors at all: every keyword match within the dates, however weak.
+    #[test]
+    fn search_with_no_vector_within_the_dates_answers_by_keyword() {
+        let Some(engine) = embedding_engine() else { return };
+        let (profile, _path, mut conn, mut known_years) = temp_email_db("no-vector-within");
+        let day = 86_400_000;
+        let now = chrono::Utc::now().timestamp_millis();
+        // Within the dates, no vectors yet; "budget" in each, so it weighs little by keyword.
+        let within: Vec<Value> = (0..20).map(|i| email_row(&format!("acc:/:within-{i}"), "Notes", &format!("the quarterly budget, item {i}"), now - i)).collect();
+        index_batch(&mut conn, &within, None, &mut known_years).unwrap();
+        let outside: Vec<Value> = (0..5).map(|i| email_row(&format!("acc:/:outside-{i}"), "Weather", "rain tomorrow", now - (30 + i) * day)).collect();
+        index_batch(&mut conn, &outside, Some(&engine), &mut known_years).unwrap();
+        let mut expected: Vec<String> = (0..20).map(|i| format!("acc:/:within-{i}")).collect();
+        expected.sort();
+        let params = serde_json::json!({ "from": now - day, "to": now + day, "limit": 100 });
+        let mut found = result_ids(&search(&conn, "budget", &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap());
+        found.sort();
+        assert_eq!(found, expected);
+        drop(conn);
         let _ = std::fs::remove_dir_all(profile);
     }
 }
