@@ -1096,6 +1096,13 @@ fn search_rows(
         limit as usize,
     );
 
+    // Words matched but the merge kept nothing (a word in at least half the messages scores about 0 by keyword, and a
+    // weak vector match adds too little to reach MIN_SCORE): answer by keyword, as with no vectors.
+    if merged.is_empty() && !text_pairs.is_empty() {
+        log::info!("Hybrid merge kept none of {} keyword matches, falling back to FTS-only search", text_pairs.len());
+        return search_fts_only(conn, query, params, synonyms, limit, known_years);
+    }
+
     // --- Assemble results ---
     let mut fts_map: HashMap<i64, FtsCandidate> =
         fts_candidates.into_iter().map(|c| (c.rowid, c)).collect();
@@ -4588,6 +4595,79 @@ mod tests {
         let mut found = result_ids(&search(&conn, "budget", &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap());
         found.sort();
         assert_eq!(found, expected);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    /// A search whose merge keeps nothing although words match answers by keyword: a word in most
+    /// messages scores about 0 by keyword (FTS5 clamps its IDF), and a one-word query's vector scores
+    /// are weak, so every merged score fell under MIN_SCORE and the search returned nothing (#28).
+    #[test]
+    fn search_whose_merge_keeps_nothing_answers_by_keyword() {
+        let Some(engine) = embedding_engine() else { return };
+        let (profile, _path, mut conn, mut known_years) = temp_email_db("merge-keeps-nothing");
+        let hour = 3_600_000;
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut rows: Vec<Value> = (0..30).map(|i| email_row(&format!("acc:/:budget-{i}"), "Budget", "the quarterly budget", now - i * hour)).collect();
+        rows.extend((0..10).map(|i| email_row(&format!("acc:/:weather-{i}"), "Weather", "rain tomorrow", now - (100 + i) * hour)));
+        index_batch(&mut conn, &rows, Some(&engine), &mut known_years).unwrap();
+        let budget = |range: std::ops::Range<i64>| -> Vec<String> { range.map(|i| format!("acc:/:budget-{i}")).collect() };
+        let search_with = |params: Value| result_ids(&search(&conn, "budget", &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap());
+
+        let mut found = search_with(serde_json::json!({ "ignoreDate": true, "limit": 100 }));
+        found.sort();
+        let mut expected = budget(0..30);
+        expected.sort();
+        assert_eq!(found, expected);
+        // Within dates: only the matches within them, with matches both before and after them.
+        let mut dated = search_with(serde_json::json!({ "from": now - 9 * hour - hour / 2, "to": now - 4 * hour - hour / 2, "limit": 100 }));
+        dated.sort();
+        let mut expected = budget(5..10);
+        expected.sort();
+        assert_eq!(dated, expected);
+        // Fewer than the matches: the newest `limit`, newest first.
+        assert_eq!(search_with(serde_json::json!({ "ignoreDate": true, "limit": 5 })), budget(0..5));
+        drop(conn);
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    /// A query whose words match a row answers by the merge when it keeps something: a match by
+    /// meaning alone, without the words, is among the results.
+    #[test]
+    fn search_whose_merge_keeps_results_answers_by_meaning_too() {
+        let Some(engine) = embedding_engine() else { return };
+        let (profile, _path, mut conn, mut known_years) = temp_email_db("merge-keeps-results");
+        let now = chrono::Utc::now().timestamp_millis();
+        let rows = vec![
+            email_row("acc:/:words", "Plan", "plan the vacation itinerary for the team", now),
+            email_row("acc:/:meaning", "Vacation", "Here is the vacation itinerary", now - 1),
+        ];
+        index_batch(&mut conn, &rows, Some(&engine), &mut known_years).unwrap();
+        let params = serde_json::json!({ "ignoreDate": true, "limit": 10 });
+        let mut found = result_ids(&search(&conn, "plan the vacation itinerary", &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap());
+        found.sort();
+        assert_eq!(found, vec!["acc:/:meaning".to_string(), "acc:/:words".to_string()]);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    /// A merge that keeps a single result is the answer too: the words of the query are in 30
+    /// messages but past the embedding input, so they score about 0 both ways, and one message
+    /// without the words is kept by meaning.
+    #[test]
+    fn search_whose_merge_keeps_one_result_answers_by_it() {
+        let Some(engine) = embedding_engine() else { return };
+        let (profile, _path, mut conn, mut known_years) = temp_email_db("merge-keeps-one");
+        let now = chrono::Utc::now().timestamp_millis();
+        let query = "plan the vacation itinerary";
+        let long = format!("{} {query}", "rain tomorrow ".repeat(160));
+        let mut rows: Vec<Value> = (0..30).map(|i| email_row(&format!("acc:/:words-{i}"), "Weather", &long, now - i)).collect();
+        rows.extend((0..10).map(|i| email_row(&format!("acc:/:other-{i}"), "Weather", "rain tomorrow", now - 100 - i)));
+        rows.push(email_row("acc:/:meaning", "Vacation", "Here is the vacation itinerary", now - 200));
+        index_batch(&mut conn, &rows, Some(&engine), &mut known_years).unwrap();
+        let params = serde_json::json!({ "ignoreDate": true, "limit": 100 });
+        let found = result_ids(&search(&conn, query, &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap());
+        assert_eq!(found, vec!["acc:/:meaning".to_string()]);
         drop(conn);
         let _ = std::fs::remove_dir_all(profile);
     }

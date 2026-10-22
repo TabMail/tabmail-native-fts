@@ -521,6 +521,13 @@ fn memory_search_rows(
         limit as usize,
     );
 
+    // Words matched but the merge kept nothing (a word in at least half the entries scores about 0 by keyword, and a
+    // weak vector match adds too little to reach MIN_SCORE): answer by keyword, as with no vectors.
+    if merged.is_empty() && !text_pairs.is_empty() {
+        log::info!("Memory hybrid merge kept none of {} keyword matches, falling back to FTS-only search", text_pairs.len());
+        return memory_search_fts_only(conn, query, params, synonyms, ignore_date, limit);
+    }
+
     // --- Assemble results ---
     let mut fts_map: HashMap<i64, MemoryFtsCandidate> =
         fts_candidates.into_iter().map(|c| (c.rowid, c)).collect();
@@ -2272,6 +2279,88 @@ pub(crate) mod tests {
         let mut expected: Vec<String> = (0..20).map(|i| format!("turn:{i}")).collect();
         expected.sort();
         assert_eq!(found, expected);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A memory search whose merge keeps nothing although words match answers by keyword: a word in
+    /// most entries scores about 0 by keyword, and a one-word query's vector scores are weak (#28).
+    #[test]
+    fn memory_search_whose_merge_keeps_nothing_answers_by_keyword() {
+        let Some(engine) = embedding_engine() else { return };
+        let (dir, mut conn) = temp_memory_db("merge-keeps-nothing");
+        let hour = 3_600_000;
+        let now = chrono::Utc::now().timestamp_millis();
+        let turn = |i: i64, content: &str, date_ms: i64| serde_json::json!({ "memId": format!("turn:{i}"), "role": "session",
+            "sessionId": "persistent_chat", "content": content, "dateMs": date_ms, "turnIndex": i });
+        // "budget" once among other topics: in at least half the entries, so it weighs little by keyword, and far
+        // from the one-word query by meaning.
+        let mut rows: Vec<Value> = (0..30).map(|i| turn(i, &format!("we talked about the parking, the lunch order {i}, the weather, the train schedule and the budget"), now - i * hour)).collect();
+        rows.extend((30..40).map(|i| turn(i, "rain tomorrow", now - (100 + i) * hour)));
+        memory_index_batch(&mut conn, &rows, Some(&engine)).unwrap();
+        let turns = |range: std::ops::Range<i64>| -> Vec<String> { range.map(|i| format!("turn:{i}")).collect() };
+        let search_with = |params: Value| -> Vec<String> {
+            memory_search(&conn, "budget", &params, &SynonymLookup::new(), Some(&engine)).unwrap()
+                .iter().map(|r| r["memId"].as_str().unwrap().to_string()).collect()
+        };
+
+        let mut found = search_with(serde_json::json!({ "ignoreDate": true, "limit": 100 }));
+        found.sort();
+        let mut expected = turns(0..30);
+        expected.sort();
+        assert_eq!(found, expected);
+        // Within dates: only the matches within them, with matches both before and after them.
+        let mut dated = search_with(serde_json::json!({ "from": now - 9 * hour - hour / 2, "to": now - 4 * hour - hour / 2, "limit": 100 }));
+        dated.sort();
+        let mut expected = turns(5..10);
+        expected.sort();
+        assert_eq!(dated, expected);
+        // Fewer than the matches: `limit` of them, best keyword match first (equal here, so newest first).
+        assert_eq!(search_with(serde_json::json!({ "ignoreDate": true, "limit": 5 })), turns(0..5));
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A query whose words match an entry answers by the merge when it keeps something: an entry
+    /// found by meaning alone, without the words, is among the results.
+    #[test]
+    fn memory_search_whose_merge_keeps_results_answers_by_meaning_too() {
+        let Some(engine) = embedding_engine() else { return };
+        let (dir, mut conn) = temp_memory_db("merge-keeps-results");
+        let now = chrono::Utc::now().timestamp_millis();
+        let turn = |i: i64, content: &str| serde_json::json!({ "memId": format!("turn:{i}"), "role": "session",
+            "sessionId": "persistent_chat", "content": content, "dateMs": now - i, "turnIndex": i });
+        let rows = vec![turn(0, "plan the vacation itinerary for the team"), turn(1, "Here is the vacation itinerary")];
+        memory_index_batch(&mut conn, &rows, Some(&engine)).unwrap();
+        let params = serde_json::json!({ "ignoreDate": true, "limit": 10 });
+        let mut found: Vec<String> = memory_search(&conn, "plan the vacation itinerary", &params, &SynonymLookup::new(), Some(&engine)).unwrap()
+            .iter().map(|r| r["memId"].as_str().unwrap().to_string()).collect();
+        found.sort();
+        assert_eq!(found, vec!["turn:0".to_string(), "turn:1".to_string()]);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A merge that keeps a single result is the answer too: the words of the query are in 30
+    /// entries but past the embedding input, so they score about 0 both ways, and one entry without
+    /// the words is kept by meaning.
+    #[test]
+    fn memory_search_whose_merge_keeps_one_result_answers_by_it() {
+        let Some(engine) = embedding_engine() else { return };
+        let (dir, mut conn) = temp_memory_db("merge-keeps-one");
+        let now = chrono::Utc::now().timestamp_millis();
+        let query = "plan the vacation itinerary";
+        let long = format!("{} {query}", "rain tomorrow ".repeat(160));
+        let turn = |i: i64, content: &str| serde_json::json!({ "memId": format!("turn:{i}"), "role": "session",
+            "sessionId": "persistent_chat", "content": content, "dateMs": now - i, "turnIndex": i });
+        let mut rows: Vec<Value> = (0..30).map(|i| turn(i, &long)).collect();
+        rows.extend((30..40).map(|i| turn(i, "rain tomorrow")));
+        rows.push(turn(40, "Here is the vacation itinerary"));
+        memory_index_batch(&mut conn, &rows, Some(&engine)).unwrap();
+        let params = serde_json::json!({ "ignoreDate": true, "limit": 100 });
+        let found: Vec<String> = memory_search(&conn, query, &params, &SynonymLookup::new(), Some(&engine)).unwrap()
+            .iter().map(|r| r["memId"].as_str().unwrap().to_string()).collect();
+        assert_eq!(found, vec!["turn:40".to_string()]);
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }
