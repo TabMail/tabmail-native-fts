@@ -11,6 +11,9 @@ use unicode_categories::UnicodeCategories;
 /// Every word and every `"quoted phrase"` reaches FTS5 as a string, so nothing typed breaks the
 /// query: parentheses and punctuation are searched as text, and non-ASCII text is kept whole.
 /// A capital AND, OR or NOT between two terms stays the operator; anywhere else it is dropped.
+/// At most `SEARCH_MAX_KEPT_NOTS` NOTs are kept, and a later exclusion is left out (FTS5 nests
+/// each NOT and refuses an expression deeper than 256).
+/// A word whose only punctuation is an inner apostrophe searches both spellings (`don't`, `dont`).
 /// `name:word`, `name:"phrase"` and `name: word` scope to a column only when `columns` names it
 /// (typed name, case-insensitive → table column); any other `x:` is text.
 pub fn build_fts_match(
