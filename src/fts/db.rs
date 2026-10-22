@@ -4480,4 +4480,60 @@ mod tests {
         let next = search(&conn, "budget", &params, &SynonymLookup::new(), None, &known_years).unwrap();
         assert_eq!(result_ids(&next), ["acc:/:budget"]);
     }
+
+    /// Refuses every read of the table a `DeniedTable` names, counting them.
+    struct DeniedTable {
+        name: &'static [u8],
+        denied: usize,
+    }
+
+    extern "C" fn deny_reads_of_table(
+        context: *mut c_void,
+        action: c_int,
+        table: *const std::os::raw::c_char,
+        _column: *const std::os::raw::c_char,
+        _db: *const std::os::raw::c_char,
+        _trigger: *const std::os::raw::c_char,
+    ) -> c_int {
+        let state = unsafe { &mut *(context as *mut DeniedTable) };
+        if action == ffi::SQLITE_READ && !table.is_null() && unsafe { CStr::from_ptr(table) }.to_bytes() == state.name {
+            state.denied += 1;
+            return ffi::SQLITE_DENY;
+        }
+        ffi::SQLITE_OK
+    }
+
+    /// When the vector search itself fails, an email or memory search still answers, by keyword
+    /// only (the error is logged).
+    #[test]
+    fn search_whose_vector_leg_fails_answers_by_keyword() {
+        let Some(engine) = embedding_engine() else { return };
+        let (profile, _path, mut conn, mut known_years) = temp_email_db("vector-fails");
+        let now = chrono::Utc::now().timestamp_millis();
+        index_batch(&mut conn, &[email_row("acc:/:budget", "Budget", "the quarterly budget", now)], Some(&engine), &mut known_years).unwrap();
+        let (_memory_path, mut memory) = crate::fts::memory_db::open_or_create_memory_db(&profile).unwrap();
+        let exchange = serde_json::json!({ "memId": "budget", "role": "session", "sessionId": "persistent_chat",
+            "content": "the quarterly budget", "dateMs": now, "turnIndex": 0 });
+        crate::fts::memory_db::memory_index_batch(&mut memory, &[exchange], Some(&engine)).unwrap();
+        let params = serde_json::json!({ "ignoreDate": true });
+        let with_denied = |conn: &Connection, name: &'static [u8], run: &dyn Fn() -> Vec<Value>| {
+            let mut state = DeniedTable { name, denied: 0 };
+            unsafe { ffi::sqlite3_set_authorizer(conn.handle(), Some(deny_reads_of_table), &mut state as *mut DeniedTable as *mut c_void) };
+            let results = run();
+            unsafe { ffi::sqlite3_set_authorizer(conn.handle(), None, std::ptr::null_mut()) };
+            assert!(state.denied > 0, "the vector search was refused");
+            results
+        };
+
+        let email = with_denied(&conn, b"messages_vec", &|| search(&conn, "budget", &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap());
+        assert_eq!(result_ids(&email), ["acc:/:budget"]);
+        assert_ne!(email[0]["snippet"], "", "found by its words");
+        let memories = with_denied(&memory, b"memory_vec", &|| crate::fts::memory_db::memory_search(&memory, "budget", &params, &SynonymLookup::new(), Some(&engine)).unwrap());
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0]["memId"], "budget");
+        assert_ne!(memories[0]["snippet"], "", "found by its words");
+        drop(conn);
+        drop(memory);
+        let _ = std::fs::remove_dir_all(profile);
+    }
 }

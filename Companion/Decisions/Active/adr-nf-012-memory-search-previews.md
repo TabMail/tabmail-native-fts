@@ -83,7 +83,8 @@ outside the dates are nearer the query, no match inside them keeps its vector sc
 inside the dates that matches only by meaning is missed (one with the words is still found by the
 keyword leg). Asking sqlite-vec for the dates directly would need the date in the vector table.
 The email hybrid search in `db.rs` still drops vector candidates outside the dates after its merge,
-as memory did; it shows only once #20 lets its vector search run, so it is fixed there (noted on #20).
+as memory did; it shows only once #20 lets its vector search run, so it is fixed there (noted on #20;
+fixed 2026-10-21 by ADR-NF-013).
 
 Evidence: `memory_listing_gives_the_newest_within_the_dates_each_whole` (unit: newest first, the
 limit, both bounds inclusive, `ignoreDate` over the dates, every field whole) passes on the old

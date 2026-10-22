@@ -56,8 +56,10 @@ best `limit`, so nearer messages outside the dates took the places of matches in
 - Lowering `CANDIDATE_MULTIPLIER` or capping `limit` at the callers: every caller (Thunderbird,
   Voice, any later one) would have to know sqlite-vec's maximum. The helper is the one place that
   knows it.
-- Failing the search when the vector leg fails: the keyword-only fallback is how a search answers
-  while embeddings are rebuilt. It now logs a warning instead of failing silently.
+- Failing the search when the vector leg fails: a keyword-only answer is still an answer, and with
+  the clamp the error is rare (a negative `limit`, a broken vector table). It now logs a warning
+  instead of failing silently. (A rebuild empties the vector table, which answers no rows, not an
+  error: that goes through the fallback for no vector candidates.)
 
 ## Evidence
 
@@ -84,6 +86,9 @@ Each test below was checked against a mutated build. "Red" means it fails there.
   and one without): the match every time. Red without the transaction.
 - `search_after_a_failed_one_is_answered` (unit: a `message_meta` read refused inside the search):
   the next search is answered. Red when a failed search leaves its transaction open.
+- `search_whose_vector_leg_fails_answers_by_keyword` (unit, model loaded: reads of `messages_vec` and
+  `memory_vec` refused): email and memory search each answer the keyword match. Red when a vector
+  error fails the search.
 - `test_searches_at_the_callers_limit_are_hybrid` (process, model loaded): email search at limit
   2,000 with and without dates, a `subject:` search at 1,000, and a memory search at 2,000 each find
   the match by meaning alone, and the dated one leaves out the nearer message outside the dates.
