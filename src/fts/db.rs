@@ -1071,31 +1071,29 @@ fn search_rows(
         None
     };
 
-    // --- Vector candidates ---
+    // --- Vector candidates: the nearest within the dates (and the field's matches) ---
     let query_embedding = engine.embed(query)?;
     let query_blob = f32_vec_to_blob(&query_embedding);
-    let vec_limit = if eligible_rowids.is_some() { candidate_limit * config::hybrid::FIELD_VEC_MULTIPLIER } else { candidate_limit };
-    let all_vec = search_vec_candidates(conn, "messages_vec", &query_blob, vec_limit).unwrap_or_else(|e| {
+    let vec_candidates = search_vec_candidates(
+        conn,
+        "messages_vec",
+        "message_meta",
+        &query_blob,
+        candidate_limit,
+        from_ts,
+        to_ts,
+        eligible_rowids.as_ref(),
+    )
+    .unwrap_or_else(|e| {
         log::warn!("Vector search failed, searching by keyword only: {e}");
         vec![]
     });
 
-    // Filter vector candidates to eligible set when column-scoped
-    let vec_candidates: Vec<(i64, f64)> = if let Some(ref eligible) = eligible_rowids {
-        all_vec.into_iter().filter(|(rowid, _)| eligible.contains(rowid)).collect()
-    } else {
-        all_vec
-    };
-
-    // Keep only the vector candidates within the dates asked, before the merge keeps the best
-    // `limit` (the FTS candidates are filtered by date in their query).
-    let vec_candidates = vec_candidates_within_dates(conn, "message_meta", vec_candidates, from_ts, to_ts)?;
-
-    // Fall back to FTS-only when no vector candidates are left: the vec table is empty (e.g., during
-    // embedding rebuild), or none of them is within the dates.
+    // Fall back to FTS-only when there are no vector candidates: the vec table is empty (e.g., during
+    // embedding rebuild), or no vector is within the dates (or among the field's matches).
     // Without this, hybrid weights (text_weight=0.3) penalize text-only results below MIN_SCORE.
     if vec_candidates.is_empty() {
-        log::info!("No vector candidates (vec table may be empty, or none within the dates), falling back to FTS-only search");
+        log::info!("No vector candidates (vec table may be empty, or none within the dates or the field), falling back to FTS-only search");
         return search_fts_only(conn, query, params, synonyms, limit, known_years);
     }
 
@@ -1134,7 +1132,7 @@ fn search_rows(
                 "rank": -hr.final_score
             }));
         } else {
-            // Vector-only result (within the dates: filtered before the merge)
+            // Vector-only result (within the dates and the field: sqlite-vec searched only those)
             if let Some(meta) = fetch_message_meta(conn, hr.rowid)? {
                 results.push(serde_json::json!({
                     "uniqueId": meta.msg_id,
@@ -1353,47 +1351,40 @@ pub(crate) fn cap_search_limit(limit: i64) -> i64 {
     limit.min(config::hybrid::SEARCH_LIMIT_MAX)
 }
 
-/// Get the `limit` nearest vectors from a vec0 table. sqlite-vec refuses a `limit` over `VEC_K_MAX`,
-/// which `cap_search_limit` keeps a search's within.
+/// The `k` nearest vectors in a vec0 table. With dates (either bound alone, or both, each inclusive)
+/// or `eligible` rowids (an email query naming a field), only rows of `meta_table` dated within the
+/// dates and among those rowids: sqlite-vec searches just them (`rowid IN`), so a match inside them is
+/// found however many nearer rows lie outside. sqlite-vec refuses a `k` over `VEC_K_MAX`, which
+/// `cap_search_limit` keeps a search's within.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn search_vec_candidates(
     conn: &Connection,
-    table: &str,
-    query_blob: &[u8],
-    limit: i64,
-) -> anyhow::Result<Vec<(i64, f64)>> {
-    let sql = format!(
-        "SELECT rowid, distance FROM {table} WHERE embedding MATCH ?1 AND k = ?2"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![query_blob, limit], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
-    })?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-}
-
-/// The vector candidates whose row in `meta_table` is dated within the dates asked (either bound
-/// alone, or both, each inclusive), in their order. A hybrid search filters them before its merge
-/// keeps the best `limit`: dropped after it, nearer rows outside the dates would take the places
-/// of matches inside them.
-pub(crate) fn vec_candidates_within_dates(
-    conn: &Connection,
+    vec_table: &str,
     meta_table: &str,
-    candidates: Vec<(i64, f64)>,
+    query_blob: &[u8],
+    k: i64,
     from_ts: Option<i64>,
     to_ts: Option<i64>,
+    eligible: Option<&HashSet<i64>>,
 ) -> anyhow::Result<Vec<(i64, f64)>> {
-    if from_ts.is_none() && to_ts.is_none() {
-        return Ok(candidates);
+    let read = |r: &rusqlite::Row| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?));
+    if from_ts.is_none() && to_ts.is_none() && eligible.is_none() {
+        let mut stmt = conn.prepare(&format!("SELECT rowid, distance FROM {vec_table} WHERE embedding MATCH ?1 AND k = ?2"))?;
+        let rows = stmt.query_map(params![query_blob, k], read)?;
+        return rows.collect::<Result<Vec<_>, _>>().map_err(Into::into);
     }
-    let mut date_of = conn.prepare(&format!("SELECT dateMs FROM {meta_table} WHERE rowid = ?1"))?;
-    let mut kept = Vec::with_capacity(candidates.len());
-    for (rowid, distance) in candidates {
-        let date_ms: Option<i64> = date_of.query_row(params![rowid], |r| r.get(0)).optional()?;
-        if date_ms.is_some_and(|d| from_ts.is_none_or(|from| d >= from) && to_ts.is_none_or(|to| d <= to)) {
-            kept.push((rowid, distance));
-        }
-    }
-    Ok(kept)
+    let sql = format!(
+        "SELECT rowid, distance FROM {vec_table} WHERE embedding MATCH ?1 AND k = ?2 AND rowid IN \
+         (SELECT rowid FROM {meta_table} WHERE dateMs >= ?3 AND dateMs <= ?4 \
+          AND (?5 IS NULL OR rowid IN (SELECT value FROM json_each(?5))))"
+    );
+    let eligible_json = eligible.map(|e| serde_json::to_string(&e.iter().collect::<Vec<_>>())).transpose()?;
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params![query_blob, k, from_ts.unwrap_or(i64::MIN), to_ts.unwrap_or(i64::MAX), eligible_json],
+        read,
+    )?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 /// Fetch metadata for a single message by rowid (used for vector-only results).
@@ -4678,8 +4669,8 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(profile);
     }
 
-    /// sqlite-vec answers at most VEC_K_MAX nearest vectors and refuses a larger k, and a search at
-    /// SEARCH_LIMIT_MAX asks for no more than that (FIELD_VEC_MULTIPLIER times more with a field).
+    /// sqlite-vec answers at most VEC_K_MAX nearest vectors and refuses a larger k (a search at
+    /// SEARCH_LIMIT_MAX asks for no more: a compile-time check in config).
     #[test]
     fn sqlite_vec_answers_at_most_vec_k_max() {
         let (profile, _path, conn, _years) = temp_email_db("k-max");
@@ -4698,40 +4689,110 @@ pub(crate) mod tests {
         tx.commit().unwrap();
         let query = vector(0);
         for limit in [config::hybrid::VEC_K_MAX - 1, config::hybrid::VEC_K_MAX] {
-            let found = search_vec_candidates(&conn, "messages_vec", &query, limit).unwrap();
+            let found = search_vec_candidates(&conn, "messages_vec", "message_meta", &query, limit, None, None, None).unwrap();
             assert_eq!(found.len() as i64, limit, "asked for {limit}");
             assert!(found.iter().any(|c| c.0 == 1), "the nearest is among them");
         }
-        assert!(search_vec_candidates(&conn, "messages_vec", &query, config::hybrid::VEC_K_MAX + 1).is_err());
-        let most_asked = config::hybrid::SEARCH_LIMIT_MAX * config::hybrid::CANDIDATE_MULTIPLIER * config::hybrid::FIELD_VEC_MULTIPLIER;
-        assert!(most_asked <= config::hybrid::VEC_K_MAX);
+        assert!(search_vec_candidates(&conn, "messages_vec", "message_meta", &query, config::hybrid::VEC_K_MAX + 1, None, None, None).is_err());
         drop(conn);
         let _ = std::fs::remove_dir_all(profile);
     }
 
-    /// The vector candidates kept for a search with dates are those dated within them, either bound
-    /// alone or both, each inclusive, in their order; one with no metadata row is not kept. Without
-    /// dates, every candidate is kept.
+    /// With dates or a field's rowids, sqlite-vec searches only the rows dated within the dates (either
+    /// bound alone, or both, each inclusive) and among those rowids: the k nearest of them, however many
+    /// nearer rows lie outside. A vector with no metadata row is found only without either.
     #[test]
-    fn vec_candidates_within_dates_keeps_those_dated_within_them() {
-        let (conn, _years) = setup_test_db();
-        for (rowid, date_ms) in [(1, 100), (2, 200), (3, 300), (4, 400)] {
-            conn.execute("INSERT INTO message_meta (rowid, dateMs, hasAttachments, shardYear) VALUES (?1, ?2, 0, 2000)", params![rowid, date_ms]).unwrap();
-        }
-        // Nearest first, as sqlite-vec gives them; rowid 9 has no metadata.
-        let candidates = vec![(3, 0.1), (9, 0.2), (1, 0.3), (4, 0.4), (2, 0.5)];
-        let kept = |from: Option<i64>, to: Option<i64>| {
-            vec_candidates_within_dates(&conn, "message_meta", candidates.clone(), from, to).unwrap().iter().map(|c| c.0).collect::<Vec<_>>()
+    fn search_vec_candidates_searches_only_within_the_dates_and_the_field() {
+        let (profile, _path, conn, _years) = temp_email_db("vec-within");
+        let dims = config::embedding::EMBEDDING_DIMS;
+        // Farther from the query the larger i is.
+        let vector = |i: i64| {
+            let mut v = vec![0.0f32; dims];
+            v[0] = 1.0;
+            v[1] = i as f32 / 100.0;
+            f32_vec_to_blob(&v)
         };
-        assert_eq!(kept(None, None), [3, 9, 1, 4, 2]);
-        assert_eq!(kept(Some(200), Some(300)), [3, 2]);
-        assert_eq!(kept(Some(300), None), [3, 4]);
-        assert_eq!(kept(None, Some(200)), [1, 2]);
-        assert_eq!(kept(Some(500), None), Vec::<i64>::new());
+        let tx = conn.unchecked_transaction().unwrap();
+        for i in 1..=20 {
+            tx.execute("INSERT INTO messages_vec (rowid, embedding) VALUES (?1, ?2)", params![i, vector(i)]).unwrap();
+            tx.execute("INSERT INTO message_meta (rowid, dateMs, hasAttachments, shardYear) VALUES (?1, ?2, 0, 2000)", params![i, i * 100]).unwrap();
+        }
+        // Dated far before 1970 and far in the future (a message's own date is stored as it is):
+        // a missing bound leaves the dates open on that side.
+        for (i, date_ms) in [(21, -5_000_000_000_000i64), (22, 10_000_000_000_000)] {
+            tx.execute("INSERT INTO messages_vec (rowid, embedding) VALUES (?1, ?2)", params![i, vector(i)]).unwrap();
+            tx.execute("INSERT INTO message_meta (rowid, dateMs, hasAttachments, shardYear) VALUES (?1, ?2, 0, 2000)", params![i, date_ms]).unwrap();
+        }
+        // The nearest of all, with no metadata row.
+        tx.execute("INSERT INTO messages_vec (rowid, embedding) VALUES (99, ?1)", params![vector(0)]).unwrap();
+        tx.commit().unwrap();
+        let query = vector(0);
+        let nearest = |k: i64, from: Option<i64>, to: Option<i64>, eligible: Option<&[i64]>| {
+            let eligible: Option<HashSet<i64>> = eligible.map(|e| e.iter().copied().collect());
+            search_vec_candidates(&conn, "messages_vec", "message_meta", &query, k, from, to, eligible.as_ref())
+                .unwrap()
+                .iter()
+                .map(|c| c.0)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(nearest(3, None, None, None), [99, 1, 2]);
+        assert_eq!(nearest(3, Some(1000), Some(1500), None), [10, 11, 12]);
+        assert_eq!(nearest(3, Some(1500), Some(1500), None), [15]);
+        assert_eq!(nearest(4, Some(1800), None, None), [18, 19, 20, 22]);
+        assert_eq!(nearest(3, None, Some(200), None), [1, 2, 21]);
+        assert_eq!(nearest(3, Some(2100), Some(2200), None), Vec::<i64>::new());
+        assert_eq!(nearest(3, None, None, Some(&[17, 5, 2, 99])), [2, 5, 17]);
+        assert_eq!(nearest(3, Some(1000), None, Some(&[17, 5, 2, 99])), [17]);
+        assert_eq!(nearest(3, None, None, Some(&[])), Vec::<i64>::new());
+        drop(conn);
+        let _ = std::fs::remove_dir_all(profile);
     }
 
-    /// A hybrid search asks sqlite-vec for `limit` x CANDIDATE_MULTIPLIER nearest vectors (twice as
-    /// many with a field in the query), which it refuses past VEC_K_MAX; the `limit` is capped at
+    /// A search with dates finds a match inside them by meaning alone however many nearer messages lie
+    /// outside them (more than the vector candidates it asks for), and a search naming a field finds
+    /// one among the field's matches however many nearer messages lie outside the field (#26).
+    #[test]
+    fn search_finds_a_match_by_meaning_past_nearer_messages_outside_the_dates_or_the_field() {
+        let Some(engine) = embedding_engine() else { return };
+        let (profile, _path, mut conn, mut known_years) = temp_email_db("past-nearer");
+        let day = 86_400_000;
+        let start = chrono::Utc::now().timestamp_millis() - 30 * day;
+        let end = start + day;
+        let limit = 2;
+        // Twice the vector candidates a search asks for, and more.
+        let nearer = limit * config::hybrid::CANDIDATE_MULTIPLIER * 2 + 4;
+        let row = |id: &str, subject: &str, from: &str, body: &str, date_ms: i64| {
+            serde_json::json!({ "msgId": id, "subject": subject, "from": from, "body": body, "dateMs": date_ms })
+        };
+        // Near the queries by meaning, with none of their words (or synonyms) but "vacation".
+        let mut rows = vec![row("acc:/:inside", "Vacation", "alice@example.com", "The route and hotels for our summer holiday", start + day / 2)];
+        for i in 0..nearer {
+            // Nearer the first query, on both sides of the dates.
+            rows.push(row(&format!("acc:/:before-{i}"), "Vacation", "bob@example.com", "please plan the vacation itinerary", start - day - i));
+            rows.push(row(&format!("acc:/:after-{i}"), "Vacation", "bob@example.com", "please plan the vacation itinerary", end + day + i));
+            // Nearer the second, from someone else.
+            rows.push(row(&format!("acc:/:other-{i}"), "From Alice: plan the itinerary", "bob@example.com", "from alice plan the itinerary", start - 2 * day - i));
+        }
+        index_batch(&mut conn, &rows, Some(&engine), &mut known_years).unwrap();
+        let inside: i64 = conn.query_row("SELECT rowid FROM message_ids WHERE msgId = 'acc:/:inside'", [], |r| r.get(0)).unwrap();
+        for (q, params) in [
+            ("plan the vacation itinerary", serde_json::json!({ "from": start, "to": end, "limit": limit })),
+            ("from:alice plan the itinerary", serde_json::json!({ "ignoreDate": true, "limit": limit })),
+        ] {
+            // The match is not among the nearest over the whole archive.
+            let query = f32_vec_to_blob(&engine.embed(q).unwrap());
+            let nearest = search_vec_candidates(&conn, "messages_vec", "message_meta", &query, nearer, None, None, None).unwrap();
+            assert!(nearest.iter().all(|c| c.0 != inside), "{q}");
+            let results = search(&conn, q, &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap();
+            assert_eq!(result_ids(&results), vec!["acc:/:inside".to_string()], "{q} {params}");
+            assert_eq!(results[0]["snippet"], "", "found by meaning, not by its words");
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    /// A hybrid search asks sqlite-vec for `limit` x CANDIDATE_MULTIPLIER nearest vectors, which it
+    /// refuses past VEC_K_MAX; the `limit` is capped at
     /// SEARCH_LIMIT_MAX to keep within it. At any `limit` asked, a match by meaning alone is still
     /// found: the search stays hybrid. With a field, a match by meaning outside the field is left out.
     #[test]
@@ -4949,18 +5010,22 @@ pub(crate) mod tests {
     }
 
     /// When the vector search itself fails, an email or memory search still answers, by keyword
-    /// only (the error is logged).
+    /// only (the error is logged), within its dates and field, and the next search is answered.
     #[test]
     fn search_whose_vector_leg_fails_answers_by_keyword() {
         let Some(engine) = embedding_engine() else { return };
         let (profile, _path, mut conn, mut known_years) = temp_email_db("vector-fails");
+        let day = 86_400_000;
         let now = chrono::Utc::now().timestamp_millis();
-        index_batch(&mut conn, &[email_row("acc:/:budget", "Budget", "the quarterly budget", now)], Some(&engine), &mut known_years).unwrap();
+        let rows = [
+            email_row("acc:/:budget", "Budget", "the quarterly budget", now),
+            email_row("acc:/:older", "Review", "the quarterly budget", now - 30 * day),
+        ];
+        index_batch(&mut conn, &rows, Some(&engine), &mut known_years).unwrap();
         let (_memory_path, mut memory) = crate::fts::memory_db::open_or_create_memory_db(&profile).unwrap();
-        let exchange = serde_json::json!({ "memId": "budget", "role": "session", "sessionId": "persistent_chat",
-            "content": "the quarterly budget", "dateMs": now, "turnIndex": 0 });
-        crate::fts::memory_db::memory_index_batch(&mut memory, &[exchange], Some(&engine)).unwrap();
-        let params = serde_json::json!({ "ignoreDate": true });
+        let exchange = |id: &str, date_ms: i64, i: i64| serde_json::json!({ "memId": id, "role": "session", "sessionId": "persistent_chat",
+            "content": "the quarterly budget", "dateMs": date_ms, "turnIndex": i });
+        crate::fts::memory_db::memory_index_batch(&mut memory, &[exchange("budget", now, 0), exchange("older", now - 30 * day, 1)], Some(&engine)).unwrap();
         let with_denied = |conn: &Connection, name: &'static [u8], run: &dyn Fn() -> Vec<Value>| {
             let mut state = DeniedTable { name, denied: 0 };
             unsafe { ffi::sqlite3_set_authorizer(conn.handle(), Some(deny_reads_of_table), &mut state as *mut DeniedTable as *mut c_void) };
@@ -4969,14 +5034,34 @@ pub(crate) mod tests {
             assert!(state.denied > 0, "the vector search was refused");
             results
         };
+        let undated = serde_json::json!({ "ignoreDate": true });
+        let dated = serde_json::json!({ "from": now - day, "to": now + day });
+        let email_search = |q: &str, params: &Value| search(&conn, q, params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap();
+        let memory_search = |params: &Value| crate::fts::memory_db::memory_search(&memory, "budget", params, &SynonymLookup::new(), Some(&engine)).unwrap();
+        let sorted = |mut ids: Vec<String>| {
+            ids.sort();
+            ids
+        };
 
-        let email = with_denied(&conn, b"messages_vec", &|| search(&conn, "budget", &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap());
-        assert_eq!(result_ids(&email), ["acc:/:budget"]);
-        assert_ne!(email[0]["snippet"], "", "found by its words");
-        let memories = with_denied(&memory, b"memory_vec", &|| crate::fts::memory_db::memory_search(&memory, "budget", &params, &SynonymLookup::new(), Some(&engine)).unwrap());
-        assert_eq!(memories.len(), 1);
-        assert_eq!(memories[0]["memId"], "budget");
-        assert_ne!(memories[0]["snippet"], "", "found by its words");
+        // Without dates or a field, with dates, and with a field: the keyword matches in scope.
+        for (q, params, expected) in [
+            ("budget", &undated, vec!["acc:/:budget", "acc:/:older"]),
+            ("budget", &dated, vec!["acc:/:budget"]),
+            ("subject:budget quarterly", &undated, vec!["acc:/:budget"]),
+        ] {
+            let email = with_denied(&conn, b"messages_vec", &|| email_search(q, params));
+            assert_eq!(sorted(result_ids(&email)), expected, "{q} {params}");
+            assert!(email.iter().all(|r| r["snippet"] != ""), "found by their words");
+        }
+        for (params, expected) in [(&undated, vec!["budget", "older"]), (&dated, vec!["budget"])] {
+            let memories = with_denied(&memory, b"memory_vec", &|| memory_search(params));
+            assert_eq!(sorted(memories.iter().map(|r| r["memId"].as_str().unwrap().to_string()).collect()), expected, "{params}");
+            assert!(memories.iter().all(|r| r["snippet"] != ""), "found by their words");
+        }
+
+        // The next searches, with the vector table readable, are answered.
+        assert_eq!(result_ids(&email_search("budget", &dated)), ["acc:/:budget"]);
+        assert_eq!(memory_search(&dated).len(), 1);
         drop(conn);
         drop(memory);
         let _ = std::fs::remove_dir_all(profile);

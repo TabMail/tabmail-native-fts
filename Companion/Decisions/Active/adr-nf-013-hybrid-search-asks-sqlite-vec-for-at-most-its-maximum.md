@@ -60,6 +60,9 @@ best `limit`, so nearer messages outside the dates took the places of matches in
   `MIN_SCORE`. sqlite-vec 0.1.9 vec0 metadata
   columns accept range constraints in a KNN query, so the date can move into the vector table; #26
   starts with a study measuring that.
+  **Fixed 2026-10-22 by ADR-NF-016:** sqlite-vec searches only the rows within the dates and the
+  field (`rowid IN`, no schema change); `vec_candidates_within_dates` and `FIELD_VEC_MULTIPLIER` are
+  deleted, and `SEARCH_LIMIT_MAX` stays 512 as a number of its own.
 - Known limitation, approved by the owner 2026-10-21, fixed by the next PR in the train (#28, with
   iOS in step, tabmail-ios#240): a query word in at least half the rows can return nothing. SQLite
   FTS5 clamps that word's IDF to about 0, so its keyword score is about 0, and with a one-word

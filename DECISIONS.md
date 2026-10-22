@@ -162,11 +162,15 @@ archives of any size.
 
 ## ADR-NF-013: A Hybrid Search Asks sqlite-vec for at Most Its Maximum, and Email Search Keeps Its Dated Matches
 
-- **[Full ADR](Companion/Decisions/Active/adr-nf-013-hybrid-search-asks-sqlite-vec-for-at-most-its-maximum.md)** — #20: sqlite-vec k max 4,096 (`SQLITE_VEC_VEC0_K_MAX`) made searches with limit > 1,024 silently keyword-only; `cap_search_limit` caps a search with a query at `SEARCH_LIMIT_MAX` 512 (`FIELD_VEC_MULTIPLIER`); vector failure warns; email `vec_candidates_within_dates` before the merge + one read transaction; no vector within the dates falls back to keyword-only. Known limitations (owner-approved): nearest k over the whole archive, #26; a word in most rows can return nothing (FTS5 IDF clamp + `MIN_SCORE`), #28. (#28 fixed by ADR-NF-014)
+- **[Full ADR](Companion/Decisions/Active/adr-nf-013-hybrid-search-asks-sqlite-vec-for-at-most-its-maximum.md)** — #20: sqlite-vec k max 4,096 (`SQLITE_VEC_VEC0_K_MAX`) made searches with limit > 1,024 silently keyword-only; `cap_search_limit` caps a search with a query at `SEARCH_LIMIT_MAX` 512 (`FIELD_VEC_MULTIPLIER`); vector failure warns; email `vec_candidates_within_dates` before the merge + one read transaction; no vector within the dates falls back to keyword-only. Known limitations (owner-approved): nearest k over the whole archive, #26; a word in most rows can return nothing (FTS5 IDF clamp + `MIN_SCORE`), #28. (#28 fixed by ADR-NF-014; #26 fixed by ADR-NF-016)
 
 ## ADR-NF-014: A Hybrid Search Whose Merge Keeps Nothing Answers by Keyword
 
 - **[Full ADR](Companion/Decisions/Active/adr-nf-014-an-empty-merge-answers-by-keyword.md)** — #28: a word in at least half the rows (FTS5 IDF clamp to ~0) + weak vectors put every fused score under `MIN_SCORE` 0.1, so hybrid search returned nothing; now an empty merge with keyword matches falls back to `search_fts_only` / `memory_search_fts_only`. Scoring unchanged: study on real TB/iOS email + memory DBs, current `merge_results` best or tied in 4 of 5 DBs (unthresholded RRF higher only on a 25-turn Voice DB, by filling the page with non-matches) vs weighted RRF, min-max normalisation, query-length gating, keyword-only (known-item MRR@10). iOS in step, tabmail-ios#240.
+
+## ADR-NF-016: sqlite-vec Searches Only Within a Search's Dates and Field
+
+- **[Full ADR](Companion/Decisions/Active/adr-nf-016-sqlite-vec-searches-only-within-the-dates-and-the-field.md)** — #26: dated / field-scoped hybrid search asked sqlite-vec for the nearest k over the whole archive then filtered, missing meaning-only matches (real TB DB: vector recall 0.002-0.16 with dates, keyword-only fallback for most narrow windows); now KNN with `rowid IN (SELECT rowid FROM message_meta/memory_meta WHERE dateMs ... AND json_each(field rowids))`, exact and faster, no schema change. Deleted `vec_candidates_within_dates`, `FIELD_VEC_MULTIPLIER`; `SEARCH_LIMIT_MAX` stays 512 (const assert vs `VEC_K_MAX`). Rejected vec0 `dateMs` metadata column (migration), brute-force `vec_distance_cosine`. iOS port with tabmail-ios#242.
 
 ---
 

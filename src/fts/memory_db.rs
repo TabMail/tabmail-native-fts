@@ -495,17 +495,14 @@ fn memory_search_rows(
     // --- Vector candidates ---
     let query_embedding = engine.embed(query)?;
     let query_blob = super::db::f32_vec_to_blob(&query_embedding);
-    let vec_candidates = super::db::search_vec_candidates(conn, "memory_vec", &query_blob, candidate_limit).unwrap_or_else(|e| {
-        log::warn!("Memory vector search failed, searching by keyword only: {e}");
-        vec![]
-    });
+    let vec_candidates = super::db::search_vec_candidates(conn, "memory_vec", "memory_meta", &query_blob, candidate_limit, from_ts, to_ts, None)
+        .unwrap_or_else(|e| {
+            log::warn!("Memory vector search failed, searching by keyword only: {e}");
+            vec![]
+        });
 
-    // Keep only the vector candidates within the dates asked, before the merge keeps the best
-    // `limit` (the FTS candidates are filtered by date in their query).
-    let vec_candidates = super::db::vec_candidates_within_dates(conn, "memory_meta", vec_candidates, from_ts, to_ts)?;
-
-    // Fall back to FTS-only when no vector candidates are left: the vec table is empty (e.g., during
-    // embedding rebuild), or none of them is within the dates.
+    // Fall back to FTS-only when there are no vector candidates: the vec table is empty (e.g., during
+    // embedding rebuild), or no vector is within the dates.
     if vec_candidates.is_empty() {
         log::info!("No memory vector candidates (vec table may be empty, or none within the dates), falling back to FTS-only search");
         return memory_search_fts_only(conn, query, params, synonyms, ignore_date, limit);
@@ -545,7 +542,7 @@ fn memory_search_rows(
                 "rank": -hr.final_score
             }));
         } else {
-            // Vector-only result (within the dates: filtered before the merge)
+            // Vector-only result (within the dates: sqlite-vec searched only those)
             if let Some(meta) = fetch_memory_meta(conn, hr.rowid)? {
                 results.push(serde_json::json!({
                     "memId": meta.mem_id,
@@ -2340,6 +2337,42 @@ pub(crate) mod tests {
             let results = memory_search(&conn, "plan the vacation itinerary", &params, &SynonymLookup::new(), Some(&engine)).unwrap();
             assert_eq!(results.len(), 1, "at limit {limit}");
             assert_eq!(results[0]["memId"], "found");
+            assert_eq!(results[0]["snippet"], "", "found by meaning, not by its words");
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A memory search with dates finds an entry inside them by meaning alone however many nearer
+    /// entries lie outside them (more than the vector candidates it asks for) (#26).
+    #[test]
+    fn memory_search_finds_a_match_by_meaning_past_nearer_entries_outside_the_dates() {
+        let Some(engine) = embedding_engine() else { return };
+        let (dir, mut conn) = temp_memory_db("past-nearer");
+        let day = 86_400_000;
+        let start = chrono::Utc::now().timestamp_millis() - 30 * day;
+        let end = start + day;
+        let limit = 2;
+        let nearer = limit * config::hybrid::CANDIDATE_MULTIPLIER + 4;
+        let turn = |i: i64, content: &str, date_ms: i64| serde_json::json!({ "memId": format!("turn:{i}"), "role": "session",
+            "sessionId": "persistent_chat", "content": content, "dateMs": date_ms, "turnIndex": i });
+        let mut rows = vec![turn(0, "Here is the vacation itinerary", start + day / 2)];
+        for i in 1..=nearer {
+            rows.push(turn(i, "plan the vacation itinerary", start - day - i));
+            rows.push(turn(nearer + i, "plan the vacation itinerary", end + day + i));
+        }
+        memory_index_batch(&mut conn, &rows, Some(&engine)).unwrap();
+        // The nearer entries are more than the vector candidates a search asks for, and all nearer.
+        let inside: i64 = conn.query_row("SELECT rowid FROM memory_ids WHERE memId = 'turn:0'", [], |r| r.get(0)).unwrap();
+        let query = super::super::db::f32_vec_to_blob(&engine.embed("plan the vacation itinerary").unwrap());
+        let nearest = super::super::db::search_vec_candidates(&conn, "memory_vec", "memory_meta", &query, nearer * 2, None, None, None).unwrap();
+        assert!(nearest.len() as i64 == nearer * 2 && nearest.iter().all(|c| c.0 != inside));
+        for params in [
+            serde_json::json!({ "from": start, "to": end, "limit": limit }),
+            serde_json::json!({ "from": start, "to": end + day / 2, "limit": limit }),
+        ] {
+            let results = memory_search(&conn, "plan the vacation itinerary", &params, &SynonymLookup::new(), Some(&engine)).unwrap();
+            assert_eq!(results.iter().map(|r| r["memId"].as_str().unwrap()).collect::<Vec<_>>(), ["turn:0"], "{params}");
             assert_eq!(results[0]["snippet"], "", "found by meaning, not by its words");
         }
         drop(conn);
