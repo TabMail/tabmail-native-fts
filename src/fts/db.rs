@@ -4306,21 +4306,27 @@ mod tests {
     /// A hybrid search asks sqlite-vec for `limit` x CANDIDATE_MULTIPLIER nearest vectors (twice as
     /// many with a field in the query), which it refuses past VEC_K_MAX; the `limit` is capped at
     /// SEARCH_LIMIT_MAX to keep within it. At any `limit` asked, a match by meaning alone is still
-    /// found: the search stays hybrid.
+    /// found: the search stays hybrid. With a field, a match by meaning outside the field is left out.
     #[test]
     fn search_with_a_large_limit_finds_a_match_by_meaning() {
         let Some(engine) = embedding_engine() else { return };
         let (profile, _path, mut conn, mut known_years) = temp_email_db("large-limit");
         let now = chrono::Utc::now().timestamp_millis();
         let found = email_row("acc:/:found", "Vacation", "Here is the vacation itinerary", now);
-        index_batch(&mut conn, &[found], Some(&engine), &mut known_years).unwrap();
+        let outside_field = email_row("acc:/:outside-field", "Holiday", "Here is the vacation itinerary", now);
+        index_batch(&mut conn, &[found, outside_field], Some(&engine), &mut known_years).unwrap();
         let most = config::hybrid::SEARCH_LIMIT_MAX;
-        for q in ["plan the vacation itinerary", "subject:vacation plan the itinerary"] {
+        for (q, expected) in [
+            ("plan the vacation itinerary", vec!["acc:/:found", "acc:/:outside-field"]),
+            ("subject:vacation plan the itinerary", vec!["acc:/:found"]),
+        ] {
             for limit in [10, most, most + 1, 2_000, 4_000] {
                 let params = serde_json::json!({ "ignoreDate": true, "limit": limit });
                 let results = search(&conn, q, &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap();
-                assert_eq!(result_ids(&results), ["acc:/:found"], "{q} at limit {limit}");
-                assert_eq!(results[0]["snippet"], "", "found by meaning, not by its words");
+                let mut ids = result_ids(&results);
+                ids.sort();
+                assert_eq!(ids, expected, "{q} at limit {limit}");
+                assert!(results.iter().all(|r| r["snippet"] == ""), "found by meaning, not by their words");
             }
         }
         drop(conn);

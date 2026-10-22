@@ -87,8 +87,9 @@ Each test below was checked against a mutated build. "Red" means it fails there.
   limits 10, 512, 513 and 4,000 return 10, 512, 512, 512; a memory listing returns the 588 it asks
   for. Red with no cap (email and memory each).
 - `search_with_a_large_limit_finds_a_match_by_meaning` (unit, model loaded): limits 10, 512, 513,
-  2,000 and 4,000, plain and with `subject:`, all find the match by meaning alone. Red with no cap
-  and with the cap at 1,024. `memory_search_with_a_large_limit_finds_a_match_by_meaning` does the
+  2,000 and 4,000, plain and with `subject:`, all find the match by meaning alone; the plain search
+  also finds a match by meaning whose subject is another, and the `subject:` search leaves it out.
+  Red with no cap, with the cap at 1,024, and with the field filter skipped past limit 10. `memory_search_with_a_large_limit_finds_a_match_by_meaning` does the
   same for memory; red with no memory cap.
 - `search_with_no_vector_within_the_dates_answers_by_keyword` and
   `memory_search_with_no_vector_within_the_dates_answers_by_keyword` (unit, model loaded: 20
@@ -113,6 +114,8 @@ Each test below was checked against a mutated build. "Red" means it fails there.
   `memory_vec` refused): email and memory search each answer the keyword match. Red when a vector
   error fails the search.
 - `test_searches_at_the_callers_limit_are_hybrid` (process, model loaded): email search at limits
-  2,000 and 4,000, one at 2,000 with dates, a `subject:` search at 4,000, and memory searches at
-  2,000 and 4,000 each find the match by meaning alone, and the dated one leaves out the nearer
-  message outside the dates. Red with no k limit (the first version's evidence).
+  2,000 and 4,000, one at 2,000 with dates, `subject:` searches at 10 and 4,000, and memory
+  searches at 2,000 and 4,000 each find the match by meaning alone; the dated one leaves out the
+  nearer message outside the dates, and the `subject:` ones the match by meaning in another
+  subject. Red with no k limit (the first version's evidence) and with the field filter skipped
+  past limit 10.

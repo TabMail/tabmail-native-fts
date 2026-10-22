@@ -408,6 +408,8 @@ class TestRustHelperProcess(unittest.TestCase):
                  "body": "Here is the vacation itinerary", "dateMs": now, "hasAttachments": False},
                 {"msgId": "outside", "subject": "Vacation", "from_": "agent@example.com", "to_": "me@example.com",
                  "body": "Here is the vacation itinerary again", "dateMs": now - 10 * day, "hasAttachments": False},
+                {"msgId": "outside-field", "subject": "Holiday", "from_": "agent@example.com", "to_": "me@example.com",
+                 "body": "Here is the vacation itinerary", "dateMs": now - 10 * day, "hasAttachments": False},
             ]
             _send_message(proc, {"id": "3", "method": "indexBatch", "params": {"rows": emails}})
             self.assert_success(_read_message(proc), "indexBatch")
@@ -435,12 +437,13 @@ class TestRustHelperProcess(unittest.TestCase):
             query = "plan the vacation itinerary"
             for limit in (2000, 4000):
                 undated = search("search", {"q": query, "limit": limit, "ignoreDate": True})
-                self.assertEqual(sorted(r["uniqueId"] for r in undated), ["found", "outside"], limit)
+                self.assertEqual(sorted(r["uniqueId"] for r in undated), ["found", "outside", "outside-field"], limit)
                 self.assertTrue(all(r["snippet"] == "" for r in undated), "found by meaning, not by their words")
             dated = search("search", {"q": query, "limit": 2000, "from": now - day, "to": now + day})
             self.assertEqual([r["uniqueId"] for r in dated], ["found"])
-            scoped = search("search", {"q": "subject:vacation plan the itinerary", "limit": 4000, "ignoreDate": True})
-            self.assertEqual(sorted(r["uniqueId"] for r in scoped), ["found", "outside"])
+            for limit in (10, 4000):
+                scoped = search("search", {"q": "subject:vacation plan the itinerary", "limit": limit, "ignoreDate": True})
+                self.assertEqual(sorted(r["uniqueId"] for r in scoped), ["found", "outside"], limit)
             for limit in (2000, 4000):
                 memory = search("memorySearch", {"q": query, "limit": limit, "ignoreDate": True})
                 self.assertEqual([r["memId"] for r in memory], ["found"], limit)
