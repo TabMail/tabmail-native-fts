@@ -1538,8 +1538,8 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A word with an apostrophe finds the text it was written as (`o` + `brien`), not the
-    /// joined word.
+    /// A word with an inner apostrophe finds both spellings: the text it was written as
+    /// (`o` + `brien`) and the joined word.
     #[test]
     fn memory_search_finds_words_with_apostrophes() {
         let (dir, mut conn) = temp_memory_db("apostrophe");
@@ -1550,7 +1550,9 @@ pub(crate) mod tests {
             "[USER]: plan launch\n\n[AGENT]: Noted.",
             "[USER]: Notesheet for the client\n\n[AGENT]: Noted.",
             "[USER]: notes for the customer\n\n[AGENT]: Noted.",
-            "[USER]: Tommy sent the files\n\n[AGENT]: Noted."]
+            "[USER]: Tommy sent the files\n\n[AGENT]: Noted.",
+            "[USER]: Don took the bus\n\n[AGENT]: Noted.",
+            "[USER]: lunch at noon\n\n[AGENT]: Noted."]
             .iter()
             .enumerate()
             .map(|(i, content)| serde_json::json!({
@@ -1562,12 +1564,19 @@ pub(crate) mod tests {
         memory_index_batch(&mut conn, &rows, None).unwrap();
         let synonyms = SynonymLookup::new();
         let params = serde_json::json!({"ignoreDate": true});
-        for q in ["O'Brien", "don't forget", "Don't"] {
+        let found = |q: &str| -> Vec<String> {
             let found = memory_search(&conn, q, &params, &synonyms, None)
                 .unwrap_or_else(|e| panic!("memory search for {q:?} failed: {e:?}"));
-            let ids: Vec<_> = found.iter().map(|r| r["memId"].as_str().unwrap_or_default()).collect();
-            assert_eq!(ids, ["turn:0"], "{q:?}");
+            let mut ids: Vec<_> = found.iter().map(|r| r["memId"].as_str().unwrap_or_default().to_string()).collect();
+            ids.sort();
+            ids
+        };
+        // Never "Don took": a one-letter last part is not a prefix. A word beside it keeps its
+        // prefix star, and a kept NOT excludes both spellings.
+        for q in ["O'Brien", "O\u{2019}Brien", "don't forget", "Don't", "Don\u{2019}t", "don't forg", "forg don't"] {
+            assert_eq!(found(q), ["turn:0", "turn:1"], "{q:?}");
         }
+        assert_eq!(found("lunch NOT don't"), ["turn:9"]);
         // A possessive finds what it names; a word in a run without synonyms keeps its prefix
         // star (`notes` finds "Notesheet"), and so does one beside a possessive, which does not
         // expand; a private-use character is indexed and kept.

@@ -1,6 +1,6 @@
 # ADR-NF-011: Search Query Text Reaches FTS5 as Text
 
-**Status:** Accepted (2026-10-18). Callers: Thunderbird (email search tool, memory search tool,
+**Status:** Accepted (2026-10-18; both apostrophe spellings added 2026-10-22, native-fts #31). Callers: Thunderbird (email search tool, memory search tool,
 Chat History search), TabMail Voice (memory search). No wire change.
 
 ## Context
@@ -51,18 +51,27 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
    (`clients` has none) stays a word, so it does not take the prefix star off the words beside it.
    Its removed `s` counts toward the 4 bytes (`Tom's` searches
    `"Tom"*`, as 0.11.8's `Toms*` did).
-3. A word expanding to synonyms becomes the generated `(a OR b …)` group; when any group is
-   present every term is joined with an explicit `AND`. Whether a
-   group is present is read from the terms as written (only a group starts with `(`), so it can't
-   disagree with how fields took their values (a separate pre-scan did, for runs of empty fields
-   like `from: to: meeting`).
+   A word whose only punctuation is an inner apostrophe (straight `'` or typographic `’`) searches
+   both spellings, as a group: `("don't" OR "dont"*)`, so `Don't` finds "Don't" and "Dont" (#31).
+   The typed spelling is a prefix, as any word with punctuation, unless its last part is one
+   letter: `t*` has no prefix index (`FTS_PREFIXES` is 2 3 4), so it merges every indexed word
+   starting with t (32 to 106 ms median on a 40,000-message archive), and `"don't"*` finds
+   "Don took". The joined spelling is a plain word (`("we'll"* OR "well"*)`, `("I'm" OR "Im")`).
+   A spelling group is not a synonym group: it leaves its neighbours' prefix stars alone
+   (`don't forg` finds "forget"). A field's value keeps one spelling, as typed.
+3. A word expanding to synonyms becomes the generated `(a OR b …)` group; when any group
+   (synonyms or spellings) is present every term is joined with an explicit `AND`. Whether a
+   group is present is read from the terms as written (only a group starts with `(`; the builder
+   records which are synonym groups), so it can't disagree with how fields took their values (a
+   separate pre-scan did, for runs of empty fields like `from: to: meeting`).
 4. A capital `AND`, `OR` or `NOT` (FTS5's operators are case-sensitive) standing between two
    written terms stays that operator, in place of the join: `from:"a@example.com" OR
    to:"a@example.com"`, `"budget plan" OR greetings`, `alice NOT carol`. One that is first, last,
    after another operator, or left with no written term after it is dropped (`NOT budget` searches
    `budget`), so it can never be a syntax error. Lowercase, quoted or a field's value, it is text.
    The word after a kept `NOT` searches what was typed, without its synonyms: expanded, it would
-   also exclude the left side's (`invoice NOT receipt` found nothing). FTS5's grammar decides what
+   also exclude the left side's (`invoice NOT receipt` found nothing). Both spellings are what
+   was typed, so `lunch NOT don't` excludes "Dont" too. FTS5's grammar decides what
    a kept `NOT` excludes: without a synonym group, the rest of the run of words (`alice NOT carol
    zebra` is alice NOT (carol zebra), as in 0.11.8); with one, the explicit `AND` leaves it only
    the next term.
@@ -101,9 +110,14 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
   `db::tests::test_search_operators_separators_and_text_less_words` and its memory twin pin the
   operators both ways, tabs / no-break / ideographic spaces as separators, and that a word with no
   letter or digit beside a synonym group hides no match;
-  `db::tests::test_search_finds_words_with_apostrophes` and its memory twin find `O'Brien` and
-  `don't forget` in the mail that has them and not in the one spelling `OBrien` / `Dont` (red
-  with the apostrophe strip restored: each finds only the other row), and `Sarah's`,
+  `db::tests::test_search_finds_words_with_apostrophes` and its memory twin find `O'Brien`,
+  `O’Brien`, `don't forget`, `Don't` and `Don’t` in the text spelling them either way, never
+  "Don took" (one-letter last part), with a neighbour's prefix star kept (`don't forg`), both
+  spellings excluded by `lunch NOT don't`, and `subject:O'Brien` exact (each red on the #14
+  builder or under its #31 mutant: no spellings, typed spelling always starred, spelling group
+  treated as a synonym group, NOT operand without spellings, field value with spellings, no AND
+  join); `query::tests::a_word_with_an_inner_apostrophe_searches_both_spellings` pins the
+  written groups; and `Sarah's`,
   `Sarah’s invoice`, `John's flight`, `team's budget` find what they name (red without the
   possessive strip), `Tom's` finds "Tommy" (red without the `s` counted), `Sarah's.`, `Sarah's...`,
   `Sarah's,` and `(Sarah's)` find Sarah (red with the possessive read at the end of the word), and `'budget'` still
@@ -128,18 +142,20 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
   `body:https://example.com/x` (red when the field ends at the last colon).
 - A differential against the released 0.11.8 helper (Thunderbird-shaped `search` and
   `memorySearch`, with and without the embedding model, 2026-10-21) found no query that newly
-  fails, and no common query shape that finds less, apart from the intended apostrophe change
-  above (`O'Brien`, `don't`) and the possessive of a short word ending in `ie` (`Tie's` searches
+  fails, and no common query shape that finds less, apart from the apostrophe change of the
+  next item (since replaced by both spellings, #31) and the possessive of a short word ending in `ie` (`Tie's` searches
   `tie*`, not 0.11.8's `Ties*`, and misses mail saying only "ties"), a variant form the owner's
   rule in the next item leaves to the vector side. Two differences find fewer rows on purpose: a
   capitalized field (`Subject:Invoice`) now filters the hybrid search's vector candidates, which
   0.11.8's case-sensitive check missed, so vector neighbours outside the field are no longer
   returned; and a typographic possessive (`comment’s`) now expands like the straight one, so its
   run of words loses the automatic prefix star.
-- The apostrophe trade was approved by the owner on 2026-10-21: a word with an inner apostrophe
-  finds the text as typed (`O'Brien`, `don't`), and no longer the spelling without it (`Don't`
-  misses "Dont", `you're` misses "your", `we'll` misses "well", which 0.11.8 found by deleting
-  the apostrophe). The owner's rule, the same day: a keyword miss of a variant or misspelled form
+- The apostrophe trade approved by the owner on 2026-10-21 (a word with an inner apostrophe
+  finds the text as typed and no longer the spelling without it: `Don't` missed "Dont") was
+  replaced on 2026-10-22 by both spellings (#31; the owner: "shouldn't don't find dont in
+  keywords still?"). Accepted precision cost, the same as 0.11.8's: `we'll` also finds "well",
+  `you're` also finds "your". A kept `NOT` beside a spelling group binds as beside a synonym
+  group: the explicit `AND` leaves it only the next term. The owner's rule, 2026-10-21: a keyword miss of a variant or misspelled form
   of the typed word is acceptable, as those are typos the vector side of hybrid search finds.
 - Accepted limitations, approved by the owner on 2026-10-21 (common query shapes must find what
   0.11.8 found; a recall difference on rare input is acceptable, and synonym expansion stays):

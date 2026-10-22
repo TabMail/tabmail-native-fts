@@ -2728,8 +2728,8 @@ pub(crate) mod tests {
         assert_eq!(search_ok(&conn, "plan \u{e000}", &known_years), vec!["acc:/:mark".to_string()]);
     }
 
-    /// A word with an apostrophe finds the text it was written as: the tokenizer splits
-    /// `O'Brien` into `o` and `brien`, and the word must search those, not `obrien`.
+    /// A word with an inner apostrophe finds both spellings: the text it was written as (the
+    /// tokenizer splits `O'Brien` into `o` and `brien`) and the one without it ("OBrien").
     #[test]
     fn test_search_finds_words_with_apostrophes() {
         let (conn, mut known_years) = setup_test_db();
@@ -2752,15 +2752,26 @@ pub(crate) mod tests {
         insert_test_message_full(&conn, &mut known_years, "acc:/:team", "Team budget", "carol@example.com", "team@example.com", "", a_week_ago);
         insert_test_message_full(&conn, &mut known_years, "acc:/:expense", "Travel expense report", "agent@example.com", "office@example.com", "", a_week_ago);
         insert_test_message_full(&conn, &mut known_years, "acc:/:r5", "Files", "agent@example.com", "office@example.com", "Tommy sent the files.", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:took", "Bus", "agent@example.com", "office@example.com", "Don took the bus.", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:noon", "Lunch at noon", "agent@example.com", "office@example.com", "See you there.", a_week_ago);
         let found = |q: &str| -> Vec<String> {
             let mut ids = search_ok(&conn, q, &known_years);
             ids.sort();
             ids
         };
-        let apostrophe = vec!["acc:/:apostrophe".to_string()];
-        for q in ["O'Brien", "o'brien", "subject:O'Brien", "don't forget", "Don't"] {
-            assert_eq!(found(q), apostrophe, "{q:?}");
+        // Never "Don took": a one-letter last part is not a prefix.
+        let both = vec!["acc:/:apostrophe".to_string(), "acc:/:joined".to_string()];
+        for q in ["O'Brien", "o'brien", "O\u{2019}Brien", "don't forget", "Don't", "Don\u{2019}t", "DON'T"] {
+            assert_eq!(found(q), both, "{q:?}");
         }
+        // A word beside it keeps its prefix star, as beside any word.
+        for q in ["don't forg", "forg don't"] {
+            assert_eq!(found(q), both, "{q:?}");
+        }
+        // A kept NOT excludes both spellings.
+        assert_eq!(found("lunch NOT don't"), vec!["acc:/:noon".to_string()]);
+        // A field's value is searched as typed.
+        assert_eq!(found("subject:O'Brien"), vec!["acc:/:apostrophe".to_string()]);
         // A possessive finds what it names, written with or without the 's.
         let sarah = vec!["acc:/:sarah".to_string(), "acc:/:sarahs".to_string()];
         for q in ["Sarah's", "Sarah\u{2019}s invoice", "SARAH'S", "Sarah's.", "Sarah's...", "Sarah's,", "(Sarah's)", "Sarah's?"] {
