@@ -521,6 +521,13 @@ fn memory_search_rows(
         limit as usize,
     );
 
+    // Words matched but the merge kept nothing (a word in most entries scores about 0 by keyword, and a
+    // weak vector match adds too little to reach MIN_SCORE): answer by keyword, as with no vectors.
+    if merged.is_empty() && !text_pairs.is_empty() {
+        log::info!("Memory hybrid merge kept none of {} keyword matches, falling back to FTS-only search", text_pairs.len());
+        return memory_search_fts_only(conn, query, params, synonyms, ignore_date, limit);
+    }
+
     // --- Assemble results ---
     let mut fts_map: HashMap<i64, MemoryFtsCandidate> =
         fts_candidates.into_iter().map(|c| (c.rowid, c)).collect();
@@ -2270,6 +2277,31 @@ pub(crate) mod tests {
             .iter().map(|r| r["memId"].as_str().unwrap().to_string()).collect();
         found.sort();
         let mut expected: Vec<String> = (0..20).map(|i| format!("turn:{i}")).collect();
+        expected.sort();
+        assert_eq!(found, expected);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A memory search whose merge keeps nothing although words match answers by keyword: a word in
+    /// most entries scores about 0 by keyword, and a one-word query's vector scores are weak (#28).
+    #[test]
+    fn memory_search_whose_merge_keeps_nothing_answers_by_keyword() {
+        let Some(engine) = embedding_engine() else { return };
+        let (dir, mut conn) = temp_memory_db("merge-keeps-nothing");
+        let now = chrono::Utc::now().timestamp_millis();
+        let turn = |i: i64, content: &str| serde_json::json!({ "memId": format!("turn:{i}"), "role": "session",
+            "sessionId": "persistent_chat", "content": content, "dateMs": now - i, "turnIndex": i });
+        // "budget" once among other topics: in most entries, so it weighs little by keyword, and far
+        // from the one-word query by meaning.
+        let mut rows: Vec<Value> = (0..30).map(|i| turn(i, &format!("we talked about the parking, the lunch order {i}, the weather, the train schedule and the budget"))).collect();
+        rows.extend((30..40).map(|i| turn(i, "rain tomorrow")));
+        memory_index_batch(&mut conn, &rows, Some(&engine)).unwrap();
+        let params = serde_json::json!({ "ignoreDate": true, "limit": 100 });
+        let mut found: Vec<String> = memory_search(&conn, "budget", &params, &SynonymLookup::new(), Some(&engine)).unwrap()
+            .iter().map(|r| r["memId"].as_str().unwrap().to_string()).collect();
+        found.sort();
+        let mut expected: Vec<String> = (0..30).map(|i| format!("turn:{i}")).collect();
         expected.sort();
         assert_eq!(found, expected);
         drop(conn);

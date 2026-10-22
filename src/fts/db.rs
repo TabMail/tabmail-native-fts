@@ -1096,6 +1096,13 @@ fn search_rows(
         limit as usize,
     );
 
+    // Words matched but the merge kept nothing (a word in most messages scores about 0 by keyword, and a
+    // weak vector match adds too little to reach MIN_SCORE): answer by keyword, as with no vectors.
+    if merged.is_empty() && !text_pairs.is_empty() {
+        log::info!("Hybrid merge kept none of {} keyword matches, falling back to FTS-only search", text_pairs.len());
+        return search_fts_only(conn, query, params, synonyms, limit, known_years);
+    }
+
     // --- Assemble results ---
     let mut fts_map: HashMap<i64, FtsCandidate> =
         fts_candidates.into_iter().map(|c| (c.rowid, c)).collect();
@@ -4587,6 +4594,27 @@ mod tests {
         let params = serde_json::json!({ "from": now - day, "to": now + day, "limit": 100 });
         let mut found = result_ids(&search(&conn, "budget", &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap());
         found.sort();
+        assert_eq!(found, expected);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    /// A search whose merge keeps nothing although words match answers by keyword: a word in most
+    /// messages scores about 0 by keyword (FTS5 clamps its IDF), and a one-word query's vector scores
+    /// are weak, so every merged score fell under MIN_SCORE and the search returned nothing (#28).
+    #[test]
+    fn search_whose_merge_keeps_nothing_answers_by_keyword() {
+        let Some(engine) = embedding_engine() else { return };
+        let (profile, _path, mut conn, mut known_years) = temp_email_db("merge-keeps-nothing");
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut rows: Vec<Value> = (0..30).map(|i| email_row(&format!("acc:/:budget-{i}"), "Budget", "the quarterly budget", now - i)).collect();
+        rows.extend((0..10).map(|i| email_row(&format!("acc:/:weather-{i}"), "Weather", "rain tomorrow", now - 100 - i)));
+        index_batch(&mut conn, &rows, Some(&engine), &mut known_years).unwrap();
+        let params = serde_json::json!({ "ignoreDate": true, "limit": 100 });
+        let mut found = result_ids(&search(&conn, "budget", &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap());
+        found.sort();
+        let mut expected: Vec<String> = (0..30).map(|i| format!("acc:/:budget-{i}")).collect();
+        expected.sort();
         assert_eq!(found, expected);
         drop(conn);
         let _ = std::fs::remove_dir_all(profile);

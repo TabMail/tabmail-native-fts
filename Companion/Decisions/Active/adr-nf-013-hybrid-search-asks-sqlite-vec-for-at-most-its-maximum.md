@@ -67,6 +67,8 @@ best `limit`, so nearer messages outside the dates took the places of matches in
   rows with "budget", the query `budget` returns 0). The scoring predates this decision; the
   callers' searches meet it now that they are hybrid. #28 replaces the absolute-score merge after a
   study on real databases.
+  **Fixed 2026-10-21 by ADR-NF-014:** the study kept the absolute-score merge (it ranked best); a
+  merge that keeps nothing now answers by keyword.
 
 ## Rejected
 
