@@ -178,10 +178,12 @@ pub fn open_or_create_memory_db(fts_dir: &Path) -> anyhow::Result<(PathBuf, Conn
     // Verify FTS5 is available
     super::db::ensure_fts5_available(&conn)?;
 
-    // Check if schema exists
+    // Check if schema exists. memory_meta is created after memory_fts, so a memory whose creation
+    // stopped between them (a full disk, a crash) is completed by init's IF NOT EXISTS statements
+    // instead of failing the date index below on every start.
     let exists: Option<String> = conn
         .query_row(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='memory_fts'",
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='memory_meta'",
             [],
             |r| r.get(0),
         )
@@ -609,14 +611,17 @@ fn memory_list_all(
         }
     }
 
-    sql.push_str(" ORDER BY dateMs DESC LIMIT ?");
+    // Entries sharing a millisecond go in the order they were written (rowid), as the trim's
+    // oldest-first order does; without it their order follows the plan (the date index reads them
+    // backwards).
+    sql.push_str(" ORDER BY dateMs DESC, rowid ASC LIMIT ?");
     bind.push(rusqlite::types::Value::from(limit));
     let sql = format!(
         r#"
         SELECT fts.memId, fts.role, fts.content, fts.sessionId, meta.dateMs
         FROM ({sql}) meta
         CROSS JOIN memory_fts fts ON fts.rowid = meta.rowid
-        ORDER BY meta.dateMs DESC
+        ORDER BY meta.dateMs DESC, meta.rowid ASC
         "#
     );
 
@@ -1144,11 +1149,11 @@ pub fn memory_read_by_timestamp(
         FROM (
             SELECT rowid, dateMs FROM memory_meta
             WHERE dateMs >= ?1 AND dateMs <= ?2
-            ORDER BY dateMs ASC
+            ORDER BY dateMs ASC, rowid ASC
             LIMIT 50
         ) meta
         CROSS JOIN memory_fts fts ON fts.rowid = meta.rowid
-        ORDER BY meta.dateMs ASC
+        ORDER BY meta.dateMs ASC, meta.rowid ASC
         "#,
     )?;
 
@@ -2534,7 +2539,6 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-
     /// What a cold reader reads from disk for a one-entry `memoryRead` and, on another cold reader, a
     /// dated listing page, in a memory of `n` short entries a millisecond apart.
     fn cold_reads_by_date(db: &Path, now: i64, n: i64) -> (i32, i32) {
@@ -2576,13 +2580,16 @@ pub(crate) mod tests {
     /// A read by date finds its entries by the date index, not by scanning every entry's date: a
     /// one-entry `memoryRead` and a three-entry dated listing page read about as many pages from
     /// disk in a memory of 20,000 entries as in one of 200 (ADR-NF-015; without the index the
-    /// large memory's dates alone take over a hundred pages).
+    /// large memory's dates alone take over a hundred pages). Each memory is one memoryClear has
+    /// rebuilt, as the writer's own reopen builds it too.
     #[test]
     fn a_read_by_date_costs_the_same_whatever_the_memorys_size() {
         let now = chrono::Utc::now().timestamp_millis();
         let mut cost = vec![];
         for n in [200, 20_000] {
-            let (dir, mut conn) = temp_memory_db(&format!("date-index-{n}"));
+            let (dir, conn) = temp_memory_db(&format!("date-index-{n}"));
+            let (mut conn, deleted) = memory_clear_rebuild_standalone(&dir.join("memory.db"), conn).unwrap();
+            deleted.unwrap();
             short_entries(&mut conn, now, n);
             drop(conn);
             cost.push(cold_reads_by_date(&dir.join("memory.db"), now, n));
@@ -2610,6 +2617,64 @@ pub(crate) mod tests {
         let (read, listed) = cold_reads_by_date(&db, now, n);
         assert!(read * 5 < before_read, "a one-entry read: {before_read} pages before the open, {read} after");
         assert!(listed * 5 < before_listed, "a listing page: {before_listed} pages before the open, {listed} after");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Entries that share a millisecond come back in the order they were written, in the listing
+    /// (newest millisecond first) and in memoryRead (oldest first), whichever page cuts the group.
+    #[test]
+    fn entries_sharing_a_millisecond_keep_the_order_they_were_written_in() {
+        let t = chrono::Utc::now().timestamp_millis();
+        let (dir, mut conn) = temp_memory_db("date-ties");
+        // Written a..g; b, d and f a millisecond after a, c, e and g.
+        let rows: Vec<Value> = ["a", "b", "c", "d", "e", "f", "g"]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| serde_json::json!({ "memId": format!("turn:{id}"), "role": "session", "sessionId": "persistent_chat",
+                "content": format!("exchange {id}"), "dateMs": t + (i as i64 % 2), "turnIndex": i }))
+            .collect();
+        memory_index_batch(&mut conn, &rows, None).unwrap();
+        let ids = |found: Vec<Value>| found.iter().map(|r| r["memId"].as_str().unwrap().trim_start_matches("turn:").to_string()).collect::<Vec<_>>().join(",");
+        let list = |params: Value| ids(memory_search(&conn, "", &params, &SynonymLookup::new(), None).unwrap());
+        for (params, want) in [
+            (serde_json::json!({ "ignoreDate": true, "limit": 10 }), "b,d,f,a,c,e,g"),
+            (serde_json::json!({ "from": t, "to": t + 1, "limit": 10 }), "b,d,f,a,c,e,g"),
+            (serde_json::json!({ "ignoreDate": true, "limit": 1 }), "b"),
+            (serde_json::json!({ "ignoreDate": true, "limit": 4 }), "b,d,f,a"),
+            (serde_json::json!({ "to": t, "limit": 2 }), "a,c"),
+        ] {
+            assert_eq!(list(params.clone()), want, "{params}");
+        }
+        assert_eq!(ids(memory_read_by_timestamp(&conn, t, 0).unwrap()), "a,c,e,g");
+        assert_eq!(ids(memory_read_by_timestamp(&conn, t, 1).unwrap()), "a,c,e,g,b,d,f");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A memory whose creation stopped after its first table (the disk filled, or the helper died
+    /// between the statements) opens on the next start, and works.
+    #[test]
+    fn a_memory_whose_creation_stopped_after_its_first_table_opens_and_works() {
+        let (dir, conn) = temp_memory_db("half-created");
+        drop(conn);
+        let db = dir.join("memory.db");
+        crate::fts::db::delete_database_files(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("PRAGMA max_page_count = 6;").unwrap();
+        assert!(init_memory_database(&conn).is_err(), "the disk fills during creation");
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('memory_fts', 'memory_meta', 'memory_ids')").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(tables, ["memory_fts"], "the creation stopped after memory_fts");
+        drop(conn);
+
+        let (_path, mut conn) = open_or_create_memory_db(&dir).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        short_entries(&mut conn, now, 2);
+        let listed = memory_search(&conn, "", &serde_json::json!({ "ignoreDate": true, "limit": 10 }), &SynonymLookup::new(), None).unwrap();
+        assert_eq!(listed.iter().map(|r| r["memId"].as_str().unwrap()).collect::<Vec<_>>(), ["turn:1", "turn:0"]);
+        assert_eq!(memory_read_by_timestamp(&conn, now, 0).unwrap()[0]["content"], "exchange 0");
+        drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }
 
