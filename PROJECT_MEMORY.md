@@ -8,6 +8,8 @@
 
 ## Architecture
 
+- **2026-10-21 TLS audit:** CVE-2026-111943 affects `rustls-webpki` 0.103.15 and `webpki-roots` 1.0.9 in v0.11.8's ureq path; fixes are 0.103.16 and 1.0.10, validated with 151 tests and pending release. [Audit evidence](Companion/Memory/Current/2026-10-21-emsign-tls-audit.md).
+
 Native messaging host for full-text search + semantic search. Communicates with the Thunderbird add-on via native messaging protocol (stdin/stdout JSON).
 
 ### Multi-Threading Model
