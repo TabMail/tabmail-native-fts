@@ -115,6 +115,10 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
   `memorySearch`, with and without the embedding model, 2026-10-21) found no query that newly
   fails, and no common query shape that finds less, apart from the intended apostrophe change
   above (`O'Brien`, `don't`).
+- The apostrophe trade was approved by the owner on 2026-10-21: a word with an inner apostrophe
+  finds the text as typed (`O'Brien`, `don't`), and no longer the spelling without it (`Don't`
+  misses "Dont", `you're` misses "your", `we'll` misses "well", which 0.11.8 found by deleting
+  the apostrophe).
 - Accepted limitations, approved by the owner on 2026-10-21 (common query shapes must find what
   0.11.8 found; a recall difference on rare input is acceptable, and synonym expansion stays):
   - Rare input: a few code points are read differently from unicode61's Unicode 6.1 data (code
