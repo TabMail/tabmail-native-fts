@@ -94,6 +94,8 @@ The date filter also runs on sqlite-vec's top k over the whole memory: when k or
 outside the dates are nearer the query, no match inside them keeps its vector score, so an entry
 inside the dates that matches only by meaning is missed (one with the words is still found by the
 keyword leg). Asking sqlite-vec for the dates directly would need the date in the vector table.
+(Fixed 2026-10-22 by ADR-NF-016, without that: sqlite-vec searches only the rowids `memory_meta`
+dates within the dates.)
 The email hybrid search in `db.rs` still drops vector candidates outside the dates after its merge,
 as memory did; it shows only once #20 lets its vector search run, so it is fixed there (noted on #20;
 fixed 2026-10-21 by ADR-NF-013).
