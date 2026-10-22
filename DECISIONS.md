@@ -159,7 +159,7 @@ archives of any size.
 
 ## ADR-NF-013: A Hybrid Search Asks sqlite-vec for at Most Its Maximum, and Email Search Keeps Its Dated Matches
 
-- **[Full ADR](Companion/Decisions/Active/adr-nf-013-hybrid-search-asks-sqlite-vec-for-at-most-its-maximum.md)** — #20: sqlite-vec k max 4,096 (`SQLITE_VEC_VEC0_K_MAX`) made searches with limit > 1,024 silently keyword-only; `cap_search_limit` caps a search with a query at `SEARCH_LIMIT_MAX` 512 (`FIELD_VEC_MULTIPLIER`); vector failure warns; email `vec_candidates_within_dates` before the merge + one read transaction; no vector within the dates falls back to keyword-only. Known limitation: nearest k over the whole archive, #26.
+- **[Full ADR](Companion/Decisions/Active/adr-nf-013-hybrid-search-asks-sqlite-vec-for-at-most-its-maximum.md)** — #20: sqlite-vec k max 4,096 (`SQLITE_VEC_VEC0_K_MAX`) made searches with limit > 1,024 silently keyword-only; `cap_search_limit` caps a search with a query at `SEARCH_LIMIT_MAX` 512 (`FIELD_VEC_MULTIPLIER`); vector failure warns; email `vec_candidates_within_dates` before the merge + one read transaction; no vector within the dates falls back to keyword-only. Known limitations (owner-approved): nearest k over the whole archive, #26; a word in most rows can return nothing (FTS5 IDF clamp + `MIN_SCORE`), #28.
 
 ---
 
