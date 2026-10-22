@@ -2706,7 +2706,7 @@ pub(crate) mod tests {
         }
         // A possessive finds what it names, written with or without the 's.
         let sarah = vec!["acc:/:sarah".to_string(), "acc:/:sarahs".to_string()];
-        for q in ["Sarah's", "Sarah\u{2019}s invoice", "SARAH'S"] {
+        for q in ["Sarah's", "Sarah\u{2019}s invoice", "SARAH'S", "Sarah's.", "Sarah's...", "Sarah's,", "(Sarah's)", "Sarah's?"] {
             assert_eq!(found(q), sarah, "{q:?}");
         }
         assert_eq!(found("John's flight"), vec!["acc:/:john".to_string()]);

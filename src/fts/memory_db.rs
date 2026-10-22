@@ -1566,7 +1566,7 @@ pub(crate) mod tests {
         // A possessive finds what it names; a word in a run without synonyms keeps its prefix
         // star (`notes` finds "Notesheet"), and so does one beside a possessive, which does not
         // expand; a private-use character is indexed and kept.
-        for (q, want) in [("team's budget", "turn:2"), ("notes \"Jane Doe\" roadmapping budget", "turn:2"), ("plan \u{e000}", "turn:3"), ("client's notes", "turn:5"), ("Tom's", "turn:7")] {
+        for (q, want) in [("team's budget", "turn:2"), ("notes \"Jane Doe\" roadmapping budget", "turn:2"), ("plan \u{e000}", "turn:3"), ("client's notes", "turn:5"), ("Tom's", "turn:7"), ("Tom's.", "turn:7")] {
             let found = memory_search(&conn, q, &params, &synonyms, None)
                 .unwrap_or_else(|e| panic!("memory search for {q:?} failed: {e:?}"));
             let ids: Vec<_> = found.iter().map(|r| r["memId"].as_str().unwrap_or_default()).collect();

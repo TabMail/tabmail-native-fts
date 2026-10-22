@@ -153,7 +153,11 @@ fn scoped_column<'a>(w: &'a str, columns: &[(&str, &'a str)]) -> Option<(&'a str
 /// alphanumeric also counts the marks and enclosed-letter symbols (Ⓜ, 🅿) that have the
 /// Alphabetic property, which unicode61 does not index.
 fn has_text(s: &str) -> bool {
-    s.chars().any(|c| (c.is_alphanumeric() && !c.is_mark() && !c.is_symbol()) || c.is_other_private_use())
+    s.chars().any(is_text)
+}
+
+fn is_text(c: char) -> bool {
+    (c.is_alphanumeric() && !c.is_mark() && !c.is_symbol()) || c.is_other_private_use()
 }
 
 fn phrase(p: &str) -> Option<String> {
@@ -162,7 +166,8 @@ fn phrase(p: &str) -> Option<String> {
 
 /// A word's searched text, whether the user ended it with `*`, and whether a possessive was
 /// removed: one trailing `*`, then trailing `/` and `?`, then quote marks at either end
-/// (`'budget'`), then one possessive `'s` are removed. Any other apostrophe stays: the tokenizer
+/// (`'budget'`), then one possessive `'s` are removed. A possessive is found at the end of the
+/// word's text, so `Sarah's.` reads as `Sarah's`. Any other apostrophe stays: the tokenizer
 /// splits `O'Brien` into `o` and `brien`, and the quoted word searches them as a phrase.
 /// `John's` searches `John`, which (stemmed) also finds "John's".
 fn prepare_word(w: &str) -> Option<(String, bool, bool)> {
@@ -171,7 +176,7 @@ fn prepare_word(w: &str) -> Option<(String, bool, bool)> {
         None => (w, false),
     };
     let w = w.trim_end_matches(['/', '?']).trim_matches(['\'', '\u{2018}', '\u{2019}']);
-    let stripped = POSSESSIVES.iter().find_map(|p| w.strip_suffix(p));
+    let stripped = POSSESSIVES.iter().find_map(|p| w.trim_end_matches(|c| !is_text(c)).strip_suffix(p));
     let core = stripped.unwrap_or(w).to_string();
     has_text(&core).then_some((core, star, stripped.is_some()))
 }
@@ -226,6 +231,9 @@ mod tests {
         assert_eq!(build("client's notes", &[]), r#""client"* "notes"*"#);
         // A possessive's `s` counts toward the automatic star's 4 bytes.
         assert_eq!(build("Tom's it's", &[]), r#""Tom"* "it""#);
+        // A possessive is read at the end of the word's text, before any trailing punctuation.
+        assert_eq!(build("Sarah's. (Sarah's) John's?.", &[]), r#""Sarah"* "(Sarah"* "John"*"#);
+        assert_eq!(build("O'Brien.", &[]), r#""O'Brien."*"#);
         // Quote marks around a word are not part of it.
         assert_eq!(build("'budget'", &[]), build("budget", &[]));
         assert_eq!(build("\u{2018}abcd\u{2019}", &[]), r#""abcd"*"#);

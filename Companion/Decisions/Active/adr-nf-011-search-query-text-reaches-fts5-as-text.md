@@ -45,8 +45,10 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
    either end (`'budget'`) and one possessive `'s` (straight or typographic), which are removed:
    quoted, `O'Brien` is the phrase `o brien` the tokenizer indexed, and `John's` searches `John`,
    as 0.11.8 effectively did (only one trailing `*`, then trailing `/` and `?`, then the quote
-   marks, then the possessive are removed from a word). A possessive does not expand to synonyms
-   (0.11.8 searched `client's` as `clients`, which has none), so it does not take the prefix star
+   marks, then the possessive are removed from a word; the possessive is found at the end of the
+   word's text, so `Sarah's.` and `(Sarah's)` read as `Sarah's`). A possessive does not expand to
+   synonyms (0.11.8 searched `client's` as `clients`, which has none; the few nouns whose plural is
+   a synonym key, such as `comment's`, lose that accidental expansion), so it does not take the prefix star
    off the words beside it, and its removed `s` counts toward the 4 bytes (`Tom's` searches
    `"Tom"*`, as 0.11.8's `Toms*` did).
 3. A word expanding to synonyms becomes the generated `(a OR b …)` group; when any group is
@@ -98,7 +100,8 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
   `don't forget` in the mail that has them and not in the one spelling `OBrien` / `Dont` (red
   with the apostrophe strip restored: each finds only the other row), and `Sarah's`,
   `Sarah’s invoice`, `John's flight`, `team's budget` find what they name (red without the
-  possessive strip), `Tom's` finds "Tommy" (red without the `s` counted), and `'budget'` still
+  possessive strip), `Tom's` finds "Tommy" (red without the `s` counted), `Sarah's.`, `Sarah's...`,
+  `Sarah's,` and `(Sarah's)` find Sarah (red with the possessive read at the end of the word), and `'budget'` still
   expands;
   `db::tests::test_search_prefix_star_is_decided_per_run_of_words` and the memory twin (red with
   a query-wide star rule), including `client's notes` finding "Notesheet for the client" and not
