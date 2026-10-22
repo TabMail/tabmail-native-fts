@@ -58,6 +58,11 @@ pub mod sqlite {
     pub const FTS_TOKENIZE: &str = "porter unicode61 remove_diacritics 2";
 
     pub const SEARCH_DEFAULT_LIMIT: i64 = 50;
+    /// Capital `NOT` operators a search query keeps. FTS5 nests each `NOT` (it flattens `AND`
+    /// and `OR` chains) and refuses an expression deeper than 256, so a query with more answered
+    /// an error (#22). Well below 256, to leave room for the groups and column filters around
+    /// them; an exclusion past it is left out of the query.
+    pub const SEARCH_MAX_KEPT_NOTS: usize = 100;
     pub const SEARCH_SNIPPET_TOKENS: i64 = 16;
     pub const SEARCH_DEBUG_SAMPLE_LIMIT: i64 = 10;
     pub const QUERY_BY_DATE_RANGE_DEFAULT_LIMIT: i64 = 1000;

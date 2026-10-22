@@ -2754,6 +2754,8 @@ pub(crate) mod tests {
         insert_test_message_full(&conn, &mut known_years, "acc:/:r5", "Files", "agent@example.com", "office@example.com", "Tommy sent the files.", a_week_ago);
         insert_test_message_full(&conn, &mut known_years, "acc:/:took", "Bus", "agent@example.com", "office@example.com", "Don took the bus.", a_week_ago);
         insert_test_message_full(&conn, &mut known_years, "acc:/:noon", "Lunch at noon", "agent@example.com", "office@example.com", "See you there.", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:r6", "L'\u{e9}tudiant arrives", "agent@example.com", "office@example.com", "", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:r7", "L\u{e9}tude draft", "agent@example.com", "office@example.com", "", a_week_ago);
         let found = |q: &str| -> Vec<String> {
             let mut ids = search_ok(&conn, q, &known_years);
             ids.sort();
@@ -2768,8 +2770,17 @@ pub(crate) mod tests {
         for q in ["don't forg", "forg don't"] {
             assert_eq!(found(q), both, "{q:?}");
         }
+        // A joined spelling of 4 bytes is a prefix, counted in bytes: "lét" finds "Létude".
+        assert_eq!(found("l'\u{e9}t"), vec!["acc:/:r6".to_string(), "acc:/:r7".to_string()]);
         // A kept NOT excludes both spellings.
         assert_eq!(found("lunch NOT don't"), vec!["acc:/:noon".to_string()]);
+        // More capital NOTs than FTS5's expression depth allows (#22), beside a spelling group or
+        // a synonym group: the first ones exclude, the rest are left out, and the query answers.
+        let nots = |n: usize| (0..n).map(|k| format!(" NOT qz{k:03}")).collect::<String>();
+        for n in [255, 256, 257, 300] {
+            assert_eq!(found(&format!("don't NOT obrien{}", nots(n))), vec!["acc:/:apostrophe".to_string()], "{n} NOTs");
+            assert_eq!(found(&format!("'budget'{}", nots(n))), found("'budget'"), "{n} NOTs");
+        }
         // A field's value is searched as typed.
         assert_eq!(found("subject:O'Brien"), vec!["acc:/:apostrophe".to_string()]);
         // A possessive finds what it names, written with or without the 's.
@@ -4675,6 +4686,9 @@ pub(crate) mod tests {
             search(&conn, q, &params, &synonyms, Some(&engine), &known_years)
                 .unwrap_or_else(|e| panic!("hybrid search for {q:?} failed: {e:?}"));
         }
+        let many_nots = format!("budget don't{}", (0..300).map(|k| format!(" NOT qz{k:03}")).collect::<String>());
+        search(&conn, &many_nots, &params, &synonyms, Some(&engine), &known_years)
+            .unwrap_or_else(|e| panic!("hybrid search with 300 NOTs failed: {e:?}"));
         let results = search(&conn, "budget plan meeting", &params, &synonyms, Some(&engine), &known_years).unwrap();
         assert_eq!(result_ids(&results), vec!["acc:/:one".to_string()]);
         drop(conn);

@@ -69,6 +69,10 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
    to:"a@example.com"`, `"budget plan" OR greetings`, `alice NOT carol`. One that is first, last,
    after another operator, or left with no written term after it is dropped (`NOT budget` searches
    `budget`), so it can never be a syntax error. Lowercase, quoted or a field's value, it is text.
+   At most `SEARCH_MAX_KEPT_NOTS` (100) capital `NOT`s are kept: FTS5 nests each one and refuses
+   an expression deeper than 256, and a spelling group adds a level, so `don't` followed by 256
+   `NOT`s failed where the #14 builder answered. An exclusion past the cap is left out (the `NOT`
+   and the term after it), so the query answers with the first 100 exclusions applied (#22).
    The word after a kept `NOT` searches what was typed, without its synonyms: expanded, it would
    also exclude the left side's (`invoice NOT receipt` found nothing). Both spellings are what
    was typed, so `lunch NOT don't` excludes "Dont" too. FTS5's grammar decides what
@@ -122,7 +126,11 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
   rule counting characters (`c'è`), and a possessive counting toward the 4 bytes; the
   `QUERY_FRAGMENTS` fuzz holds `don't`, `O’Brien` and `I'm`, so both seeded fuzz tests build
   spelling groups beside every operator, field and punctuation (red without the AND join), and
-  both hybrid any-text tests send contractions, scoped and under a kept `NOT`; and `Sarah's`,
+  both hybrid any-text tests send contractions, scoped and under a kept `NOT`, and 300 kept `NOT`s;
+  both apostrophe tests find "Létude" for `l'ét` (a joined spelling's 4 bytes counted in bytes)
+  and answer `don't NOT obrien` followed by 255 to 300 more `NOT`s with the first exclusion applied
+  (red without the `NOT` cap); `query::tests::operators_between_terms_stay_operators` pins the
+  cap; and `Sarah's`,
   `Sarah’s invoice`, `John's flight`, `team's budget` find what they name (red without the
   possessive strip), `Tom's` finds "Tommy" (red without the `s` counted), `Sarah's.`, `Sarah's...`,
   `Sarah's,` and `(Sarah's)` find Sarah (red with the possessive read at the end of the word), and `'budget'` still
@@ -171,8 +179,8 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
     `from:"jane doe"`) takes it without starting a new run of words. Typed parentheses are text, not grouping
     (`(budget OR plan) review`; 0.11.8 failed on them).
   - Pre-existing in 0.11.8, tracked separately: a kept `NOT` is not applied to hybrid vector
-    candidates (#21); a long chain of kept `NOT`s (about 256) exceeds FTS5's expression depth and
-    fails (#22).
+    candidates (#21). A long chain of kept `NOT`s (about 256) exceeded FTS5's expression depth and
+    failed (#22); fixed with #31 by keeping at most 100 (Decision 4).
 - `role:` / `content:` no longer scope in memory search, and `msgId:` / `attachmentNames:` no longer
   scope in mail search (all undocumented and unused by any client).
 - Both behaviour changes (`from :` with a space before the colon no longer scopes; memory search has

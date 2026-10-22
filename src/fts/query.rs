@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use crate::config;
 use crate::fts::synonyms::SynonymLookup;
 use unicode_categories::UnicodeCategories;
 
@@ -36,6 +37,7 @@ pub fn build_fts_match(
         let mut out: Vec<Term> = vec![];
         let mut operator: Option<&'static str> = None;
         let mut run = 0usize;
+        let mut kept_nots = 0usize;
         let mut i = 0usize;
         while i < items.len() {
             let item = items[i];
@@ -75,7 +77,15 @@ pub fn build_fts_match(
                 },
             };
             if let Some((text, synonym_group)) = term {
-                out.push(Term { operator: operator.take(), text, run, synonym_group });
+                let operator = operator.take();
+                if operator == Some("NOT") && !out.is_empty() {
+                    // Past the cap, an exclusion is left out: the query still answers.
+                    if kept_nots == config::sqlite::SEARCH_MAX_KEPT_NOTS {
+                        continue;
+                    }
+                    kept_nots += 1;
+                }
+                out.push(Term { operator, text, run, synonym_group });
             }
         }
         out
@@ -359,6 +369,12 @@ mod tests {
         let q = build("invoice NOT receipt", &[]);
         assert!(q.starts_with('(') && q.ends_with(r#") NOT "receipt""#), "{q}");
         assert_eq!(build("NOT receipt", &[]), build("receipt", &[]));
+        // At most SEARCH_MAX_KEPT_NOTS capital NOTs are kept (FTS5 nests each one, #22); an
+        // exclusion past them is left out.
+        let cap = crate::config::sqlite::SEARCH_MAX_KEPT_NOTS;
+        let q = build(&format!("abcd{}", (0..cap + 5).map(|k| format!(" NOT qz{k:03}")).collect::<String>()), &[]);
+        assert_eq!(q.matches(" NOT ").count(), cap, "{q}");
+        assert!(q.ends_with(&format!(r#"NOT "qz{:03}"*"#, cap - 1)), "{q}");
     }
 
     #[test]
