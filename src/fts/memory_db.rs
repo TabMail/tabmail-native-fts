@@ -1121,9 +1121,11 @@ pub fn memory_read_by_timestamp(
         to_ms
     );
 
-    // The rows are chosen from memory_meta (dates only) before any content is read, as the listing
-    // does: with a plain JOIN SQLite scans memory_fts, reading the whole memory's content for each
-    // read (Thunderbird reads each entry it shows at its own millisecond). CROSS JOIN keeps that order.
+    // The rows are chosen from memory_meta (dates only; it has no index on dateMs, so every
+    // entry's date is still scanned) before any content is read, as the listing does. Joined from
+    // memory_fts, as this query used to be, SQLite read every row's content for each read, and
+    // Thunderbird reads each entry it shows at its own millisecond. CROSS JOIN makes memory_meta
+    // the outer loop by rule rather than by the planner's estimate.
     let mut stmt = conn.prepare(
         r#"
         SELECT fts.memId, fts.role, fts.content, fts.sessionId, meta.dateMs
@@ -2234,17 +2236,20 @@ pub(crate) mod tests {
     }
 
     /// A read gives the entries within the dates, oldest first, each whole, at most 50, and reads
-    /// only those entries' content, not the whole memory's: one of a hundred long ones reads a few
-    /// pages from disk, well under the hundred they take.
+    /// only those entries' content, not the whole memory's: one of 200 long ones reads a few pages
+    /// from disk, and 50 of them about 50 entries' worth, well under the 200 the window holds. The
+    /// entries are written newest first (a re-feed of older history writes against the dates), so
+    /// the oldest by date are not the first written.
     #[test]
     fn memory_read_gives_the_entries_within_the_dates_and_reads_only_their_content() {
         let (dir, mut conn) = temp_memory_db("read-reads");
         let now = chrono::Utc::now().timestamp_millis();
-        let rows: Vec<Value> = (0..100)
+        let rows: Vec<Value> = (0..200)
             .map(|i| serde_json::json!({ "memId": format!("turn:{i}"), "role": "session", "sessionId": "persistent_chat",
                 "content": format!("exchange {i} {}", "word ".repeat(1000)), "dateMs": now + i, "turnIndex": i }))
             .collect();
-        memory_index_batch(&mut conn, &rows, None).unwrap();
+        let written: Vec<Value> = rows.iter().rev().cloned().collect();
+        memory_index_batch(&mut conn, &written, None).unwrap();
         let ids = |read: &[Value]| read.iter().map(|r| r["memId"].as_str().unwrap().to_string()).collect::<Vec<_>>();
         // Both bounds inclusive, oldest first, each whole.
         let window = memory_read_by_timestamp(&conn, now + 10, 2).unwrap();
@@ -2256,7 +2261,7 @@ pub(crate) mod tests {
             assert_eq!(row["dateMs"], now + i as i64);
         }
         // At most 50, the oldest within the dates.
-        let wide = memory_read_by_timestamp(&conn, now + 50, 1000).unwrap();
+        let wide = memory_read_by_timestamp(&conn, now + 100, 1000).unwrap();
         assert_eq!(ids(&wide), (0..50).map(|i| format!("turn:{i}")).collect::<Vec<_>>());
         drop(conn);
         // A cold reader with a tiny cache and no memory map, so each page it needs is a miss.
@@ -2274,6 +2279,12 @@ pub(crate) mod tests {
         assert_eq!(one[0]["content"], rows[42]["content"]);
         assert!(read > 0, "the cold reader read from disk");
         assert!(read < 30, "a read of one entry read {read} pages");
+        let before = misses();
+        let wide = memory_read_by_timestamp(&conn, now + 100, 1000).unwrap();
+        let read = misses() - before;
+        assert_eq!(wide.len(), 50);
+        assert!(read > 0, "the cold reader read from disk");
+        assert!(read < 130, "a read of 50 of 200 entries read {read} pages");
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }
