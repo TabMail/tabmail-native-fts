@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use crate::config;
 use crate::fts::synonyms::SynonymLookup;
 use unicode_categories::UnicodeCategories;
 
@@ -10,6 +11,9 @@ use unicode_categories::UnicodeCategories;
 /// Every word and every `"quoted phrase"` reaches FTS5 as a string, so nothing typed breaks the
 /// query: parentheses and punctuation are searched as text, and non-ASCII text is kept whole.
 /// A capital AND, OR or NOT between two terms stays the operator; anywhere else it is dropped.
+/// At most `SEARCH_MAX_KEPT_NOTS` NOTs are kept, and a later exclusion is left out (FTS5 nests
+/// each NOT and refuses an expression deeper than 256).
+/// A word whose only punctuation is an inner apostrophe searches both spellings (`don't`, `dont`).
 /// `name:word`, `name:"phrase"` and `name: word` scope to a column only when `columns` names it
 /// (typed name, case-insensitive → table column); any other `x:` is text.
 pub fn build_fts_match(
@@ -24,17 +28,19 @@ pub fn build_fts_match(
     let q = q.replace('\0', " ");
     let items = scan(&q);
 
-    // A word with synonyms becomes an OR group; FTS5 then needs an explicit AND between all
-    // terms. As before, no word in the same run of words (between quoted phrases) as a group gets
-    // an automatic prefix star. Which runs have a group is read from the terms written, so it
-    // can't disagree with how they were written.
+    // A word with synonyms becomes an OR group, and so does a word with an inner apostrophe (its
+    // two spellings); FTS5 then needs an explicit AND between all terms. As before, no word in the
+    // same run of words (between quoted phrases) as a synonym group gets an automatic prefix star;
+    // a spelling group leaves its neighbours' stars alone. Which runs have a synonym group is read
+    // from the terms written, so it can't disagree with how they were written.
     // A capital AND, OR or NOT standing between two terms stays the FTS5 operator, as the old
     // builder passed it through (`from:"a@example.com" OR to:"a@example.com"`); anywhere else
     // (first, last, after another operator) it is dropped.
-    let render = |grouped_runs: &[bool]| -> Vec<(Option<&'static str>, String, usize)> {
-        let mut out: Vec<(Option<&'static str>, String, usize)> = vec![];
+    let render = |grouped_runs: &[bool]| -> Vec<Term> {
+        let mut out: Vec<Term> = vec![];
         let mut operator: Option<&'static str> = None;
         let mut run = 0usize;
+        let mut kept_nots = 0usize;
         let mut i = 0usize;
         while i < items.len() {
             let item = items[i];
@@ -47,11 +53,12 @@ pub fn build_fts_match(
                     continue;
                 }
             }
+            // A synonym group in this run of words; a spelling group does not count.
             let has_or_groups = grouped_runs.get(run).copied().unwrap_or(false);
             let term = match item {
                 Item::Phrase(p) => {
                     run += 1;
-                    phrase(p)
+                    phrase(p).map(|p| (p, false))
                 }
                 Item::Word(w) => match scoped_column(w, columns) {
                     // name:"phrase" and name: word take the next item as the value.
@@ -59,28 +66,38 @@ pub fn build_fts_match(
                         let value = items.get(i).copied();
                         i += 1;
                         match value {
-                            Some(Item::Phrase(p)) => phrase(p).map(|v| format!("{col}:{v}")),
-                            Some(Item::Word(w)) => word(w, false, has_or_groups, synonyms).map(|v| format!("{col}:{v}")),
+                            Some(Item::Phrase(p)) => phrase(p).map(|v| (format!("{col}:{v}"), false)),
+                            Some(Item::Word(w)) => word(w, false, false, has_or_groups, synonyms).map(|(v, _)| (format!("{col}:{v}"), false)),
                             None => None,
                         }
                     }
-                    Some((col, value)) => word(value, false, has_or_groups, synonyms).map(|v| format!("{col}:{v}")),
+                    // A field's value is searched as typed: no synonyms, no second spelling.
+                    Some((col, value)) => word(value, false, false, has_or_groups, synonyms).map(|(v, _)| (format!("{col}:{v}"), false)),
                     // A kept NOT excludes the word typed: its synonyms would exclude the left
-                    // side's too (`invoice NOT receipt` would find nothing).
-                    None => word(w, use_synonyms && !(operator == Some("NOT") && !out.is_empty()), has_or_groups, synonyms),
+                    // side's too (`invoice NOT receipt` would find nothing). Both spellings are
+                    // the word typed, so `NOT don't` excludes "Dont" too.
+                    None => word(w, use_synonyms && !(operator == Some("NOT") && !out.is_empty()), true, has_or_groups, synonyms),
                 },
             };
-            if let Some(term) = term {
-                out.push((operator.take(), term, run));
+            if let Some((text, synonym_group)) = term {
+                let operator = operator.take();
+                if operator == Some("NOT") && !out.is_empty() {
+                    // Past the cap, an exclusion is left out: the query still answers.
+                    if kept_nots == config::sqlite::SEARCH_MAX_KEPT_NOTS {
+                        continue;
+                    }
+                    kept_nots += 1;
+                }
+                out.push(Term { operator, text, run, synonym_group });
             }
         }
         out
     };
-    let join = |terms: Vec<(Option<&str>, String, usize)>, joiner: &str| -> String {
+    let join = |terms: Vec<Term>, joiner: &str| -> String {
         let mut s = String::new();
-        for (n, (op, term, _)) in terms.into_iter().enumerate() {
+        for (n, term) in terms.into_iter().enumerate() {
             if n > 0 {
-                match op {
+                match term.operator {
                     Some(op) => {
                         s.push(' ');
                         s.push_str(op);
@@ -89,25 +106,36 @@ pub fn build_fts_match(
                     None => s.push_str(joiner),
                 }
             }
-            s.push_str(&term);
+            s.push_str(&term.text);
         }
         s
     };
 
     let terms = render(&[]);
-    // Only a synonym group starts with "(": words and phrases start with a quote, scoped terms
-    // with their column.
-    let mut grouped_runs = vec![false; terms.last().map_or(0, |(_, _, run)| run + 1)];
-    for (_, term, run) in &terms {
-        if term.starts_with('(') {
-            grouped_runs[*run] = true;
+    let mut grouped_runs = vec![false; terms.last().map_or(0, |t| t.run + 1)];
+    for t in &terms {
+        if t.synonym_group {
+            grouped_runs[t.run] = true;
         }
     }
     if grouped_runs.contains(&true) {
         join(render(&grouped_runs), " AND ")
+    } else if terms.iter().any(|t| t.text.starts_with('(')) {
+        // Only a group starts with "(": words and phrases start with a quote, scoped terms with
+        // their column.
+        join(terms, " AND ")
     } else {
         join(terms, " ")
     }
+}
+
+/// A written term: the operator kept before it, its FTS5 text, its run of words, and whether it
+/// is a synonym group (which takes the automatic prefix star off the words in its run).
+struct Term {
+    operator: Option<&'static str>,
+    text: String,
+    run: usize,
+    synonym_group: bool,
 }
 
 /// FTS5's binary operators, which are case-sensitive.
@@ -195,20 +223,46 @@ fn has_punctuation(core: &str) -> bool {
     core.chars().any(|c| !c.is_alphanumeric() && c != '_' && !c.is_other_private_use())
 }
 
-fn word(w: &str, use_synonyms: bool, has_or_groups: bool, synonyms: &SynonymLookup) -> Option<String> {
+/// Apostrophes a word may hold inside it (`don't`, `don’t`).
+const APOSTROPHES: [char; 2] = ['\'', '\u{2019}'];
+
+/// The word written without its apostrophes, when an inner apostrophe is its only punctuation
+/// (`don't` → `dont`, `rock'n'roll` → `rocknroll`; `a'b-c` has none).
+fn joined_spelling(core: &str) -> Option<String> {
+    let joined = core.replace(APOSTROPHES, "");
+    (joined.len() < core.len() && !has_punctuation(&joined)).then_some(joined)
+}
+
+/// The FTS5 text of a word, and whether it is a synonym group. `spellings` lets a word with an
+/// inner apostrophe search both spellings.
+fn word(w: &str, use_synonyms: bool, spellings: bool, has_or_groups: bool, synonyms: &SynonymLookup) -> Option<(String, bool)> {
     let (core, star, possessive) = prepare_word(w)?;
     // A possessive looks up its word with the `s`, as 0.11.8 did: `comment's` gets the synonyms
     // of `comments`, and `client's` (`clients` has none) keeps its neighbours' prefix stars.
     let key = if possessive { format!("{core}s") } else { core.clone() };
     if use_synonyms && expands(&key, star, synonyms) {
-        return Some(synonyms.expand(&key));
+        return Some((synonyms.expand(&key), true));
+    }
+    let star_mark = |prefix: bool| if prefix { "*" } else { "" };
+    // A word with an inner apostrophe finds the text as written (the tokenizer indexed `don't` as
+    // `don` `t`) and the spelling without it ("Dont"), as 0.11.8 searched it. The typed spelling
+    // is a prefix, as any word with punctuation, unless its last part is one letter: `t*` would
+    // merge every indexed word starting with t (no one-letter prefix index), and finds "Don took".
+    // The joined spelling is a plain word.
+    if spellings {
+        if let Some(joined) = joined_spelling(&core) {
+            let last_part_is_a_letter = core.rsplit(APOSTROPHES).next().is_some_and(|t| t.chars().count() == 1);
+            let typed = star || !last_part_is_a_letter;
+            let plain = star || (joined.len() + usize::from(possessive) >= 4 && !has_or_groups);
+            return Some((format!("(\"{core}\"{} OR \"{joined}\"{})", star_mark(typed), star_mark(plain)), false));
+        }
     }
     // A word with punctuation is a phrase of its parts ("dmarc-supp" → [dmarc, supp]); the star
     // keeps a partial address matching while it is typed. Plain words of 4+ bytes get one too,
     // unless synonym groups are present; a possessive's `s` counts, as 0.11.8 searched `Tom's`
     // as `Toms*`.
     let prefix = star || has_punctuation(&core) || (core.len() + usize::from(possessive) >= 4 && !has_or_groups);
-    Some(format!("\"{core}\"{}", if prefix { "*" } else { "" }))
+    Some((format!("\"{core}\"{}", star_mark(prefix)), false))
 }
 
 #[cfg(test)]
@@ -227,9 +281,9 @@ mod tests {
         assert_eq!(build("50% off", &[]), r#""50%"* "off""#);
         assert_eq!(build("NOT (budget", &[]), r#""(budget"*"#);
         assert_eq!(build(r#"say "hi there"#, &[]), r#""say" "hi there""#);
-        // One possessive 's is removed; any other apostrophe stays.
+        // One possessive 's is removed; a word with an inner apostrophe searches both spellings.
         assert_eq!(build("it's gone?", &[]), r#""it" "gone"*"#);
-        assert_eq!(build("Sarah\u{2019}s O'Brien's don't", &[]), r#""Sarah"* "O'Brien"* "don't"*"#);
+        assert_eq!(build("Sarah\u{2019}s O'Brien's don't", &[]), r#""Sarah"* AND ("O'Brien"* OR "OBrien"*) AND ("don't" OR "dont"*)"#);
         // A possessive looks up its word with the `s`: `clients` has no synonyms, so its
         // neighbours keep their stars; `comments` has.
         assert_eq!(build("client's notes", &[]), r#""client"* "notes"*"#);
@@ -255,6 +309,33 @@ mod tests {
         // Private-use characters are indexed, so they stay.
         assert_eq!(build("\u{24d0} \u{1f17f}\u{fe0f} \u{0301} \u{93e}", &[]), "");
         assert_eq!(build("\u{e000}", &[]), "\"\u{e000}\"");
+    }
+
+    #[test]
+    fn a_word_with_an_inner_apostrophe_searches_both_spellings() {
+        // The typed spelling is a prefix unless its last part is one letter; the joined one is a
+        // plain word (a star from 4 bytes); a user's star stars both.
+        assert_eq!(build("I'm we'll", &[]), r#"("I'm" OR "Im") AND ("we'll"* OR "well"*)"#);
+        assert_eq!(build("don\u{2019}t*", &[]), "(\"don\u{2019}t\"* OR \"dont\"*)");
+        assert_eq!(build("rock'n'roll", &[]), r#"("rock'n'roll"* OR "rocknroll"*)"#);
+        assert_eq!(build("I'm*", &[]), r#"("I'm"* OR "Im"*)"#);
+        // One letter counts characters, not bytes; a possessive counts toward the 4 bytes.
+        assert_eq!(build("c'\u{e8}", &[]), "(\"c'\u{e8}\" OR \"c\u{e8}\")");
+        assert_eq!(build("a'bc's", &[]), r#"("a'bc"* OR "abc"*)"#);
+        // Any other punctuation: one spelling, as typed.
+        assert_eq!(build("a'b-c", &[]), r#""a'b-c"*"#);
+        // A field's value is searched as typed.
+        assert_eq!(build("from:o'brien", COLUMNS), r#"from_:"o'brien"*"#);
+        assert_eq!(build("subject: O'Brien", COLUMNS), r#"subject:"O'Brien"*"#);
+        // A spelling group leaves its neighbours' stars alone, and a kept NOT excludes both
+        // spellings.
+        assert_eq!(build("don't forg", &[]), r#"("don't" OR "dont"*) AND "forg"*"#);
+        assert_eq!(build("abcd NOT don't", &[]), r#""abcd"* NOT ("don't" OR "dont"*)"#);
+        // Beside a synonym group, the joined spelling gets no automatic star, as any word.
+        let q = build("meeting don't", &[]);
+        assert!(q.starts_with('(') && q.ends_with(r#") AND ("don't" OR "dont")"#), "{q}");
+        let q = build("meeting we'll*", &[]);
+        assert!(q.starts_with('(') && q.ends_with(r#") AND ("we'll"* OR "well"*)"#), "{q}");
     }
 
     #[test]
@@ -291,6 +372,12 @@ mod tests {
         let q = build("invoice NOT receipt", &[]);
         assert!(q.starts_with('(') && q.ends_with(r#") NOT "receipt""#), "{q}");
         assert_eq!(build("NOT receipt", &[]), build("receipt", &[]));
+        // At most SEARCH_MAX_KEPT_NOTS capital NOTs are kept (FTS5 nests each one, #22); an
+        // exclusion past them is left out.
+        let cap = crate::config::sqlite::SEARCH_MAX_KEPT_NOTS;
+        let q = build(&format!("abcd{}", (0..cap + 5).map(|k| format!(" NOT qz{k:03}")).collect::<String>()), &[]);
+        assert_eq!(q.matches(" NOT ").count(), cap, "{q}");
+        assert!(q.ends_with(&format!(r#"NOT "qz{:03}"*"#, cap - 1)), "{q}");
     }
 
     #[test]

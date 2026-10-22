@@ -1538,8 +1538,8 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A word with an apostrophe finds the text it was written as (`o` + `brien`), not the
-    /// joined word.
+    /// A word with an inner apostrophe finds both spellings: the text it was written as
+    /// (`o` + `brien`) and the joined word.
     #[test]
     fn memory_search_finds_words_with_apostrophes() {
         let (dir, mut conn) = temp_memory_db("apostrophe");
@@ -1550,7 +1550,11 @@ pub(crate) mod tests {
             "[USER]: plan launch\n\n[AGENT]: Noted.",
             "[USER]: Notesheet for the client\n\n[AGENT]: Noted.",
             "[USER]: notes for the customer\n\n[AGENT]: Noted.",
-            "[USER]: Tommy sent the files\n\n[AGENT]: Noted."]
+            "[USER]: Tommy sent the files\n\n[AGENT]: Noted.",
+            "[USER]: Don took the bus\n\n[AGENT]: Noted.",
+            "[USER]: lunch at noon\n\n[AGENT]: Noted.",
+            "[USER]: L'\u{e9}tudiant arrives\n\n[AGENT]: Noted.",
+            "[USER]: L\u{e9}tude draft\n\n[AGENT]: Noted."]
             .iter()
             .enumerate()
             .map(|(i, content)| serde_json::json!({
@@ -1562,11 +1566,27 @@ pub(crate) mod tests {
         memory_index_batch(&mut conn, &rows, None).unwrap();
         let synonyms = SynonymLookup::new();
         let params = serde_json::json!({"ignoreDate": true});
-        for q in ["O'Brien", "don't forget", "Don't"] {
+        let found = |q: &str| -> Vec<String> {
             let found = memory_search(&conn, q, &params, &synonyms, None)
                 .unwrap_or_else(|e| panic!("memory search for {q:?} failed: {e:?}"));
-            let ids: Vec<_> = found.iter().map(|r| r["memId"].as_str().unwrap_or_default()).collect();
-            assert_eq!(ids, ["turn:0"], "{q:?}");
+            let mut ids: Vec<_> = found.iter().map(|r| r["memId"].as_str().unwrap_or_default().to_string()).collect();
+            ids.sort();
+            ids
+        };
+        // Never "Don took": a one-letter last part is not a prefix. A word beside it keeps its
+        // prefix star, and a kept NOT excludes both spellings.
+        for q in ["O'Brien", "O\u{2019}Brien", "don't forget", "Don't", "Don\u{2019}t", "don't forg", "forg don't"] {
+            assert_eq!(found(q), ["turn:0", "turn:1"], "{q:?}");
+        }
+        assert_eq!(found("lunch NOT don't"), ["turn:9"]);
+        // A joined spelling of 4 bytes is a prefix, counted in bytes: "lét" finds "Létude".
+        assert_eq!(found("l'\u{e9}t"), ["turn:10", "turn:11"]);
+        // More capital NOTs than FTS5's expression depth allows (#22): the first ones exclude,
+        // the rest are left out, and the query answers.
+        let nots = |n: usize| (0..n).map(|k| format!(" NOT qz{k:03}")).collect::<String>();
+        for n in [255, 256, 257, 300] {
+            assert_eq!(found(&format!("don't NOT obrien{}", nots(n))), ["turn:0"], "{n} NOTs");
+            assert_eq!(found(&format!("budget{}", nots(n))), found("budget"), "{n} NOTs");
         }
         // A possessive finds what it names; a word in a run without synonyms keeps its prefix
         // star (`notes` finds "Notesheet"), and so does one beside a possessive, which does not
@@ -2289,10 +2309,13 @@ pub(crate) mod tests {
         memory_index_batch(&mut conn, &[row], Some(&engine)).unwrap();
         let params = serde_json::json!({ "ignoreDate": true });
         let synonyms = SynonymLookup::new();
-        for q in ["-- ?", "_", "AND", "OR", "NOT", "\"\"", "ⓐ", "nobody: cares"] {
+        for q in ["-- ?", "_", "AND", "OR", "NOT", "\"\"", "ⓐ", "nobody: cares", "don't forg", "meeting NOT don't"] {
             memory_search(&conn, q, &params, &synonyms, Some(&engine))
                 .unwrap_or_else(|e| panic!("hybrid memory search for {q:?} failed: {e:?}"));
         }
+        let many_nots = format!("budget don't{}", (0..300).map(|k| format!(" NOT qz{k:03}")).collect::<String>());
+        memory_search(&conn, &many_nots, &params, &synonyms, Some(&engine))
+            .unwrap_or_else(|e| panic!("hybrid memory search with 300 NOTs failed: {e:?}"));
         let results = memory_search(&conn, "budget", &params, &synonyms, Some(&engine)).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["memId"], "turn:1");
