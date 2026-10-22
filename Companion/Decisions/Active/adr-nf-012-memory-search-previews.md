@@ -85,6 +85,8 @@ matches (it asked for 2,000). Review of that change found two helper defects it 
    index on `dateMs`, so each read still scans every entry's date (about 300 pages at 40k entries,
    2,400 at 300k: linear, but dates only, far below the content scan it replaces); an index would be
    a schema change for every Thunderbird and Voice memory, and was left out as for the listing.
+   **Amended 2026-10-22:** the owner chose the index as an immediate follow-up. ADR-NF-015 adds it,
+   so the listing and `memoryRead` find their dates without scanning every entry's.
 
 Still open (not here): a search's `limit` times `CANDIDATE_MULTIPLIER` over 4,096 still fails the
 vector search silently, for email and memory searches alike (#20; Thunderbird's email search and Voice's

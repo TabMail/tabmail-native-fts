@@ -158,7 +158,7 @@ archives of any size.
 
 ## ADR-NF-012: Memory Search Can Return Previews
 
-- **[Full ADR](Companion/Decisions/Active/adr-nf-012-memory-search-previews.md)** — `memorySearch` `previewChars` cuts `content`/`snippet` in the reply only (Thunderbird refuses a native message over 1 MiB); stored rows and `memoryRead` whole; no capability flag. Amended 2026-10-21: dated hybrid search filters vector candidates by date before the merge; listing and `memoryRead` pick rowids from `memory_meta` first (`memoryRead`: #151, 2026-10-21); a memory search runs in one read transaction (rowid reuse). Open: limit x 4 > 4,096 fails the vector search silently (#20); fixed by ADR-NF-013.
+- **[Full ADR](Companion/Decisions/Active/adr-nf-012-memory-search-previews.md)** — `memorySearch` `previewChars` cuts `content`/`snippet` in the reply only (Thunderbird refuses a native message over 1 MiB); stored rows and `memoryRead` whole; no capability flag. Amended 2026-10-21: dated hybrid search filters vector candidates by date before the merge; listing and `memoryRead` pick rowids from `memory_meta` first (`memoryRead`: #151, 2026-10-21); a memory search runs in one read transaction (rowid reuse). Open: limit x 4 > 4,096 fails the vector search silently (#20); fixed by ADR-NF-013. Date scan of item 3 removed by ADR-NF-015's index.
 
 ## ADR-NF-013: A Hybrid Search Asks sqlite-vec for at Most Its Maximum, and Email Search Keeps Its Dated Matches
 
@@ -167,6 +167,10 @@ archives of any size.
 ## ADR-NF-014: A Hybrid Search Whose Merge Keeps Nothing Answers by Keyword
 
 - **[Full ADR](Companion/Decisions/Active/adr-nf-014-an-empty-merge-answers-by-keyword.md)** — #28: a word in at least half the rows (FTS5 IDF clamp to ~0) + weak vectors put every fused score under `MIN_SCORE` 0.1, so hybrid search returned nothing; now an empty merge with keyword matches falls back to `search_fts_only` / `memory_search_fts_only`. Scoring unchanged: study on real TB/iOS email + memory DBs, current `merge_results` best or tied in 4 of 5 DBs (unthresholded RRF higher only on a 25-turn Voice DB, by filling the page with non-matches) vs weighted RRF, min-max normalisation, query-length gating, keyword-only (known-item MRR@10). iOS in step, tabmail-ios#240.
+
+## ADR-NF-015: Memory Dates Are Indexed
+
+- **[Full ADR](Companion/Decisions/Active/adr-nf-015-memory-dates-are-indexed.md)** — `memory_meta_dateMs` index on `memory_meta(dateMs)` (`MEMORY_META_DATE_INDEX`), created with the schema and on the first open of an older memory (`CREATE INDEX IF NOT EXISTS`, about 0.1 s per 300k dates); `memoryRead`, the listing and the oldest-first removal use it, so a read by date no longer scans every entry's date (one-entry cold read 8 pages at 20k entries, about 170 without). Ties in a millisecond ordered by rowid (written order) in the listing and `memoryRead`; an existing memory is decided by `memory_meta` (a half-created one is completed). Keyword-search plans unchanged. Owner 2026-10-22; follows ADR-NF-012 item 3.
 
 ## ADR-NF-016: sqlite-vec Searches Only Within a Search's Dates and Field
 
