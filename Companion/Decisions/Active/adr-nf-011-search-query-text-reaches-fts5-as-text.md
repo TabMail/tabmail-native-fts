@@ -111,8 +111,9 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
   `db::tests::test_search_prefix_star_is_decided_per_run_of_words` and the memory twin (red with
   a query-wide star rule), including `client's notes` finding "Notesheet for the client" and not
   "Notes for the customer" (red when a possessive looks up its synonyms without the `s`);
-  `db::tests::test_search_possessive_of_a_plural_synonym_key_expands` finds the feedback mail
-  for `comment's` (red when a possessive never expands) and a field's value beside a group
+  `db::tests::test_search_possessive_of_a_plural_synonym_key_expands` and the memory twin find
+  the feedback text for `comment's` in both apostrophes and both cases (red when a possessive
+  never expands, or when one of the four endings is dropped) and a field's value beside a group
   staying exact (`meeting from:alex` does not find alexandra); an operator replaces one join only
   (`café OR greetings budget`); `db::tests::test_search_not_excludes_only_the_word_typed` finds
   `invoice NOT receipt` and `March NOT receipt` (red when the word after `NOT` expands) and that

@@ -1576,6 +1576,33 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A possessive looks up its word with the `s`: `comment's` gets the synonyms of `comments`,
+    /// in either apostrophe and either case.
+    #[test]
+    fn memory_search_possessive_of_a_plural_synonym_key_expands() {
+        let (dir, mut conn) = temp_memory_db("possessive-synonyms");
+        let rows: Vec<_> = ["[USER]: thoughts on the deck\n\n[AGENT]: My feedback on the slides.",
+            "[USER]: lunch plans\n\n[AGENT]: Pizza on Friday."]
+            .iter()
+            .enumerate()
+            .map(|(i, content)| serde_json::json!({
+                "memId": format!("turn:{i}"), "role": "session", "content": content,
+                "sessionId": "persistent_chat", "turnIndex": i,
+                "dateMs": chrono::Utc::now().timestamp_millis(),
+            }))
+            .collect();
+        memory_index_batch(&mut conn, &rows, None).unwrap();
+        let params = serde_json::json!({"ignoreDate": true});
+        for q in ["comment's", "COMMENT'S", "comment\u{2019}s", "COMMENT\u{2019}S"] {
+            let found = memory_search(&conn, q, &params, &SynonymLookup::new(), None)
+                .unwrap_or_else(|e| panic!("memory search for {q:?} failed: {e:?}"));
+            let ids: Vec<_> = found.iter().map(|r| r["memId"].as_str().unwrap_or_default()).collect();
+            assert_eq!(ids, ["turn:0"], "{q:?}");
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Indexes one text-only exchange dated `i`, as one memory write does.
     fn add_text(conn: &mut Connection, i: usize) {
         let row = serde_json::json!({

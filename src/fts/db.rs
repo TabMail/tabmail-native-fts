@@ -2625,14 +2625,16 @@ pub(crate) mod tests {
     }
 
     /// A possessive looks up its word with the `s`, as 0.11.8 did: `comment's` gets the synonyms
-    /// of `comments`.
+    /// of `comments`, in either apostrophe and either case.
     #[test]
     fn test_search_possessive_of_a_plural_synonym_key_expands() {
         let (conn, mut known_years) = setup_test_db();
         let a_week_ago = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
         insert_test_message_full(&conn, &mut known_years, "acc:/:p1", "Thoughts on the deck", "erin@example.com", "team@example.com", "My feedback on the slides", a_week_ago);
         insert_test_message_full(&conn, &mut known_years, "acc:/:p2", "Lunch plans", "erin@example.com", "team@example.com", "Pizza on Friday", a_week_ago);
-        assert_eq!(search_ok(&conn, "comment's", &known_years), vec!["acc:/:p1".to_string()]);
+        for q in ["comment's", "COMMENT'S", "comment\u{2019}s", "COMMENT\u{2019}S"] {
+            assert_eq!(search_ok(&conn, q, &known_years), vec!["acc:/:p1".to_string()], "{q:?}");
+        }
     }
 
     /// A kept NOT excludes the word typed: its synonyms would also exclude the left side's.
