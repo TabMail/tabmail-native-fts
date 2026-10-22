@@ -20,6 +20,11 @@ use serde_json::Value;
 
 use crate::config;
 
+/// The index the reads by date use (memoryRead, the listing, the oldest-first removal), so a read
+/// finds its dates without scanning every entry's (ADR-NF-015). Created with the schema, and on the
+/// first open of a memory written before it.
+const MEMORY_META_DATE_INDEX: &str = "CREATE INDEX IF NOT EXISTS memory_meta_dateMs ON memory_meta(dateMs);";
+
 /// Initialize the memory database schema
 pub fn init_memory_database(conn: &Connection) -> anyhow::Result<()> {
     log::info!("Initializing memory database schema");
@@ -72,6 +77,7 @@ PRAGMA wal_autocheckpoint = {wal_autocheckpoint};\n\
         tokenize = config::sqlite::FTS_TOKENIZE,
         prefix = config::sqlite::FTS_PREFIXES
     ))?;
+    conn.execute_batch(MEMORY_META_DATE_INDEX)?;
 
     // FTS5 automerge settings
     conn.execute(
@@ -188,6 +194,8 @@ pub fn open_or_create_memory_db(fts_dir: &Path) -> anyhow::Result<(PathBuf, Conn
         log::info!("Using existing memory database schema");
         // Migrate: add vector tables if missing (pre-v0.7.0 databases)
         ensure_memory_vector_tables(&conn)?;
+        // A memory written before the date index gets it here, built once from the dates alone.
+        conn.execute_batch(MEMORY_META_DATE_INDEX)?;
         // In-place tokenizer migration (ADR-024) — same lockstep change as the
         // email shards; without this, memory search would tokenize differently
         // from email search on pre-existing profiles.
@@ -1125,8 +1133,8 @@ pub fn memory_read_by_timestamp(
         to_ms
     );
 
-    // The rows are chosen from memory_meta (dates only; it has no index on dateMs, so every
-    // entry's date is still scanned) before any content is read, as the listing does. Joined from
+    // The rows are chosen from memory_meta by its date index before any content is read, as the
+    // listing does. Joined from
     // memory_fts, as this query used to be, SQLite read every row's content for each read, and
     // Thunderbird reads each entry it shows at its own millisecond. CROSS JOIN makes memory_meta
     // the outer loop by rule rather than by the planner's estimate.
@@ -2523,6 +2531,85 @@ pub(crate) mod tests {
         assert!(read > 0, "the cold reader read from disk");
         assert!(read < 130, "a read of 50 of 200 entries read {read} pages");
         drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+
+    /// What a cold reader reads from disk for a one-entry `memoryRead` and, on another cold reader, a
+    /// dated listing page, in a memory of `n` short entries a millisecond apart.
+    fn cold_reads_by_date(db: &Path, now: i64, n: i64) -> (i32, i32) {
+        let cold = |read: &dyn Fn(&Connection)| {
+            let conn = open_read_only_memory_connection(db).unwrap();
+            conn.execute_batch("PRAGMA mmap_size = 0; PRAGMA cache_size = 8;").unwrap();
+            let misses = || {
+                let (mut current, mut high) = (0, 0);
+                assert_eq!(unsafe { rusqlite::ffi::sqlite3_db_status(conn.handle(), rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS, &mut current, &mut high, 0) }, rusqlite::ffi::SQLITE_OK);
+                current
+            };
+            let before = misses();
+            read(&conn);
+            let pages = misses() - before;
+            assert!(pages > 0, "the cold reader read from disk");
+            pages
+        };
+        let at = now + n / 2;
+        let read = cold(&|conn| {
+            let one = memory_read_by_timestamp(conn, at, 0).unwrap();
+            assert_eq!(one.iter().map(|r| r["memId"].as_str().unwrap()).collect::<Vec<_>>(), [format!("turn:{}", n / 2)]);
+            assert_eq!(one[0]["content"], format!("exchange {}", n / 2));
+        });
+        let listed = cold(&|conn| {
+            let page = memory_search(conn, "", &serde_json::json!({ "from": at - 2, "to": at, "limit": 3 }), &SynonymLookup::new(), None).unwrap();
+            assert_eq!(page.iter().map(|r| r["memId"].as_str().unwrap().to_string()).collect::<Vec<_>>(), (0..3).map(|i| format!("turn:{}", n / 2 - i)).collect::<Vec<_>>());
+        });
+        (read, listed)
+    }
+
+    fn short_entries(conn: &mut Connection, now: i64, n: i64) {
+        let rows: Vec<Value> = (0..n)
+            .map(|i| serde_json::json!({ "memId": format!("turn:{i}"), "role": "session", "sessionId": "persistent_chat",
+                "content": format!("exchange {i}"), "dateMs": now + i, "turnIndex": i }))
+            .collect();
+        memory_index_batch(conn, &rows, None).unwrap();
+    }
+
+    /// A read by date finds its entries by the date index, not by scanning every entry's date: a
+    /// one-entry `memoryRead` and a three-entry dated listing page read about as many pages from
+    /// disk in a memory of 20,000 entries as in one of 200 (ADR-NF-015; without the index the
+    /// large memory's dates alone take over a hundred pages).
+    #[test]
+    fn a_read_by_date_costs_the_same_whatever_the_memorys_size() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut cost = vec![];
+        for n in [200, 20_000] {
+            let (dir, mut conn) = temp_memory_db(&format!("date-index-{n}"));
+            short_entries(&mut conn, now, n);
+            drop(conn);
+            cost.push(cold_reads_by_date(&dir.join("memory.db"), now, n));
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        let ((small_read, small_listed), (large_read, large_listed)) = (cost[0], cost[1]);
+        assert!(large_read <= small_read + 4, "a one-entry read: {small_read} pages at 200 entries, {large_read} at 20,000");
+        assert!(large_listed <= small_listed + 4, "a listing page: {small_listed} pages at 200 entries, {large_listed} at 20,000");
+    }
+
+    /// A memory written before the date index gets it when the helper next opens it, and its reads
+    /// by date are then as cheap as a new memory's.
+    #[test]
+    fn a_memory_written_before_the_date_index_gets_it_on_open() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let n = 20_000;
+        let (dir, mut conn) = temp_memory_db("date-index-migrate");
+        short_entries(&mut conn, now, n);
+        conn.execute_batch("DROP INDEX memory_meta_dateMs;").unwrap();
+        drop(conn);
+        let db = dir.join("memory.db");
+        let (before_read, before_listed) = cold_reads_by_date(&db, now, n);
+        let (_path, conn) = open_or_create_memory_db(&dir).unwrap();
+        drop(conn);
+        let (read, listed) = cold_reads_by_date(&db, now, n);
+        assert!(read * 5 < before_read, "a one-entry read: {before_read} pages before the open, {read} after");
+        assert!(listed * 5 < before_listed, "a listing page: {before_listed} pages before the open, {listed} after");
         let _ = std::fs::remove_dir_all(dir);
     }
 
