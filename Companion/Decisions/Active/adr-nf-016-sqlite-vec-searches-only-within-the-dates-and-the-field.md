@@ -71,7 +71,8 @@ Email, mean recall of the vector candidates (A / B), and median time in ms (A / 
   nearer rows lie outside; the keyword-only answer for "no vector within the dates" now happens only
   when no row within them has a vector.
 - A dated or field search reads the metadata table's dates once (a scan without an index on
-  `dateMs`), measured above as faster overall than before.
+  `dateMs`), measured above as faster overall than before. Memory's dates are indexed since
+  ADR-NF-015, so a dated memory search reads only the dates within its range.
 - A field's matching rowids go to SQLite as one JSON list (as many as the field matches).
 
 ## Rejected

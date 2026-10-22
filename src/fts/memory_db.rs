@@ -2699,6 +2699,15 @@ pub(crate) mod tests {
         }
         assert_eq!(ids(memory_read_by_timestamp(&conn, t, 0).unwrap()), "a,c,e,g");
         assert_eq!(ids(memory_read_by_timestamp(&conn, t, 1).unwrap()), "a,c,e,g,b,d,f");
+        // A read keeps at most 50 entries: when more share one millisecond, the first 50 written.
+        let t2 = t + 10_000;
+        let many: Vec<Value> = (0..60)
+            .map(|i| serde_json::json!({ "memId": format!("turn:{i}"), "role": "session", "sessionId": "persistent_chat",
+                "content": format!("exchange {i}"), "dateMs": t2, "turnIndex": i }))
+            .collect();
+        memory_index_batch(&mut conn, &many, None).unwrap();
+        let want = (0..50).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        assert_eq!(ids(memory_read_by_timestamp(&conn, t2, 0).unwrap()), want);
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }

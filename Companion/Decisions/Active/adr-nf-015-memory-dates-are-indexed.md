@@ -56,7 +56,7 @@ index's).
   - `a_read_by_date_costs_the_same_whatever_the_memorys_size` (on memories memoryClear rebuilt)
   - `a_memory_written_before_the_date_index_gets_it_on_open`
   - `entries_sharing_a_millisecond_keep_the_order_they_were_written_in` (listing and `memoryRead`;
-    listing pages cut inside a group of tied entries)
+    listing pages cut inside a group of tied entries, and a read's 50-entry cap inside one)
   - `a_memory_whose_creation_stopped_after_its_first_table_opens_and_works`
   - `a_new_memory_whose_date_index_cannot_be_built_fails_init_and_keeps_its_entries` and
     `an_older_memory_whose_date_index_cannot_be_built_fails_open_and_the_next_open_builds_it`
