@@ -61,7 +61,7 @@ best `limit`, so nearer messages outside the dates took the places of matches in
   columns accept range constraints in a KNN query, so the date can move into the vector table; #26
   starts with a study measuring that.
 - Known limitation, approved by the owner 2026-10-21, fixed by the next PR in the train (#28, with
-  iOS in step, tabmail-ios#240): a query word in more than half the rows can return nothing. SQLite
+  iOS in step, tabmail-ios#240): a query word in at least half the rows can return nothing. SQLite
   FTS5 clamps that word's IDF to about 0, so its keyword score is about 0, and with a one-word
   query's weak vector scores every merged score falls under `MIN_SCORE` (measured in review: 600
   rows with "budget", the query `budget` returns 0). The scoring predates this decision; the

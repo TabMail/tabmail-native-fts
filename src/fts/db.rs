@@ -1096,7 +1096,7 @@ fn search_rows(
         limit as usize,
     );
 
-    // Words matched but the merge kept nothing (a word in most messages scores about 0 by keyword, and a
+    // Words matched but the merge kept nothing (a word in at least half the messages scores about 0 by keyword, and a
     // weak vector match adds too little to reach MIN_SCORE): answer by keyword, as with no vectors.
     if merged.is_empty() && !text_pairs.is_empty() {
         log::info!("Hybrid merge kept none of {} keyword matches, falling back to FTS-only search", text_pairs.len());
@@ -4606,16 +4606,47 @@ mod tests {
     fn search_whose_merge_keeps_nothing_answers_by_keyword() {
         let Some(engine) = embedding_engine() else { return };
         let (profile, _path, mut conn, mut known_years) = temp_email_db("merge-keeps-nothing");
+        let hour = 3_600_000;
         let now = chrono::Utc::now().timestamp_millis();
-        let mut rows: Vec<Value> = (0..30).map(|i| email_row(&format!("acc:/:budget-{i}"), "Budget", "the quarterly budget", now - i)).collect();
-        rows.extend((0..10).map(|i| email_row(&format!("acc:/:weather-{i}"), "Weather", "rain tomorrow", now - 100 - i)));
+        let mut rows: Vec<Value> = (0..30).map(|i| email_row(&format!("acc:/:budget-{i}"), "Budget", "the quarterly budget", now - i * hour)).collect();
+        rows.extend((0..10).map(|i| email_row(&format!("acc:/:weather-{i}"), "Weather", "rain tomorrow", now - (100 + i) * hour)));
         index_batch(&mut conn, &rows, Some(&engine), &mut known_years).unwrap();
-        let params = serde_json::json!({ "ignoreDate": true, "limit": 100 });
-        let mut found = result_ids(&search(&conn, "budget", &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap());
+        let budget = |range: std::ops::Range<i64>| -> Vec<String> { range.map(|i| format!("acc:/:budget-{i}")).collect() };
+        let search_with = |params: Value| result_ids(&search(&conn, "budget", &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap());
+
+        let mut found = search_with(serde_json::json!({ "ignoreDate": true, "limit": 100 }));
         found.sort();
-        let mut expected: Vec<String> = (0..30).map(|i| format!("acc:/:budget-{i}")).collect();
+        let mut expected = budget(0..30);
         expected.sort();
         assert_eq!(found, expected);
+        // Within dates: only the matches within them.
+        let mut dated = search_with(serde_json::json!({ "from": now - 9 * hour - hour / 2, "to": now + hour, "limit": 100 }));
+        dated.sort();
+        let mut expected = budget(0..10);
+        expected.sort();
+        assert_eq!(dated, expected);
+        // Fewer than the matches: the newest `limit`, newest first.
+        assert_eq!(search_with(serde_json::json!({ "ignoreDate": true, "limit": 5 })), budget(0..5));
+        drop(conn);
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    /// A query whose words match a row answers by the merge when it keeps something: a match by
+    /// meaning alone, without the words, is among the results.
+    #[test]
+    fn search_whose_merge_keeps_results_answers_by_meaning_too() {
+        let Some(engine) = embedding_engine() else { return };
+        let (profile, _path, mut conn, mut known_years) = temp_email_db("merge-keeps-results");
+        let now = chrono::Utc::now().timestamp_millis();
+        let rows = vec![
+            email_row("acc:/:words", "Plan", "plan the vacation itinerary for the team", now),
+            email_row("acc:/:meaning", "Vacation", "Here is the vacation itinerary", now - 1),
+        ];
+        index_batch(&mut conn, &rows, Some(&engine), &mut known_years).unwrap();
+        let params = serde_json::json!({ "ignoreDate": true, "limit": 10 });
+        let mut found = result_ids(&search(&conn, "plan the vacation itinerary", &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap());
+        found.sort();
+        assert_eq!(found, vec!["acc:/:meaning".to_string(), "acc:/:words".to_string()]);
         drop(conn);
         let _ = std::fs::remove_dir_all(profile);
     }

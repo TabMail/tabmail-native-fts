@@ -163,7 +163,7 @@ archives of any size.
 
 ## ADR-NF-014: A Hybrid Search Whose Merge Keeps Nothing Answers by Keyword
 
-- **[Full ADR](Companion/Decisions/Active/adr-nf-014-an-empty-merge-answers-by-keyword.md)** — #28: a word in more than half the rows (FTS5 IDF clamp to ~0) + weak vectors put every fused score under `MIN_SCORE` 0.1, so hybrid search returned nothing; now an empty merge with keyword matches falls back to `search_fts_only` / `memory_search_fts_only`. Scoring unchanged: study on real TB/iOS email + memory DBs, current `merge_results` best or tied vs weighted RRF, min-max normalisation, query-length gating, keyword-only (known-item MRR@10). iOS in step, tabmail-ios#240.
+- **[Full ADR](Companion/Decisions/Active/adr-nf-014-an-empty-merge-answers-by-keyword.md)** — #28: a word in at least half the rows (FTS5 IDF clamp to ~0) + weak vectors put every fused score under `MIN_SCORE` 0.1, so hybrid search returned nothing; now an empty merge with keyword matches falls back to `search_fts_only` / `memory_search_fts_only`. Scoring unchanged: study on real TB/iOS email + memory DBs, current `merge_results` best or tied in 4 of 5 DBs (unthresholded RRF higher only on a 25-turn Voice DB, by filling the page with non-matches) vs weighted RRF, min-max normalisation, query-length gating, keyword-only (known-item MRR@10). iOS in step, tabmail-ios#240.
 
 ---
 
