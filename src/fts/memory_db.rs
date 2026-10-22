@@ -458,6 +458,7 @@ fn memory_search_rows(
     if query.is_empty() {
         return memory_list_all(conn, params, ignore_date, limit);
     }
+    let limit = super::db::cap_search_limit(limit);
 
     // Fall back to FTS-only when no embedding engine
     let engine = match engine {
@@ -494,32 +495,21 @@ fn memory_search_rows(
     // --- Vector candidates ---
     let query_embedding = engine.embed(query)?;
     let query_blob = super::db::f32_vec_to_blob(&query_embedding);
-    let vec_candidates = super::db::search_vec_candidates(conn, "memory_vec", &query_blob, candidate_limit)
-        .unwrap_or_default(); // empty vec table during rebuild → graceful empty
-
-    // Fall back to FTS-only when vec table is empty (e.g., during embedding rebuild).
-    if vec_candidates.is_empty() {
-        log::info!("No memory vector candidates (vec table may be empty), falling back to FTS-only search");
-        return memory_search_fts_only(conn, query, params, synonyms, ignore_date, limit);
-    }
+    let vec_candidates = super::db::search_vec_candidates(conn, "memory_vec", &query_blob, candidate_limit).unwrap_or_else(|e| {
+        log::warn!("Memory vector search failed, searching by keyword only: {e}");
+        vec![]
+    });
 
     // Keep only the vector candidates within the dates asked, before the merge keeps the best
-    // `limit`: dropped after it, nearer ones outside the dates would take the places of matches
-    // inside them. (The FTS candidates are filtered by date in their query.)
-    let vec_candidates = if from_ts.is_some() || to_ts.is_some() {
-        let mut date_of = conn.prepare("SELECT dateMs FROM memory_meta WHERE rowid = ?1")?;
-        let mut kept = Vec::with_capacity(vec_candidates.len());
-        for (rowid, distance) in vec_candidates {
-            let date_ms: Option<i64> = date_of.query_row(params![rowid], |r| r.get(0)).optional()?;
-            let within = date_ms.is_some_and(|d| from_ts.is_none_or(|from| d >= from) && to_ts.is_none_or(|to| d <= to));
-            if within {
-                kept.push((rowid, distance));
-            }
-        }
-        kept
-    } else {
-        vec_candidates
-    };
+    // `limit` (the FTS candidates are filtered by date in their query).
+    let vec_candidates = super::db::vec_candidates_within_dates(conn, "memory_meta", vec_candidates, from_ts, to_ts)?;
+
+    // Fall back to FTS-only when no vector candidates are left: the vec table is empty (e.g., during
+    // embedding rebuild), or none of them is within the dates.
+    if vec_candidates.is_empty() {
+        log::info!("No memory vector candidates (vec table may be empty, or none within the dates), falling back to FTS-only search");
+        return memory_search_fts_only(conn, query, params, synonyms, ignore_date, limit);
+    }
 
     // --- Merge ---
     let text_pairs: Vec<(i64, f64)> = fts_candidates.iter().map(|c| (c.rowid, c.rank)).collect();
@@ -1209,7 +1199,7 @@ fn truncate_for_log(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A fresh on-disk memory database (WAL, like the helper's) in its own temp folder.
@@ -2031,7 +2021,7 @@ mod tests {
 
     /// The embedding model from its usual folder (not downloaded here); without it, a test that
     /// needs it is skipped.
-    fn embedding_engine() -> Option<EmbeddingEngine> {
+    pub(crate) fn embedding_engine() -> Option<EmbeddingEngine> {
         let model = crate::embeddings::download::model_dir(None).unwrap();
         let engine = EmbeddingEngine::load(&model).ok();
         if engine.is_none() {
@@ -2144,6 +2134,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A hybrid memory search asks sqlite-vec for `limit` x CANDIDATE_MULTIPLIER nearest vectors,
+    /// which it refuses past VEC_K_MAX; the `limit` is capped at SEARCH_LIMIT_MAX to keep within it
+    /// (TabMail Voice asks for 2,000). At any `limit` asked, a match by meaning alone is still
+    /// found: the search stays hybrid.
+    #[test]
+    fn memory_search_with_a_large_limit_finds_a_match_by_meaning() {
+        let Some(engine) = embedding_engine() else { return };
+        let (dir, mut conn) = temp_memory_db("large-limit");
+        let row = serde_json::json!({ "memId": "found", "role": "session", "sessionId": "persistent_chat",
+            "content": "Here is the vacation itinerary", "dateMs": chrono::Utc::now().timestamp_millis(), "turnIndex": 0 });
+        memory_index_batch(&mut conn, &[row], Some(&engine)).unwrap();
+        let most = config::hybrid::SEARCH_LIMIT_MAX;
+        for limit in [10, most, most + 1, 2_000, 4_000] {
+            let params = serde_json::json!({ "ignoreDate": true, "limit": limit });
+            let results = memory_search(&conn, "plan the vacation itinerary", &params, &SynonymLookup::new(), Some(&engine)).unwrap();
+            assert_eq!(results.len(), 1, "at limit {limit}");
+            assert_eq!(results[0]["memId"], "found");
+            assert_eq!(results[0]["snippet"], "", "found by meaning, not by its words");
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Refuses every read of memory_meta, counting them.
     extern "C" fn deny_meta_reads(
         denied: *mut std::os::raw::c_void,
@@ -2210,6 +2223,55 @@ mod tests {
         assert_eq!(page[0]["content"], rows[99]["content"]);
         assert!(read > 0, "the cold reader read from disk");
         assert!(read < 30, "a three-row page read {read} pages");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A memory search with a query returns at most 512 results, whatever `limit` it is given (owner
+    /// 2026-10-21; the expected counts are the decided numbers, not derived from the config they
+    /// pin); a listing (no query) returns the page it asks for.
+    #[test]
+    fn memory_search_returns_at_most_search_limit_max_results() {
+        let (dir, mut conn) = temp_memory_db("limit-max");
+        let now = chrono::Utc::now().timestamp_millis();
+        let rows: Vec<Value> = (0..600)
+            .map(|i| serde_json::json!({ "memId": format!("turn:{i}"), "role": "session", "sessionId": "persistent_chat",
+                "content": "the quarterly budget", "dateMs": now + i, "turnIndex": i }))
+            .collect();
+        memory_index_batch(&mut conn, &rows, None).unwrap();
+        for (limit, expected) in [(10, 10), (512, 512), (513, 512), (2_000, 512), (4_000, 512)] {
+            let params = serde_json::json!({ "ignoreDate": true, "limit": limit });
+            let results = memory_search(&conn, "budget", &params, &SynonymLookup::new(), None).unwrap();
+            assert_eq!(results.len(), expected, "at limit {limit}");
+        }
+        let listing = memory_search(&conn, "", &serde_json::json!({ "ignoreDate": true, "limit": 600 }), &SynonymLookup::new(), None).unwrap();
+        assert_eq!(listing.len(), 600);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A memory search with dates whose vector candidates are all outside them answers by keyword,
+    /// as it does with no vectors at all: every keyword match within the dates, however weak.
+    #[test]
+    fn memory_search_with_no_vector_within_the_dates_answers_by_keyword() {
+        let Some(engine) = embedding_engine() else { return };
+        let (dir, mut conn) = temp_memory_db("no-vector-within");
+        let day = 86_400_000;
+        let now = chrono::Utc::now().timestamp_millis();
+        let turn = |i: i64, content: &str, date_ms: i64| serde_json::json!({ "memId": format!("turn:{i}"), "role": "session",
+            "sessionId": "persistent_chat", "content": content, "dateMs": date_ms, "turnIndex": i });
+        // Within the dates, no vectors yet; "budget" in each, so it weighs little by keyword.
+        let within: Vec<Value> = (0..20).map(|i| turn(i, &format!("the quarterly budget, item {i}"), now - i)).collect();
+        memory_index_batch(&mut conn, &within, None).unwrap();
+        let outside: Vec<Value> = (20..25).map(|i| turn(i, "rain tomorrow", now - (30 + i) * day)).collect();
+        memory_index_batch(&mut conn, &outside, Some(&engine)).unwrap();
+        let params = serde_json::json!({ "from": now - day, "to": now + day, "limit": 100 });
+        let mut found: Vec<String> = memory_search(&conn, "budget", &params, &SynonymLookup::new(), Some(&engine)).unwrap()
+            .iter().map(|r| r["memId"].as_str().unwrap().to_string()).collect();
+        found.sort();
+        let mut expected: Vec<String> = (0..20).map(|i| format!("turn:{i}")).collect();
+        expected.sort();
+        assert_eq!(found, expected);
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }

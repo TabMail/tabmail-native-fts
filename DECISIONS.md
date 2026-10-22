@@ -155,7 +155,11 @@ archives of any size.
 
 ## ADR-NF-012: Memory Search Can Return Previews
 
-- **[Full ADR](Companion/Decisions/Active/adr-nf-012-memory-search-previews.md)** — `memorySearch` `previewChars` cuts `content`/`snippet` in the reply only (Thunderbird refuses a native message over 1 MiB); stored rows and `memoryRead` whole; no capability flag. Amended 2026-10-21: dated hybrid search filters vector candidates by date before the merge; listing picks rowids from `memory_meta` first; a memory search runs in one read transaction (rowid reuse). Open: limit x 4 > 4,096 fails the vector search silently (#20).
+- **[Full ADR](Companion/Decisions/Active/adr-nf-012-memory-search-previews.md)** — `memorySearch` `previewChars` cuts `content`/`snippet` in the reply only (Thunderbird refuses a native message over 1 MiB); stored rows and `memoryRead` whole; no capability flag. Amended 2026-10-21: dated hybrid search filters vector candidates by date before the merge; listing picks rowids from `memory_meta` first; a memory search runs in one read transaction (rowid reuse). Open: limit x 4 > 4,096 fails the vector search silently (#20); fixed by ADR-NF-013.
+
+## ADR-NF-013: A Hybrid Search Asks sqlite-vec for at Most Its Maximum, and Email Search Keeps Its Dated Matches
+
+- **[Full ADR](Companion/Decisions/Active/adr-nf-013-hybrid-search-asks-sqlite-vec-for-at-most-its-maximum.md)** — #20: sqlite-vec k max 4,096 (`SQLITE_VEC_VEC0_K_MAX`) made searches with limit > 1,024 silently keyword-only; `cap_search_limit` caps a search with a query at `SEARCH_LIMIT_MAX` 512 (`FIELD_VEC_MULTIPLIER`); vector failure warns; email `vec_candidates_within_dates` before the merge + one read transaction; no vector within the dates falls back to keyword-only. Known limitations (owner-approved): nearest k over the whole archive, #26; a word in most rows can return nothing (FTS5 IDF clamp + `MIN_SCORE`), #28.
 
 ---
 

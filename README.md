@@ -125,6 +125,10 @@ The memory database enables:
 entries stays small (Thunderbird refuses a native message over 1 MiB). The stored
 entries are unchanged. See ADR-NF-012 in `DECISIONS.md`.
 
+A `search` or `memorySearch` with a query returns at most 512 results, whatever `limit` it is
+given, so it stays a hybrid (keyword and meaning) search; narrow it by dates instead. A memory
+listing (no query) returns the page asked for. See ADR-NF-013.
+
 Each Thunderbird profile gets its own isolated FTS and memory databases.
 
 **Size limit.** A client can bound the memory database: `memoryIndexBatch` takes an
