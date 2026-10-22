@@ -48,6 +48,7 @@ pub fn build_fts_match(
                     continue;
                 }
             }
+            // A synonym group in this run of words; a spelling group does not count.
             let has_or_groups = grouped_runs.get(run).copied().unwrap_or(false);
             let term = match item {
                 Item::Phrase(p) => {
@@ -304,10 +305,15 @@ mod tests {
         assert_eq!(build("I'm we'll", &[]), r#"("I'm" OR "Im") AND ("we'll"* OR "well"*)"#);
         assert_eq!(build("don\u{2019}t*", &[]), "(\"don\u{2019}t\"* OR \"dont\"*)");
         assert_eq!(build("rock'n'roll", &[]), r#"("rock'n'roll"* OR "rocknroll"*)"#);
+        assert_eq!(build("I'm*", &[]), r#"("I'm"* OR "Im"*)"#);
+        // One letter counts characters, not bytes; a possessive counts toward the 4 bytes.
+        assert_eq!(build("c'\u{e8}", &[]), "(\"c'\u{e8}\" OR \"c\u{e8}\")");
+        assert_eq!(build("a'bc's", &[]), r#"("a'bc"* OR "abc"*)"#);
         // Any other punctuation: one spelling, as typed.
         assert_eq!(build("a'b-c", &[]), r#""a'b-c"*"#);
         // A field's value is searched as typed.
         assert_eq!(build("from:o'brien", COLUMNS), r#"from_:"o'brien"*"#);
+        assert_eq!(build("subject: O'Brien", COLUMNS), r#"subject:"O'Brien"*"#);
         // A spelling group leaves its neighbours' stars alone, and a kept NOT excludes both
         // spellings.
         assert_eq!(build("don't forg", &[]), r#"("don't" OR "dont"*) AND "forg"*"#);
@@ -315,6 +321,8 @@ mod tests {
         // Beside a synonym group, the joined spelling gets no automatic star, as any word.
         let q = build("meeting don't", &[]);
         assert!(q.starts_with('(') && q.ends_with(r#") AND ("don't" OR "dont")"#), "{q}");
+        let q = build("meeting we'll*", &[]);
+        assert!(q.starts_with('(') && q.ends_with(r#") AND ("we'll"* OR "well"*)"#), "{q}");
     }
 
     #[test]

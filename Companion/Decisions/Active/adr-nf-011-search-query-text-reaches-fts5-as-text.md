@@ -72,9 +72,9 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
    The word after a kept `NOT` searches what was typed, without its synonyms: expanded, it would
    also exclude the left side's (`invoice NOT receipt` found nothing). Both spellings are what
    was typed, so `lunch NOT don't` excludes "Dont" too. FTS5's grammar decides what
-   a kept `NOT` excludes: without a synonym group, the rest of the run of words (`alice NOT carol
-   zebra` is alice NOT (carol zebra), as in 0.11.8); with one, the explicit `AND` leaves it only
-   the next term.
+   a kept `NOT` excludes: without a group (synonyms or spellings), the rest of the run of words
+   (`alice NOT carol zebra` is alice NOT (carol zebra), as in 0.11.8); with one, the explicit
+   `AND` leaves it only the next term.
    The hybrid column filter keeps joining the scoped terms with a space, as before, so a kept
    `NOT` is not applied to hybrid vector candidates: `budget NOT from:bob@example.com` (an FTS5
    error in 0.11.8, as `budget` has synonyms) returns bob's mail through the vector side, as
@@ -115,9 +115,14 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
   "Don took" (one-letter last part), with a neighbour's prefix star kept (`don't forg`), both
   spellings excluded by `lunch NOT don't`, and `subject:O'Brien` exact (each red on the #14
   builder or under its #31 mutant: no spellings, typed spelling always starred, spelling group
-  treated as a synonym group, NOT operand without spellings, field value with spellings, no AND
-  join); `query::tests::a_word_with_an_inner_apostrophe_searches_both_spellings` pins the
-  written groups; and `Sarah's`,
+  treated as a synonym group, NOT operand without spellings, `name:value` field value with
+  spellings, no AND join); `query::tests::a_word_with_an_inner_apostrophe_searches_both_spellings`
+  pins the written groups, including the `name: value` field site (a group there would cut the
+  hybrid column filter and answer an FTS5 error), a user's star on both spellings, the one-letter
+  rule counting characters (`c'è`), and a possessive counting toward the 4 bytes; the
+  `QUERY_FRAGMENTS` fuzz holds `don't`, `O’Brien` and `I'm`, so both seeded fuzz tests build
+  spelling groups beside every operator, field and punctuation (red without the AND join), and
+  both hybrid any-text tests send contractions, scoped and under a kept `NOT`; and `Sarah's`,
   `Sarah’s invoice`, `John's flight`, `team's budget` find what they name (red without the
   possessive strip), `Tom's` finds "Tommy" (red without the `s` counted), `Sarah's.`, `Sarah's...`,
   `Sarah's,` and `(Sarah's)` find Sarah (red with the possessive read at the end of the word), and `'budget'` still

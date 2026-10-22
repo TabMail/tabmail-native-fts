@@ -2866,7 +2866,7 @@ pub(crate) mod tests {
         "\"budget plan\"", "(", ")", "*", "-", "^", "+", "%", "!", "?", "/", "'", ",", ".", "@", "#", "$",
         "&", "{", "}", "[", "]", "~", "`", "\\", "|", "<", ">", "=", ";", "_", "café", "日本語", "हिन्दी",
         "Привет", "ⓐ", "\u{301}", "😀", "\u{a0}", "\u{3000}", "\u{200b}", "\u{feff}", "\u{2028}",
-        "\u{e000}", "\u{1}", "\u{0}", "\t", " ", "a@example.com",
+        "\u{e000}", "\u{1}", "\u{0}", "\t", " ", "a@example.com", "don't", "O\u{2019}Brien", "I'm",
     ];
 
     /// `count` queries of 1 to 7 fragments, from a fixed seed, so a failure repeats.
@@ -4670,7 +4670,8 @@ pub(crate) mod tests {
         index_batch(&mut conn, &[row], Some(&engine), &mut known_years).unwrap();
         let params = serde_json::json!({ "ignoreDate": true });
         let synonyms = SynonymLookup::new();
-        for q in ["-- ?", "_", "AND", "OR", "NOT", "\"\"", "ⓐ", "nobody: cares", "acc:x", "\"meet body:x\"", "everybody: be ready"] {
+        for q in ["-- ?", "_", "AND", "OR", "NOT", "\"\"", "ⓐ", "nobody: cares", "acc:x", "\"meet body:x\"", "everybody: be ready",
+            "subject: O'Brien don't", "subject:lunch don't", "don't NOT O'Brien"] {
             search(&conn, q, &params, &synonyms, Some(&engine), &known_years)
                 .unwrap_or_else(|e| panic!("hybrid search for {q:?} failed: {e:?}"));
         }

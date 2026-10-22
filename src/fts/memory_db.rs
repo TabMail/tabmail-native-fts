@@ -2298,7 +2298,7 @@ pub(crate) mod tests {
         memory_index_batch(&mut conn, &[row], Some(&engine)).unwrap();
         let params = serde_json::json!({ "ignoreDate": true });
         let synonyms = SynonymLookup::new();
-        for q in ["-- ?", "_", "AND", "OR", "NOT", "\"\"", "ⓐ", "nobody: cares"] {
+        for q in ["-- ?", "_", "AND", "OR", "NOT", "\"\"", "ⓐ", "nobody: cares", "don't forg", "meeting NOT don't"] {
             memory_search(&conn, q, &params, &synonyms, Some(&engine))
                 .unwrap_or_else(|e| panic!("hybrid memory search for {q:?} failed: {e:?}"));
         }
