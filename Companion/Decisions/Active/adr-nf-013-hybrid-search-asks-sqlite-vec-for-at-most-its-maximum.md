@@ -27,7 +27,7 @@ best `limit`, so nearer messages outside the dates took the places of matches in
    2026-10-21: "even if requested like 4,000, it should cap itself to a reasonable outcome which
    does not fall back to keyword only"; one cap for all searches; narrow a search by dates rather
    than ask for many results). A memory listing (no query) is not capped: it reads no vectors.
-   The callers ask for 100 (thunderbird#150, voice#245).
+   The callers will ask for 100 once thunderbird#150 and voice#245 land (2,000 today).
 2. When the vector search does fail, the search still runs keyword-only (as before), and it now
    logs the error as a warning.
 3. An email search with dates removes the vector candidates outside them before the merge (one
@@ -56,7 +56,8 @@ best `limit`, so nearer messages outside the dates took the places of matches in
 - Known limitation, approved by the owner 2026-10-21, fixed next in the train (#26): the date filter
   and the field filter run on sqlite-vec's nearest k over the whole archive. When k or more messages
   outside the dates (or the field's matches) are nearer the query, a match inside them by meaning
-  alone is missed; one with the query's words is still found. sqlite-vec 0.1.9 vec0 metadata
+  alone is missed; one with the query's words is still found by the keyword leg when it scores over
+  `MIN_SCORE`. sqlite-vec 0.1.9 vec0 metadata
   columns accept range constraints in a KNN query, so the date can move into the vector table; #26
   starts with a study measuring that.
 

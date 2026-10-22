@@ -147,9 +147,9 @@ pub mod hybrid {
     // refuses a larger k.
     pub const VEC_K_MAX: i64 = 4096;
 
-    // The most results a search with a query returns, whatever its `limit`: the largest limit whose
-    // vector candidates (CANDIDATE_MULTIPLIER per result, FIELD_VEC_MULTIPLIER times more with a
-    // field) sqlite-vec still answers, so every search is fully hybrid at any limit asked.
+    // The most results a search with a query returns, at any positive `limit`: the largest limit
+    // whose vector candidates (CANDIDATE_MULTIPLIER per result, FIELD_VEC_MULTIPLIER times more with
+    // a field) sqlite-vec still answers, so every search is fully hybrid at any positive limit asked.
     pub const SEARCH_LIMIT_MAX: i64 = VEC_K_MAX / (CANDIDATE_MULTIPLIER * FIELD_VEC_MULTIPLIER);
 
     // Minimum combined score to return (filters noise).

@@ -1324,8 +1324,8 @@ fn search_fts_candidates(
     Ok(candidates)
 }
 
-/// A search's `limit`, at most `SEARCH_LIMIT_MAX`: past it, the vector candidates the search asks for
-/// are more than sqlite-vec answers, and it would search by keyword only.
+/// A search's positive `limit`, at most `SEARCH_LIMIT_MAX`: past it, the vector candidates the search
+/// asks for are more than sqlite-vec answers, and it would search by keyword only.
 pub(crate) fn cap_search_limit(limit: i64) -> i64 {
     if limit > config::hybrid::SEARCH_LIMIT_MAX {
         log::info!("Search limit {limit} capped to {}", config::hybrid::SEARCH_LIMIT_MAX);

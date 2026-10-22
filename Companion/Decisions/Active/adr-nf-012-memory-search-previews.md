@@ -76,8 +76,8 @@ matches (it asked for 2,000). Review of that change found two helper defects it 
 
 Still open (not here): a search's `limit` times `CANDIDATE_MULTIPLIER` over 4,096 still fails the
 vector search silently, for email and memory searches alike (#20; Thunderbird's email search and Voice's
-memory search ask for 2,000), so those run keyword-only. (Fixed 2026-10-21 by ADR-NF-013, with the
-email date filter and read transaction below.)
+memory search ask for 2,000), so those run keyword-only. (Fixed 2026-10-21 by ADR-NF-013, which also
+gives the email search the date filter below and a read transaction.)
 The date filter also runs on sqlite-vec's top k over the whole memory: when k or more entries
 outside the dates are nearer the query, no match inside them keeps its vector score, so an entry
 inside the dates that matches only by meaning is missed (one with the words is still found by the
