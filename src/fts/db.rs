@@ -2596,6 +2596,17 @@ pub(crate) mod tests {
         assert_eq!(search_ok(&conn, "body:launch", &known_years), one);
     }
 
+    /// A possessive looks up its word with the `s`, as 0.11.8 did: `comment's` gets the synonyms
+    /// of `comments`.
+    #[test]
+    fn test_search_possessive_of_a_plural_synonym_key_expands() {
+        let (conn, mut known_years) = setup_test_db();
+        let a_week_ago = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        insert_test_message_full(&conn, &mut known_years, "acc:/:p1", "Thoughts on the deck", "erin@example.com", "team@example.com", "My feedback on the slides", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:p2", "Lunch plans", "erin@example.com", "team@example.com", "Pizza on Friday", a_week_ago);
+        assert_eq!(search_ok(&conn, "comment's", &known_years), vec!["acc:/:p1".to_string()]);
+    }
+
     /// A kept NOT excludes the word typed: its synonyms would also exclude the left side's.
     #[test]
     fn test_search_not_excludes_only_the_word_typed() {
@@ -2616,6 +2627,9 @@ pub(crate) mod tests {
         assert_eq!(found("March NOT receipt"), ids(&["acc:/:r1", "acc:/:r3"]));
         // A NOT that is dropped leaves the word a search term with its synonyms.
         assert_eq!(found("NOT receipt"), ids(&["acc:/:r1", "acc:/:r2", "acc:/:r3"]));
+        // A word after a kept AND or OR still expands.
+        assert_eq!(found("zebra OR receipt"), ids(&["acc:/:r1", "acc:/:r2", "acc:/:r3"]));
+        assert_eq!(found("March AND receipt"), ids(&["acc:/:r1", "acc:/:r2", "acc:/:r3"]));
     }
 
     /// Capital AND, OR and NOT between two terms are operators, as they always were

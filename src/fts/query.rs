@@ -197,10 +197,11 @@ fn has_punctuation(core: &str) -> bool {
 
 fn word(w: &str, use_synonyms: bool, has_or_groups: bool, synonyms: &SynonymLookup) -> Option<String> {
     let (core, star, possessive) = prepare_word(w)?;
-    // A possessive searches the word it names, never its synonyms: 0.11.8 searched `client's`
-    // as `clients`, which has none, and a group would take the prefix star off its neighbours.
-    if use_synonyms && !possessive && expands(&core, star, synonyms) {
-        return Some(synonyms.expand(&core));
+    // A possessive looks up its word with the `s`, as 0.11.8 did: `comment's` gets the synonyms
+    // of `comments`, and `client's` (`clients` has none) keeps its neighbours' prefix stars.
+    let key = if possessive { format!("{core}s") } else { core.clone() };
+    if use_synonyms && expands(&key, star, synonyms) {
+        return Some(synonyms.expand(&key));
     }
     // A word with punctuation is a phrase of its parts ("dmarc-supp" → [dmarc, supp]); the star
     // keeps a partial address matching while it is typed. Plain words of 4+ bytes get one too,
@@ -229,8 +230,10 @@ mod tests {
         // One possessive 's is removed; any other apostrophe stays.
         assert_eq!(build("it's gone?", &[]), r#""it" "gone"*"#);
         assert_eq!(build("Sarah\u{2019}s O'Brien's don't", &[]), r#""Sarah"* "O'Brien"* "don't"*"#);
-        // A possessive never expands, so its neighbours keep their stars.
+        // A possessive looks up its word with the `s`: `clients` has no synonyms, so its
+        // neighbours keep their stars; `comments` has.
         assert_eq!(build("client's notes", &[]), r#""client"* "notes"*"#);
+        assert!(build("comment's", &[]).contains("feedback"));
         // A possessive's `s` counts toward the automatic star's 4 bytes.
         assert_eq!(build("Tom's it's", &[]), r#""Tom"* "it""#);
         // A possessive is read at the end of the word's text, before any trailing punctuation.

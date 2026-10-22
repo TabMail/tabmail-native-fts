@@ -46,10 +46,10 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
    quoted, `O'Brien` is the phrase `o brien` the tokenizer indexed, and `John's` searches `John`,
    as 0.11.8 effectively did (only one trailing `*`, then trailing `/` and `?`, then the quote
    marks, then the possessive are removed from a word; the possessive is found at the end of the
-   word's text, so `Sarah's.` and `(Sarah's)` read as `Sarah's`). A possessive does not expand to
-   synonyms (0.11.8 searched `client's` as `clients`, which has none; the few nouns whose plural is
-   a synonym key, such as `comment's`, lose that accidental expansion), so it does not take the prefix star
-   off the words beside it, and its removed `s` counts toward the 4 bytes (`Tom's` searches
+   word's text, so `Sarah's.` and `(Sarah's)` read as `Sarah's`). A possessive looks up its
+   synonyms with the `s`, as 0.11.8 did: `comment's` gets the group of `comments`, and `client's`
+   (`clients` has none) stays a word, so it does not take the prefix star off the words beside it.
+   Its removed `s` counts toward the 4 bytes (`Tom's` searches
    `"Tom"*`, as 0.11.8's `Toms*` did).
 3. A word expanding to synonyms becomes the generated `(a OR b …)` group; when any group is
    present every term is joined with an explicit `AND`. Whether a
@@ -110,21 +110,27 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
   expands;
   `db::tests::test_search_prefix_star_is_decided_per_run_of_words` and the memory twin (red with
   a query-wide star rule), including `client's notes` finding "Notesheet for the client" and not
-  "Notes for the customer" (red when a possessive expands) and a field's value beside a group
+  "Notes for the customer" (red when a possessive looks up its synonyms without the `s`);
+  `db::tests::test_search_possessive_of_a_plural_synonym_key_expands` finds the feedback mail
+  for `comment's` (red when a possessive never expands) and a field's value beside a group
   staying exact (`meeting from:alex` does not find alexandra); an operator replaces one join only
   (`café OR greetings budget`); `db::tests::test_search_not_excludes_only_the_word_typed` finds
-  `invoice NOT receipt` and `March NOT receipt` (red when the word after `NOT` expands); the text-less tests include enclosed letters and
+  `invoice NOT receipt` and `March NOT receipt` (red when the word after `NOT` expands) and that
+  the word after a kept `AND` or `OR` still expands; the text-less tests include enclosed letters and
   a lone mark, and `test_search_keeps_private_use_characters` is two-sided (red with
   `is_alphanumeric`); `test_rust_process_parity` `test_scoped_search_with_embeddings_finds_only_the_field` checks the
   same with the embedding model loaded.
 - A differential against the released 0.11.8 helper (Thunderbird-shaped `search` and
   `memorySearch`, with and without the embedding model, 2026-10-21) found no query that newly
   fails, and no common query shape that finds less, apart from the intended apostrophe change
-  above (`O'Brien`, `don't`).
+  above (`O'Brien`, `don't`) and the possessive of a short word ending in `ie` (`Tie's` searches
+  `tie*`, not 0.11.8's `Ties*`, and misses mail saying only "ties"), a variant form the owner's
+  rule in the next item leaves to the vector side.
 - The apostrophe trade was approved by the owner on 2026-10-21: a word with an inner apostrophe
   finds the text as typed (`O'Brien`, `don't`), and no longer the spelling without it (`Don't`
   misses "Dont", `you're` misses "your", `we'll` misses "well", which 0.11.8 found by deleting
-  the apostrophe).
+  the apostrophe). The owner's rule, the same day: a keyword miss of a variant or misspelled form
+  of the typed word is acceptable, as those are typos the vector side of hybrid search finds.
 - Accepted limitations, approved by the owner on 2026-10-21 (common query shapes must find what
   0.11.8 found; a recall difference on rare input is acceptable, and synonym expansion stays):
   - Rare input: a few code points are read differently from unicode61's Unicode 6.1 data (code
