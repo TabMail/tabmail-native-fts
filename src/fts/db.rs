@@ -876,7 +876,20 @@ struct MessageMeta {
     has_attachments: bool,
 }
 
-// Column-scope prefixes used in FTS5 queries after alias translation.
+/// Fields a mail search may scope to (`from:alice`): typed name → shard column. Each column
+/// is in `COLUMN_SCOPE_PREFIXES`, so a scoped hybrid search filters its vector candidates.
+const QUERY_COLUMNS: &[(&str, &str)] = &[
+    ("subject", "subject"),
+    ("from", "from_"),
+    ("from_", "from_"),
+    ("to", "to_"),
+    ("to_", "to_"),
+    ("cc", "cc"),
+    ("bcc", "bcc"),
+    ("body", "body"),
+];
+
+// Column-scope prefixes in the FTS5 queries `build_fts_match` writes.
 const COLUMN_SCOPE_PREFIXES: &[&str] = &["from_:", "to_:", "subject:", "cc:", "bcc:", "body:"];
 
 /// Check if a processed FTS5 query contains column-scoped terms.
@@ -885,7 +898,7 @@ fn query_has_column_scope(fts_query: &str) -> bool {
 }
 
 /// Extract only the column-scoped terms from a processed FTS5 query.
-/// Given `from_:"tmm@cs.ubc.ca" hiring*`, returns `from_:"tmm@cs.ubc.ca"`.
+/// Given `from_:"alice@example.com" hiring*`, returns `from_:"alice@example.com"`.
 fn extract_column_scope_filter(fts_query: &str) -> String {
     let mut scoped_terms: Vec<String> = Vec::new();
     let bytes = fts_query.as_bytes();
@@ -1034,7 +1047,7 @@ fn search_rows(
     let candidate_limit = limit * config::hybrid::CANDIDATE_MULTIPLIER;
 
     // --- FTS5 candidates (across all year shards) ---
-    let fts_query = build_fts_match(Some(query), true, synonyms);
+    let fts_query = build_fts_match(Some(query), QUERY_COLUMNS, true, synonyms);
     log::info!(
         "Hybrid search: \"{}\" -> FTS \"{}\"",
         query,
@@ -1160,7 +1173,7 @@ fn search_fts_only(
     limit: i64,
     known_years: &HashSet<i32>,
 ) -> anyhow::Result<Vec<Value>> {
-    let fts_query = build_fts_match(Some(query), true, synonyms);
+    let fts_query = build_fts_match(Some(query), QUERY_COLUMNS, true, synonyms);
     log::info!(
         "Query transformation (with synonyms): \"{}\" -> \"{}\"",
         query,
@@ -2220,7 +2233,7 @@ fn truncate_for_log(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rusqlite::{ffi, Connection};
     use std::ffi::CStr;
@@ -2505,6 +2518,392 @@ mod tests {
         assert_eq!(n, 1, "address part must match after rebuild");
     }
 
+    // --- Query text reaches FTS5 as text ---
+
+    /// Ids of the messages an FTS-only search for `q` finds; panics if the search fails.
+    fn search_ok(conn: &Connection, q: &str, known_years: &HashSet<i32>) -> Vec<String> {
+        let params = serde_json::json!({"ignoreDate": true});
+        search(conn, q, &params, &SynonymLookup::new(), None, known_years)
+            .unwrap_or_else(|e| panic!("search for {q:?} failed: {e:?}"))
+            .iter()
+            .map(|r| r["uniqueId"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Whatever a user or model types, search never fails, and every word is searched as
+    /// text (non-ASCII intact). Only the documented fields scope to a column.
+    #[test]
+    fn test_search_reads_any_query_text_as_text() {
+        let (conn, mut known_years) = setup_test_db();
+        let a_week_ago = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        insert_test_message_full(
+            &conn, &mut known_years, "acc:/:one",
+            "Budget plan for the café",
+            "alice@example.com", "team@example.com",
+            "R&D notes: 50% off the launch, and the meeting with bob@example.com",
+            a_week_ago,
+        );
+        insert_test_message_full(
+            &conn, &mut known_years, "acc:/:two",
+            "Greetings", "carol@example.com", "dave@example.com",
+            "日本語 हिन्दी Привет",
+            a_week_ago,
+        );
+        let one = vec!["acc:/:one".to_string()];
+        let two = vec!["acc:/:two".to_string()];
+        let none: Vec<String> = vec![];
+
+        // Characters FTS5 would read as syntax, and FTS5 operator words.
+        for q in [
+            "50% off", "hello!", "a/b", "#launch", "$100", "budget, plan", "invoice OR", "NOT budget",
+            "budget NOT", "(budget", "budget)", "AND", "NEAR", "OR budget", "\"unclosed", "\"\"",
+            "x^y", "budget -plan", "{budget}", "budget AND", "re:budget", "__FQ0__", "_",
+            // Fields with no value before the next field.
+            "from: to: meeting", "subject: cc: budget", "to: body: call", "from: from: invoice",
+            // A NUL, which FTS5 reads as the end of the query.
+            "budget\u{0}", "budget\u{0}plan", "\"a\u{0}b\"", "\u{0}alice",
+        ] {
+            search_ok(&conn, q, &known_years);
+        }
+
+        // Words are searched as typed, punctuation inside them included.
+        assert_eq!(search_ok(&conn, "café", &known_years), one, "non-ASCII word");
+        assert_eq!(search_ok(&conn, "cafe", &known_years), one, "without its accent");
+        assert_eq!(search_ok(&conn, "50% off", &known_years), one);
+        assert_eq!(search_ok(&conn, "budget\u{0}", &known_years), one, "a NUL separates words");
+        // Words in any script.
+        for q in ["日本語", "हिन्दी", "Привет"] {
+            assert_eq!(search_ok(&conn, q, &known_years), two, "{q}");
+        }
+        assert_eq!(search_ok(&conn, "R&D", &known_years), one);
+        assert_eq!(search_ok(&conn, "budget, plan", &known_years), one);
+        assert_eq!(search_ok(&conn, "(budget", &known_years), one);
+        // A name before a colon that is not a field is text: "note" matches "notes".
+        assert_eq!(search_ok(&conn, "note: launch", &known_years), one);
+        // A phrase beside a word that has synonyms.
+        assert_eq!(search_ok(&conn, "meeting \"budget plan\"", &known_years), one);
+        assert_eq!(search_ok(&conn, "\"budget plan\" meeting", &known_years), one);
+
+        // The documented fields still scope, whatever their case, with or without a space
+        // after the colon: bob@example.com is in the body, not the sender.
+        assert_eq!(search_ok(&conn, "from:alice@example.com", &known_years), one);
+        assert_eq!(search_ok(&conn, "from: \"alice@example.com\"", &known_years), one);
+        assert_eq!(search_ok(&conn, "from:\"alice@example.com\" launch", &known_years), one);
+        assert_eq!(search_ok(&conn, "from:bob@example.com", &known_years), none);
+        assert_eq!(search_ok(&conn, "Subject:budget", &known_years), one);
+        assert_eq!(search_ok(&conn, "subject:launch", &known_years), none);
+        assert_eq!(search_ok(&conn, "to:team", &known_years), one);
+        assert_eq!(search_ok(&conn, "body:launch", &known_years), one);
+    }
+
+    /// A partial word of 4+ bytes gets the prefix star, so a short word in another script finds
+    /// the longer one, and a CJK word finds the unspaced run it starts (indexed as one token).
+    #[test]
+    fn test_search_finds_short_partial_words_in_any_script() {
+        let (conn, mut known_years) = setup_test_db();
+        let a_week_ago = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        insert_test_message_full(&conn, &mut known_years, "acc:/:p1", "会議は明日です", "erin@example.com", "team@example.com", "Agenda attached.", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:p2", "Привет", "erin@example.com", "team@example.com", "Greetings.", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:p3", "Zürich trip", "erin@example.com", "team@example.com", "Tickets.", a_week_ago);
+        for (q, id) in [("会議", "acc:/:p1"), ("При", "acc:/:p2"), ("Zür", "acc:/:p3")] {
+            assert_eq!(search_ok(&conn, q, &known_years), vec![id.to_string()], "{q}");
+        }
+    }
+
+    /// A field is the text before the first colon, so a value may hold colons (`subject:Re:`,
+    /// `body:https://…`), as in 0.11.8.
+    #[test]
+    fn test_search_field_value_may_hold_a_colon() {
+        let (conn, mut known_years) = setup_test_db();
+        let a_week_ago = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        insert_test_message_full(&conn, &mut known_years, "acc:/:c1", "Re: budget", "erin@example.com", "team@example.com", "Notes.", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:c2", "Notes", "erin@example.com", "team@example.com", "Re the budget.", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:c3", "Link", "erin@example.com", "team@example.com", "See https://example.com/x today.", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:c4", "https://example.com/x", "erin@example.com", "team@example.com", "Other.", a_week_ago);
+        assert_eq!(search_ok(&conn, "subject:Re: budget", &known_years), vec!["acc:/:c1".to_string()]);
+        assert_eq!(search_ok(&conn, "body:https://example.com/x", &known_years), vec!["acc:/:c3".to_string()]);
+    }
+
+    /// A possessive looks up its word with the `s`, as 0.11.8 did: `comment's` gets the synonyms
+    /// of `comments`, in either apostrophe and either case.
+    #[test]
+    fn test_search_possessive_of_a_plural_synonym_key_expands() {
+        let (conn, mut known_years) = setup_test_db();
+        let a_week_ago = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        insert_test_message_full(&conn, &mut known_years, "acc:/:p1", "Thoughts on the deck", "erin@example.com", "team@example.com", "My feedback on the slides", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:p2", "Lunch plans", "erin@example.com", "team@example.com", "Pizza on Friday", a_week_ago);
+        for q in ["comment's", "COMMENT'S", "comment\u{2019}s", "COMMENT\u{2019}S"] {
+            assert_eq!(search_ok(&conn, q, &known_years), vec!["acc:/:p1".to_string()], "{q:?}");
+        }
+    }
+
+    /// A kept NOT excludes the word typed: its synonyms would also exclude the left side's.
+    #[test]
+    fn test_search_not_excludes_only_the_word_typed() {
+        let (conn, mut known_years) = setup_test_db();
+        let a_week_ago = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        insert_test_message_full(&conn, &mut known_years, "acc:/:r1", "Invoice for March", "accounts@example.com", "team@example.com", "The invoice is attached.", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:r2", "Receipt for March", "accounts@example.com", "team@example.com", "Here is the receipt.", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:r3", "Payment due in March", "accounts@example.com", "team@example.com", "Please pay soon.", a_week_ago);
+        let found = |q: &str| -> Vec<String> {
+            let mut ids = search_ok(&conn, q, &known_years);
+            ids.sort();
+            ids
+        };
+        let ids = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+
+        // The left side still expands (payment); only mail with the word typed is excluded.
+        assert_eq!(found("invoice NOT receipt"), ids(&["acc:/:r1", "acc:/:r3"]));
+        assert_eq!(found("March NOT receipt"), ids(&["acc:/:r1", "acc:/:r3"]));
+        // A NOT that is dropped leaves the word a search term with its synonyms.
+        assert_eq!(found("NOT receipt"), ids(&["acc:/:r1", "acc:/:r2", "acc:/:r3"]));
+        // A word after a kept AND or OR still expands.
+        assert_eq!(found("zebra OR receipt"), ids(&["acc:/:r1", "acc:/:r2", "acc:/:r3"]));
+        assert_eq!(found("March AND receipt"), ids(&["acc:/:r1", "acc:/:r2", "acc:/:r3"]));
+    }
+
+    /// Capital AND, OR and NOT between two terms are operators, as they always were
+    /// (`from:X OR to:X`); first, last or doubled they are dropped. Any whitespace separates
+    /// words, and a word with no letter or digit never hides a match.
+    #[test]
+    fn test_search_operators_separators_and_text_less_words() {
+        let (conn, mut known_years) = setup_test_db();
+        let a_week_ago = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        insert_test_message_full(
+            &conn, &mut known_years, "acc:/:one",
+            "Budget plan for the café",
+            "alice@example.com", "team@example.com",
+            "R&D notes: 50% off the launch, and the meeting with bob@example.com",
+            a_week_ago,
+        );
+        insert_test_message_full(
+            &conn, &mut known_years, "acc:/:two",
+            "Greetings", "carol@example.com", "dave@example.com",
+            "日本語 हिन्दी Привет",
+            a_week_ago,
+        );
+        let found = |q: &str| -> Vec<String> {
+            let mut ids = search_ok(&conn, q, &known_years);
+            ids.sort();
+            ids
+        };
+        let one = vec!["acc:/:one".to_string()];
+        let two = vec!["acc:/:two".to_string()];
+        let both = vec!["acc:/:one".to_string(), "acc:/:two".to_string()];
+        let none: Vec<String> = vec![];
+
+        assert_eq!(found("from:alice@example.com OR from:carol@example.com"), both);
+        assert_eq!(found("from:\"alice@example.com\" OR to:\"dave@example.com\""), both);
+        assert_eq!(found("\"budget plan\" OR greetings"), both);
+        // Beside a synonym group.
+        assert_eq!(found("meeting OR greetings"), both);
+        assert_eq!(found("from:alice@example.com AND from:carol@example.com"), none);
+        assert_eq!(found("from:alice@example.com AND launch"), one);
+        assert_eq!(found("from:alice@example.com NOT launch"), none);
+        assert_eq!(found("from:alice@example.com NOT greetings"), one);
+        assert_eq!(found("greetings NOT budget"), two);
+        // An operator replaces one join: this is café, or greetings and budget.
+        assert_eq!(found("café OR greetings budget"), one);
+        // Not between two terms: dropped.
+        assert_eq!(found("NOT budget"), one);
+        assert_eq!(found("OR greetings"), two);
+        assert_eq!(found("greetings OR"), two);
+        assert_eq!(found("greetings OR NOT budget"), both);
+        assert_eq!(found("greetings OR -- budget"), both);
+
+        // Tabs, no-break and ideographic spaces separate words like a space: the words are
+        // found apart, not as the phrase "plan budget".
+        assert_eq!(found("\"plan budget\""), none);
+        for q in ["plan budget", "plan\tbudget", "plan\u{a0}budget", "plan\u{3000}budget"] {
+            assert_eq!(found(q), one, "{q:?}");
+        }
+
+        // A word with no letter or digit, beside words with synonyms (an AND join).
+        assert_eq!(found("budget ?"), one);
+        assert_eq!(found("meeting -- \"\""), one);
+        // Letters the tokenizer does not index (enclosed-letter symbols, a lone mark) too.
+        for q in ["meeting \u{24d0}", "budget \u{1f17f}\u{fe0f}", "\"\u{24d0}\" meeting", "meeting AND \u{24d0}", "meeting \u{93e}"] {
+            assert_eq!(found(q), one, "{q:?}");
+        }
+    }
+
+    /// A private-use character is indexed, so a query keeps it: it finds the mail that has it.
+    #[test]
+    fn test_search_keeps_private_use_characters() {
+        let (conn, mut known_years) = setup_test_db();
+        let a_week_ago = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        insert_test_message_full(&conn, &mut known_years, "acc:/:mark", "Plan \u{e000} launch", "alice@example.com", "team@example.com", "", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:plain", "Plan launch", "alice@example.com", "team@example.com", "", a_week_ago);
+        assert_eq!(search_ok(&conn, "plan \u{e000}", &known_years), vec!["acc:/:mark".to_string()]);
+    }
+
+    /// A word with an apostrophe finds the text it was written as: the tokenizer splits
+    /// `O'Brien` into `o` and `brien`, and the word must search those, not `obrien`.
+    #[test]
+    fn test_search_finds_words_with_apostrophes() {
+        let (conn, mut known_years) = setup_test_db();
+        let a_week_ago = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        insert_test_message_full(
+            &conn, &mut known_years, "acc:/:apostrophe",
+            "Lunch with O'Brien", "alice@example.com", "team@example.com",
+            "Don't forget the receipts.",
+            a_week_ago,
+        );
+        insert_test_message_full(
+            &conn, &mut known_years, "acc:/:joined",
+            "Lunch with OBrien", "carol@example.com", "team@example.com",
+            "Dont forget the receipts.",
+            a_week_ago,
+        );
+        insert_test_message_full(&conn, &mut known_years, "acc:/:sarah", "Invoice from Sarah", "sarah@example.com", "team@example.com", "Thanks, Sarah", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:sarahs", "Sarah's invoice", "billing@example.com", "team@example.com", "", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:john", "Travel", "agent@example.com", "team@example.com", "John booked the flight to Denver.", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:team", "Team budget", "carol@example.com", "team@example.com", "", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:expense", "Travel expense report", "agent@example.com", "office@example.com", "", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:r5", "Files", "agent@example.com", "office@example.com", "Tommy sent the files.", a_week_ago);
+        let found = |q: &str| -> Vec<String> {
+            let mut ids = search_ok(&conn, q, &known_years);
+            ids.sort();
+            ids
+        };
+        let apostrophe = vec!["acc:/:apostrophe".to_string()];
+        for q in ["O'Brien", "o'brien", "subject:O'Brien", "don't forget", "Don't"] {
+            assert_eq!(found(q), apostrophe, "{q:?}");
+        }
+        // A possessive finds what it names, written with or without the 's.
+        let sarah = vec!["acc:/:sarah".to_string(), "acc:/:sarahs".to_string()];
+        for q in ["Sarah's", "Sarah\u{2019}s invoice", "SARAH'S", "Sarah's.", "Sarah's...", "Sarah's,", "(Sarah's)", "Sarah's?"] {
+            assert_eq!(found(q), sarah, "{q:?}");
+        }
+        assert_eq!(found("John's flight"), vec!["acc:/:john".to_string()]);
+        // A short name's possessive stays a prefix, as 0.11.8's `Toms*` was.
+        assert_eq!(found("Tom's"), vec!["acc:/:r5".to_string()]);
+        assert_eq!(found("team's budget"), vec!["acc:/:team".to_string()]);
+        // Quote marks around a word are not part of it: it still expands to its synonyms.
+        assert_eq!(found("'budget'"), vec!["acc:/:expense".to_string(), "acc:/:team".to_string()]);
+    }
+
+    /// A word gets its automatic prefix star unless a word with synonyms is in its own run of
+    /// words (between quoted phrases), as before: `notes` here still finds "Notesheet".
+    #[test]
+    fn test_search_prefix_star_is_decided_per_run_of_words() {
+        let (conn, mut known_years) = setup_test_db();
+        let a_week_ago = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        insert_test_message_full(&conn, &mut known_years, "acc:/:sheet", "Roadmapping", "alice@example.com", "team@example.com", "Notesheet from Jane Doe for the meeting", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:other", "Roadmapping", "alice@example.com", "team@example.com", "Jane Doe set up the meeting", a_week_ago);
+        assert_eq!(search_ok(&conn, "notes \"Jane Doe\" roadmapping meeting", &known_years), vec!["acc:/:sheet".to_string()]);
+        // A possessive does not expand, so `notes` beside it stays a prefix: this finds
+        // "Notesheet", and not the mail that has only a synonym of "client".
+        insert_test_message_full(&conn, &mut known_years, "acc:/:r1", "Notesheet for the client", "alice@example.com", "office@example.com", "", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:r2", "Notes for the customer", "alice@example.com", "office@example.com", "", a_week_ago);
+        assert_eq!(search_ok(&conn, "client's notes", &known_years), vec!["acc:/:r1".to_string()]);
+        // A field's value beside a synonym group is not a prefix either, as before.
+        insert_test_message_full(&conn, &mut known_years, "acc:/:r3", "Meeting", "alex@example.com", "office@example.com", "", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:r4", "Meeting", "alexandra@example.com", "office@example.com", "", a_week_ago);
+        for q in ["meeting from:alex", "meeting from: alex"] {
+            assert_eq!(search_ok(&conn, q, &known_years), vec!["acc:/:r3".to_string()], "{q}");
+        }
+    }
+
+    /// Inserts a message with the given FTS columns set and the others empty.
+    fn insert_with_fields(conn: &Connection, known_years: &mut HashSet<i32>, msg_id: &str, fields: &[(&str, &str)]) {
+        let date_ms = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        conn.execute("INSERT OR IGNORE INTO message_ids (msgId) VALUES (?1)", params![msg_id]).unwrap();
+        let row_id: i64 = conn.query_row("SELECT rowid FROM message_ids WHERE msgId = ?1", params![msg_id], |r| r.get(0)).unwrap();
+        let year = year_from_date_ms(date_ms);
+        ensure_shard(conn, year, known_years).unwrap();
+        let table = fts_table_name(year);
+        let field = |c: &str| fields.iter().find(|(k, _)| *k == c).map(|(_, v)| *v).unwrap_or("");
+        conn.execute(
+            &format!("INSERT INTO {table} (rowid, msgId, subject, from_, to_, cc, bcc, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"),
+            params![row_id, msg_id, field("subject"), field("from_"), field("to_"), field("cc"), field("bcc"), field("body")],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO message_meta (rowid, dateMs, hasAttachments, parsedIcsAttachments, shardYear) VALUES (?1, ?2, 0, '', ?3)",
+            params![row_id, date_ms, year],
+        ).unwrap();
+    }
+
+    /// Each field the search tools document scopes to its own column, in FTS search (typed in
+    /// either case) and in the hybrid search's vector filter (checked for the lowercase name); no
+    /// other name scopes.
+    #[test]
+    fn test_each_documented_field_scopes_to_its_column() {
+        // Written out here, not read from QUERY_COLUMNS, so a dropped or wrong entry fails.
+        let documented = [
+            ("subject", "subject"), ("from", "from_"), ("from_", "from_"), ("to", "to_"),
+            ("to_", "to_"), ("cc", "cc"), ("bcc", "bcc"), ("body", "body"),
+        ];
+        for (typed, col) in documented {
+            let (conn, mut known_years) = setup_test_db();
+            insert_with_fields(&conn, &mut known_years, "acc:/:in-field", &[(col, "zorblax@example.com")]);
+            let elsewhere = if col == "body" { "subject" } else { "body" };
+            insert_with_fields(&conn, &mut known_years, "acc:/:elsewhere", &[(elsewhere, "zorblax@example.com")]);
+            for q in [format!("{typed}:zorblax@example.com"), format!("{} zorblax@example.com", format!("{typed}:").to_uppercase())] {
+                assert_eq!(search_ok(&conn, &q, &known_years), vec!["acc:/:in-field".to_string()], "{q}");
+            }
+            let mut both = search_ok(&conn, "zorblax@example.com", &known_years);
+            both.sort();
+            assert_eq!(both, vec!["acc:/:elsewhere".to_string(), "acc:/:in-field".to_string()]);
+
+            let built = build_fts_match(Some(&format!("{typed}:\"a@example.com\" meeting")), QUERY_COLUMNS, true, &SynonymLookup::new());
+            assert!(query_has_column_scope(&built), "{built}");
+            assert_eq!(extract_column_scope_filter(&built), format!("{col}:\"a@example.com\""), "{built}");
+        }
+        let mut listed: Vec<_> = QUERY_COLUMNS.to_vec();
+        listed.sort();
+        let mut expected = documented.to_vec();
+        expected.sort();
+        assert_eq!(listed, expected);
+    }
+
+    /// Words that may be typed together, joined at random: no query makes search fail.
+    pub(crate) const QUERY_FRAGMENTS: &[&str] = &[
+        "from:", "From:", "to:", "cc:", "bcc:", "subject:", "body:", "from_:", "to_:", "note:", ":", "re:",
+        "meeting", "budget", "plan", "call", "invoice", "done", "AND", "OR", "NOT", "NEAR", "\"",
+        "\"budget plan\"", "(", ")", "*", "-", "^", "+", "%", "!", "?", "/", "'", ",", ".", "@", "#", "$",
+        "&", "{", "}", "[", "]", "~", "`", "\\", "|", "<", ">", "=", ";", "_", "café", "日本語", "हिन्दी",
+        "Привет", "ⓐ", "\u{301}", "😀", "\u{a0}", "\u{3000}", "\u{200b}", "\u{feff}", "\u{2028}",
+        "\u{e000}", "\u{1}", "\u{0}", "\t", " ", "a@example.com",
+    ];
+
+    /// `count` queries of 1 to 7 fragments, from a fixed seed, so a failure repeats.
+    pub(crate) fn random_queries(count: usize) -> Vec<String> {
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        (0..count)
+            .map(|_| {
+                let n = 1 + (next() % 7) as usize;
+                let mut q = String::new();
+                for _ in 0..n {
+                    q.push_str(QUERY_FRAGMENTS[(next() % QUERY_FRAGMENTS.len() as u64) as usize]);
+                    if next() % 2 == 0 {
+                        q.push(' ');
+                    }
+                }
+                q
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_no_query_text_makes_search_fail() {
+        let (conn, mut known_years) = setup_test_db();
+        let a_week_ago = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        insert_test_message_full(
+            &conn, &mut known_years, "acc:/:one", "Budget plan meeting", "alice@example.com",
+            "team@example.com", "the call about the invoice", a_week_ago,
+        );
+        for q in random_queries(3000) {
+            search_ok(&conn, &q, &known_years);
+        }
+    }
+
     #[test]
     fn test_extract_column_scope_filter_quoted_prefix_star() {
         // build_fts_match emits field:"value"* for special-char values — the
@@ -2519,8 +2918,8 @@ mod tests {
         // "dmarc-helper" → phrase [dmarc, helper*]. The trailing star keeps
         // mid-typing partials (incomplete last fragment) matching.
         let synonyms = SynonymLookup::new();
-        assert_eq!(build_fts_match(Some("dmarc-helper"), true, &synonyms), r#""dmarc-helper"*"#);
-        assert_eq!(build_fts_match(Some("user@example.com"), true, &synonyms), r#""user@example.com"*"#);
+        assert_eq!(build_fts_match(Some("dmarc-helper"), QUERY_COLUMNS, true, &synonyms), r#""dmarc-helper"*"#);
+        assert_eq!(build_fts_match(Some("user@example.com"), QUERY_COLUMNS, true, &synonyms), r#""user@example.com"*"#);
     }
 
     #[test]
@@ -4256,6 +4655,27 @@ mod tests {
 
     fn result_ids(results: &[Value]) -> Vec<String> {
         results.iter().map(|r| r["uniqueId"].as_str().unwrap().to_string()).collect()
+    }
+
+    /// With the model loaded, text that leaves no keyword term (`-- ?`, `AND`, `""`) or only a
+    /// scope-like word (`nobody: cares`, an empty column filter) still searches, by meaning.
+    #[test]
+    fn hybrid_search_reads_any_query_text_as_text() {
+        let Some(engine) = embedding_engine() else { return };
+        let (profile, _path, mut conn, mut known_years) = temp_email_db("any-text");
+        let now = chrono::Utc::now().timestamp_millis();
+        let row = email_row("acc:/:one", "Budget plan meeting", "the call about the invoice", now);
+        index_batch(&mut conn, &[row], Some(&engine), &mut known_years).unwrap();
+        let params = serde_json::json!({ "ignoreDate": true });
+        let synonyms = SynonymLookup::new();
+        for q in ["-- ?", "_", "AND", "OR", "NOT", "\"\"", "ⓐ", "nobody: cares", "acc:x", "\"meet body:x\"", "everybody: be ready"] {
+            search(&conn, q, &params, &synonyms, Some(&engine), &known_years)
+                .unwrap_or_else(|e| panic!("hybrid search for {q:?} failed: {e:?}"));
+        }
+        let results = search(&conn, "budget plan meeting", &params, &synonyms, Some(&engine), &known_years).unwrap();
+        assert_eq!(result_ids(&results), vec!["acc:/:one".to_string()]);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(profile);
     }
 
     /// sqlite-vec answers at most VEC_K_MAX nearest vectors and refuses a larger k, and a search at

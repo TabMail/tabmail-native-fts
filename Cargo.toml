@@ -36,6 +36,10 @@ candle-transformers = "0.8"
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 safetensors = "0.5"
 
+# Unicode general categories for the query builder (which characters the FTS tokenizer indexes).
+# Already a dependency of tokenizers (no new crate); its category tables add about 20 KB.
+unicode_categories = "0.1.1"
+
 [dev-dependencies]
 assert_cmd = "2.0.16"
 predicates = "3.1.2"

@@ -480,7 +480,7 @@ fn memory_search_rows(
     let candidate_limit = limit * config::hybrid::CANDIDATE_MULTIPLIER;
 
     // --- FTS5 candidates ---
-    let fts_query = build_fts_match(Some(query), true, synonyms);
+    let fts_query = build_fts_match(Some(query), &[], true, synonyms);
     log::info!(
         "Memory hybrid search: \"{}\" -> FTS \"{}\"",
         query,
@@ -651,7 +651,7 @@ fn memory_search_fts_only(
     ignore_date: bool,
     limit: i64,
 ) -> anyhow::Result<Vec<Value>> {
-    let fts_query = build_fts_match(Some(query), true, synonyms);
+    let fts_query = build_fts_match(Some(query), &[], true, synonyms);
     log::info!(
         "Memory query transformation (with synonyms): \"{}\" -> \"{}\"",
         query,
@@ -1471,6 +1471,138 @@ pub(crate) mod tests {
     }
 
 
+    /// Whatever a user types in the chat history search or a model asks memory, search never
+    /// fails and every word is text: memory has no fields, so `from:` is a word too.
+    #[test]
+    fn memory_search_reads_any_query_text_as_text() {
+        let (dir, mut conn) = temp_memory_db("query-text");
+        let row = serde_json::json!({
+            "memId": "turn:1", "role": "session",
+            "content": "[USER]: from: alice@example.com, the café plan\n\n[AGENT]: R&D is 50% off the budget",
+            "sessionId": "persistent_chat", "turnIndex": 0,
+            "dateMs": chrono::Utc::now().timestamp_millis(),
+        });
+        let other = serde_json::json!({
+            "memId": "turn:2", "role": "session",
+            "content": "[USER]: 日本語 हिन्दी Привет\n\n[AGENT]: Greetings.",
+            "sessionId": "persistent_chat", "turnIndex": 1,
+            "dateMs": chrono::Utc::now().timestamp_millis(),
+        });
+        memory_index_batch(&mut conn, &[row, other], None).unwrap();
+        let synonyms = SynonymLookup::new();
+        let params = serde_json::json!({"ignoreDate": true});
+        let found = |q: &str| -> usize {
+            memory_search(&conn, q, &params, &synonyms, None)
+                .unwrap_or_else(|e| panic!("memory search for {q:?} failed: {e:?}"))
+                .len()
+        };
+        for q in ["50% off", "a/b", "#plan", "NOT plan", "(plan", "plan OR", "\"unclosed", "x^y", "subject:plan", "plan\u{0}", "\"a\u{0}b\""] {
+            found(q);
+        }
+        for q in crate::fts::db::tests::random_queries(3000) {
+            found(&q);
+        }
+        assert_eq!(found("plan\u{0}"), 1, "a NUL separates words");
+        for q in ["日本語", "हिन्दी", "Привет"] {
+            assert_eq!(found(q), 1, "{q}");
+        }
+        assert_eq!(found("from: alice"), 1, "from: is text in memory");
+        assert_eq!(found("from:alice@example.com"), 1);
+        assert_eq!(found("café"), 1, "non-ASCII word");
+        assert_eq!(found("R&D"), 1);
+        assert_eq!(found("50% off"), 1);
+        // Capital AND, OR and NOT between two terms are operators; elsewhere dropped.
+        assert_eq!(found("café OR greetings"), 2);
+        assert_eq!(found("café AND greetings"), 0);
+        assert_eq!(found("café NOT greetings"), 1);
+        assert_eq!(found("NOT café"), 1);
+        assert_eq!(found("greetings OR"), 1);
+        // Any whitespace separates words: found apart, not as the phrase "plan café".
+        assert_eq!(found("\"plan café\""), 0);
+        for q in ["plan\tcafé", "plan\u{a0}café", "plan\u{3000}café"] {
+            assert_eq!(found(q), 1, "{q:?}");
+        }
+        // A word with no letter or digit beside a word with synonyms (an AND join).
+        assert_eq!(found("budget ?"), 1);
+        assert_eq!(found("budget -- \"\""), 1);
+        // Letters the tokenizer does not index (enclosed-letter symbols, a lone mark) too.
+        for q in ["budget \u{24d0}", "budget \u{1f17f}\u{fe0f}", "\"\u{24d0}\" budget", "budget AND \u{24d0}", "budget \u{93e}"] {
+            assert_eq!(found(q), 1, "{q:?}");
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A word with an apostrophe finds the text it was written as (`o` + `brien`), not the
+    /// joined word.
+    #[test]
+    fn memory_search_finds_words_with_apostrophes() {
+        let (dir, mut conn) = temp_memory_db("apostrophe");
+        let rows: Vec<_> = ["[USER]: lunch with O'Brien\n\n[AGENT]: Don't forget the receipts.",
+            "[USER]: lunch with OBrien\n\n[AGENT]: Dont forget the receipts.",
+            "[USER]: what is the team budget?\n\n[AGENT]: Notesheet from Jane Doe: roadmapping for the meeting.",
+            "[USER]: plan \u{e000} launch\n\n[AGENT]: Noted.",
+            "[USER]: plan launch\n\n[AGENT]: Noted.",
+            "[USER]: Notesheet for the client\n\n[AGENT]: Noted.",
+            "[USER]: notes for the customer\n\n[AGENT]: Noted.",
+            "[USER]: Tommy sent the files\n\n[AGENT]: Noted."]
+            .iter()
+            .enumerate()
+            .map(|(i, content)| serde_json::json!({
+                "memId": format!("turn:{i}"), "role": "session", "content": content,
+                "sessionId": "persistent_chat", "turnIndex": i,
+                "dateMs": chrono::Utc::now().timestamp_millis(),
+            }))
+            .collect();
+        memory_index_batch(&mut conn, &rows, None).unwrap();
+        let synonyms = SynonymLookup::new();
+        let params = serde_json::json!({"ignoreDate": true});
+        for q in ["O'Brien", "don't forget", "Don't"] {
+            let found = memory_search(&conn, q, &params, &synonyms, None)
+                .unwrap_or_else(|e| panic!("memory search for {q:?} failed: {e:?}"));
+            let ids: Vec<_> = found.iter().map(|r| r["memId"].as_str().unwrap_or_default()).collect();
+            assert_eq!(ids, ["turn:0"], "{q:?}");
+        }
+        // A possessive finds what it names; a word in a run without synonyms keeps its prefix
+        // star (`notes` finds "Notesheet"), and so does one beside a possessive, which does not
+        // expand; a private-use character is indexed and kept.
+        for (q, want) in [("team's budget", "turn:2"), ("notes \"Jane Doe\" roadmapping budget", "turn:2"), ("plan \u{e000}", "turn:3"), ("client's notes", "turn:5"), ("Tom's", "turn:7"), ("Tom's.", "turn:7")] {
+            let found = memory_search(&conn, q, &params, &synonyms, None)
+                .unwrap_or_else(|e| panic!("memory search for {q:?} failed: {e:?}"));
+            let ids: Vec<_> = found.iter().map(|r| r["memId"].as_str().unwrap_or_default()).collect();
+            assert_eq!(ids, [want], "{q:?}");
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A possessive looks up its word with the `s`: `comment's` gets the synonyms of `comments`,
+    /// in either apostrophe and either case.
+    #[test]
+    fn memory_search_possessive_of_a_plural_synonym_key_expands() {
+        let (dir, mut conn) = temp_memory_db("possessive-synonyms");
+        let rows: Vec<_> = ["[USER]: thoughts on the deck\n\n[AGENT]: My feedback on the slides.",
+            "[USER]: lunch plans\n\n[AGENT]: Pizza on Friday."]
+            .iter()
+            .enumerate()
+            .map(|(i, content)| serde_json::json!({
+                "memId": format!("turn:{i}"), "role": "session", "content": content,
+                "sessionId": "persistent_chat", "turnIndex": i,
+                "dateMs": chrono::Utc::now().timestamp_millis(),
+            }))
+            .collect();
+        memory_index_batch(&mut conn, &rows, None).unwrap();
+        let params = serde_json::json!({"ignoreDate": true});
+        for q in ["comment's", "COMMENT'S", "comment\u{2019}s", "COMMENT\u{2019}S"] {
+            let found = memory_search(&conn, q, &params, &SynonymLookup::new(), None)
+                .unwrap_or_else(|e| panic!("memory search for {q:?} failed: {e:?}"));
+            let ids: Vec<_> = found.iter().map(|r| r["memId"].as_str().unwrap_or_default()).collect();
+            assert_eq!(ids, ["turn:0"], "{q:?}");
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Indexes one text-only exchange dated `i`, as one memory write does.
     fn add_text(conn: &mut Connection, i: usize) {
         let row = serde_json::json!({
@@ -2136,6 +2268,48 @@ pub(crate) mod tests {
         assert_eq!(whole[0]["snippet"], "", "found by meaning, not by its words");
         for params in [serde_json::json!({ "from": now - 1 }), serde_json::json!({ "to": now + 1 })] {
             assert_eq!(search(params.clone()), whole, "{params}");
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// With the model loaded, text that leaves no keyword term (`-- ?`, `AND`, `""`) still
+    /// searches, by meaning.
+    #[test]
+    fn hybrid_memory_search_reads_any_query_text_as_text() {
+        let Some(engine) = embedding_engine() else { return };
+        let (dir, mut conn) = temp_memory_db("hybrid-any-text");
+        let row = serde_json::json!({ "memId": "turn:1", "role": "session", "sessionId": "persistent_chat",
+            "content": "the budget plan for the meeting", "dateMs": chrono::Utc::now().timestamp_millis(), "turnIndex": 0 });
+        memory_index_batch(&mut conn, &[row], Some(&engine)).unwrap();
+        let params = serde_json::json!({ "ignoreDate": true });
+        let synonyms = SynonymLookup::new();
+        for q in ["-- ?", "_", "AND", "OR", "NOT", "\"\"", "ⓐ", "nobody: cares"] {
+            memory_search(&conn, q, &params, &synonyms, Some(&engine))
+                .unwrap_or_else(|e| panic!("hybrid memory search for {q:?} failed: {e:?}"));
+        }
+        let results = memory_search(&conn, "budget", &params, &synonyms, Some(&engine)).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["memId"], "turn:1");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A partial word of 4+ bytes gets the prefix star, in any script.
+    #[test]
+    fn memory_search_finds_short_partial_words_in_any_script() {
+        let (dir, mut conn) = temp_memory_db("short-partial");
+        let now = chrono::Utc::now().timestamp_millis();
+        let rows: Vec<_> = ["会議は明日です", "Привет", "Zürich trip"].iter().enumerate().map(|(i, c)| serde_json::json!({
+            "memId": format!("turn:{i}"), "role": "session", "sessionId": "persistent_chat",
+            "content": c, "dateMs": now, "turnIndex": i,
+        })).collect();
+        memory_index_batch(&mut conn, &rows, None).unwrap();
+        let params = serde_json::json!({ "ignoreDate": true });
+        for (q, id) in [("会議", "turn:0"), ("При", "turn:1"), ("Zür", "turn:2")] {
+            let results = memory_search(&conn, q, &params, &SynonymLookup::new(), None).unwrap();
+            assert_eq!(results.len(), 1, "{q}");
+            assert_eq!(results[0]["memId"], id, "{q}");
         }
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);

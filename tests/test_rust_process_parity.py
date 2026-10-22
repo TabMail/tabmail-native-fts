@@ -275,6 +275,64 @@ class TestRustHelperProcess(unittest.TestCase):
             except Exception:
                 proc.kill()
 
+    def test_scoped_search_with_embeddings_finds_only_the_field(self):
+        """With the embedding model loaded (hybrid search), a field scopes mail search to its
+        column, and memory search reads "from:" as text."""
+        proc = subprocess.Popen([self.rust_helper_path], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            _send_message(proc, {"id": "1", "method": "hello", "params": {"addonVersion": "1.9.1"}})
+            self.assert_success(_read_message(proc), "hello")
+            _send_message(proc, {"id": "2", "method": "init", "params": {"profilePath": self.temp_dir}})
+            init = _read_message(proc)
+            self.assert_success(init, "init")
+            if not init["result"].get("hasEmbeddings"):
+                self.skipTest("embedding model not available")
+
+            now = int(time.time() * 1000)
+            filler = [dict(r, dateMs=now - (i + 10) * 60_000) for i, r in enumerate(_filler_rows("scope-filler"))]
+            a = {"msgId": "scope-a", "folderId": "account:/Scope", "subject": "Quarterly numbers", "from_": "alice@example.com",
+                 "to_": "team@example.com", "cc": "carol@example.com", "bcc": "dave@example.com",
+                 "body": "The quarterly revenue numbers are attached.", "dateMs": now - 60_000, "hasAttachments": False}
+            b = {"msgId": "scope-b", "folderId": "account:/Scope", "subject": "Notes for carol", "from_": "bob@example.com",
+                 "to_": "erin@example.com", "cc": "", "bcc": "",
+                 "body": "Quarterly numbers and revenue: ask carol@example.com and dave@example.com.", "dateMs": now - 120_000, "hasAttachments": False}
+            _send_message(proc, {"id": "3", "method": "indexBatch", "params": {"rows": filler + [a, b]}})
+            self.assert_success(_read_message(proc), "indexBatch")
+
+            def found(q):
+                _send_message(proc, {"id": q, "method": "search", "params": {"q": q, "limit": 10, "ignoreDate": True}})
+                response = _read_message(proc)
+                self.assert_success(response, q)
+                return sorted(r["uniqueId"] for r in response["result"] if r["uniqueId"] in ("scope-a", "scope-b"))
+
+            self.assertEqual(found("carol@example.com"), ["scope-a", "scope-b"])
+            self.assertEqual(found("cc:carol@example.com"), ["scope-a"])
+            self.assertEqual(found('cc:"carol@example.com" quarterly numbers'), ["scope-a"])
+            self.assertEqual(found("bcc:dave@example.com revenue"), ["scope-a"])
+            self.assertEqual(found("from:bob@example.com quarterly"), ["scope-b"])
+            self.assertEqual(found("subject:carol"), ["scope-b"])
+            self.assertEqual(found("to:erin revenue"), ["scope-b"])
+
+            mem = [{"memId": f"scope-m{i}", "role": "session", "content": f"[USER]: lunch options {i}\n\n[AGENT]: Soup.",
+                    "sessionId": "s", "turnIndex": i, "dateMs": now - (i + 10) * 60_000} for i in range(FILLER_COUNT)]
+            mem.append({"memId": "scope-mem", "role": "session", "content": "[USER]: notes from: alice about the offsite\n\n[AGENT]: Saved.",
+                        "sessionId": "s", "turnIndex": 99, "dateMs": now - 60_000})
+            _send_message(proc, {"id": "4", "method": "memoryIndexBatch", "params": {"rows": mem}})
+            self.assert_success(_read_message(proc), "memoryIndexBatch")
+            _send_message(proc, {"id": "5", "method": "memorySearch", "params": {"q": "from: alice offsite", "ignoreDate": True}})
+            response = _read_message(proc)
+            self.assert_success(response, "memorySearch")
+            self.assertIn("scope-mem", [r.get("memId") for r in response["result"]], response["result"])
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+
     def _dated_memory_search_case(self, profile, outside_each_side, inside_content):
         """Indexes, with the embedding model loaded, exchanges about the itinerary (the nearest to
         the query) on both sides of a one-day range, exchanges within it (`inside_content`, one at

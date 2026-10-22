@@ -226,6 +226,14 @@ FTS5 uses Porter stemming for English:
 | `invoice` | bill, payment, receipt, statement |
 | `attachment` | attached, file, document, enclosed |
 
+### Query Text
+
+Every word and `"quoted phrase"` in a query is searched as text, so punctuation never causes a
+syntax error. A capitalized `AND`, `OR` or `NOT` between two terms is an operator
+(`from:"alice@example.com" OR to:"alice@example.com"`); anywhere else it is dropped. Mail search scopes `subject:`, `from:`, `to:`,
+`cc:`, `bcc:` and `body:` (for example `from:"alice@example.com" budget`); any other `word:` is
+text, and memory search has no fields.
+
 ### BM25 Column Weights
 
 Search results are ranked with column-specific weights:
