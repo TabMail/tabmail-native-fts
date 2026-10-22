@@ -65,7 +65,9 @@ pub fn build_fts_match(
                         }
                     }
                     Some((col, value)) => word(value, false, has_or_groups, synonyms).map(|v| format!("{col}:{v}")),
-                    None => word(w, use_synonyms, has_or_groups, synonyms),
+                    // A kept NOT excludes the word typed: its synonyms would exclude the left
+                    // side's too (`invoice NOT receipt` would find nothing).
+                    None => word(w, use_synonyms && !(operator == Some("NOT") && !out.is_empty()), has_or_groups, synonyms),
                 },
             };
             if let Some(term) = term {
@@ -282,6 +284,10 @@ mod tests {
         // Beside a synonym group, an operator replaces the AND join.
         let q = build("meeting OR zebra", COLUMNS);
         assert!(q.starts_with('(') && q.ends_with(r#") OR "zebra""#), "{q}");
+        // A kept NOT excludes the word typed, not its synonyms; a dropped NOT changes nothing.
+        let q = build("invoice NOT receipt", &[]);
+        assert!(q.starts_with('(') && q.ends_with(r#") NOT "receipt""#), "{q}");
+        assert_eq!(build("NOT receipt", &[]), build("receipt", &[]));
     }
 
     #[test]

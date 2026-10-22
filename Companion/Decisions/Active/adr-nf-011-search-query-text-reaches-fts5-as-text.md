@@ -61,6 +61,11 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
    to:"a@example.com"`, `"budget plan" OR greetings`, `alice NOT carol`. One that is first, last,
    after another operator, or left with no written term after it is dropped (`NOT budget` searches
    `budget`), so it can never be a syntax error. Lowercase, quoted or a field's value, it is text.
+   The word after a kept `NOT` searches what was typed, without its synonyms: expanded, it would
+   also exclude the left side's (`invoice NOT receipt` found nothing). FTS5's grammar decides what
+   a kept `NOT` excludes: without a synonym group, the rest of the run of words (`alice NOT carol
+   zebra` is alice NOT (carol zebra), as in 0.11.8); with one, the explicit `AND` leaves it only
+   the next term.
    The hybrid column filter keeps joining the scoped terms with a space, as before, so a kept
    `NOT` is not applied to hybrid vector candidates: `budget NOT from:bob@example.com` (an FTS5
    error in 0.11.8, as `budget` has synonyms) returns bob's mail through the vector side, as
@@ -107,7 +112,8 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
   a query-wide star rule), including `client's notes` finding "Notesheet for the client" and not
   "Notes for the customer" (red when a possessive expands) and a field's value beside a group
   staying exact (`meeting from:alex` does not find alexandra); an operator replaces one join only
-  (`café OR greetings budget`); the text-less tests include enclosed letters and
+  (`café OR greetings budget`); `db::tests::test_search_not_excludes_only_the_word_typed` finds
+  `invoice NOT receipt` and `March NOT receipt` (red when the word after `NOT` expands); the text-less tests include enclosed letters and
   a lone mark, and `test_search_keeps_private_use_characters` is two-sided (red with
   `is_alphanumeric`); `test_rust_process_parity` `test_scoped_search_with_embeddings_finds_only_the_field` checks the
   same with the embedding model loaded.
@@ -128,7 +134,7 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
     takes a phrase without starting a new run of words. Typed parentheses are text, not grouping
     (`(budget OR plan) review`; 0.11.8 failed on them).
   - Pre-existing in 0.11.8, tracked separately: a kept `NOT` is not applied to hybrid vector
-    candidates (#21); a query with more than 256 kept `NOT`s exceeds FTS5's expression depth and
+    candidates (#21); a long chain of kept `NOT`s (about 256) exceeds FTS5's expression depth and
     fails (#22).
 - `role:` / `content:` no longer scope in memory search, and `msgId:` / `attachmentNames:` no longer
   scope in mail search (all undocumented and unused by any client).

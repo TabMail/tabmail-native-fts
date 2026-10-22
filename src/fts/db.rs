@@ -2596,6 +2596,28 @@ pub(crate) mod tests {
         assert_eq!(search_ok(&conn, "body:launch", &known_years), one);
     }
 
+    /// A kept NOT excludes the word typed: its synonyms would also exclude the left side's.
+    #[test]
+    fn test_search_not_excludes_only_the_word_typed() {
+        let (conn, mut known_years) = setup_test_db();
+        let a_week_ago = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        insert_test_message_full(&conn, &mut known_years, "acc:/:r1", "Invoice for March", "accounts@example.com", "team@example.com", "The invoice is attached.", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:r2", "Receipt for March", "accounts@example.com", "team@example.com", "Here is the receipt.", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:r3", "Payment due in March", "accounts@example.com", "team@example.com", "Please pay soon.", a_week_ago);
+        let found = |q: &str| -> Vec<String> {
+            let mut ids = search_ok(&conn, q, &known_years);
+            ids.sort();
+            ids
+        };
+        let ids = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+
+        // The left side still expands (payment); only mail with the word typed is excluded.
+        assert_eq!(found("invoice NOT receipt"), ids(&["acc:/:r1", "acc:/:r3"]));
+        assert_eq!(found("March NOT receipt"), ids(&["acc:/:r1", "acc:/:r3"]));
+        // A NOT that is dropped leaves the word a search term with its synonyms.
+        assert_eq!(found("NOT receipt"), ids(&["acc:/:r1", "acc:/:r2", "acc:/:r3"]));
+    }
+
     /// Capital AND, OR and NOT between two terms are operators, as they always were
     /// (`from:X OR to:X`); first, last or doubled they are dropped. Any whitespace separates
     /// words, and a word with no letter or digit never hides a match.
