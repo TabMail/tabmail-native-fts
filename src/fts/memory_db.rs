@@ -2246,6 +2246,48 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// With the model loaded, text that leaves no keyword term (`-- ?`, `AND`, `""`) still
+    /// searches, by meaning.
+    #[test]
+    fn hybrid_memory_search_reads_any_query_text_as_text() {
+        let Some(engine) = embedding_engine() else { return };
+        let (dir, mut conn) = temp_memory_db("hybrid-any-text");
+        let row = serde_json::json!({ "memId": "turn:1", "role": "session", "sessionId": "persistent_chat",
+            "content": "the budget plan for the meeting", "dateMs": chrono::Utc::now().timestamp_millis(), "turnIndex": 0 });
+        memory_index_batch(&mut conn, &[row], Some(&engine)).unwrap();
+        let params = serde_json::json!({ "ignoreDate": true });
+        let synonyms = SynonymLookup::new();
+        for q in ["-- ?", "_", "AND", "OR", "NOT", "\"\"", "ⓐ", "nobody: cares"] {
+            memory_search(&conn, q, &params, &synonyms, Some(&engine))
+                .unwrap_or_else(|e| panic!("hybrid memory search for {q:?} failed: {e:?}"));
+        }
+        let results = memory_search(&conn, "budget", &params, &synonyms, Some(&engine)).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["memId"], "turn:1");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A partial word of 4+ bytes gets the prefix star, in any script.
+    #[test]
+    fn memory_search_finds_short_partial_words_in_any_script() {
+        let (dir, mut conn) = temp_memory_db("short-partial");
+        let now = chrono::Utc::now().timestamp_millis();
+        let rows: Vec<_> = ["会議は明日です", "Привет", "Zürich trip"].iter().enumerate().map(|(i, c)| serde_json::json!({
+            "memId": format!("turn:{i}"), "role": "session", "sessionId": "persistent_chat",
+            "content": c, "dateMs": now, "turnIndex": i,
+        })).collect();
+        memory_index_batch(&mut conn, &rows, None).unwrap();
+        let params = serde_json::json!({ "ignoreDate": true });
+        for (q, id) in [("会議", "turn:0"), ("При", "turn:1"), ("Zür", "turn:2")] {
+            let results = memory_search(&conn, q, &params, &SynonymLookup::new(), None).unwrap();
+            assert_eq!(results.len(), 1, "{q}");
+            assert_eq!(results[0]["memId"], id, "{q}");
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A hybrid memory search asks sqlite-vec for `limit` x CANDIDATE_MULTIPLIER nearest vectors,
     /// which it refuses past VEC_K_MAX; the `limit` is capped at SEARCH_LIMIT_MAX to keep within it
     /// (TabMail Voice asks for 2,000). At any `limit` asked, a match by meaning alone is still

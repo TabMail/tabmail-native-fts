@@ -2596,6 +2596,34 @@ pub(crate) mod tests {
         assert_eq!(search_ok(&conn, "body:launch", &known_years), one);
     }
 
+    /// A partial word of 4+ bytes gets the prefix star, so a short word in another script finds
+    /// the longer one, and a CJK word finds the unspaced run it starts (indexed as one token).
+    #[test]
+    fn test_search_finds_short_partial_words_in_any_script() {
+        let (conn, mut known_years) = setup_test_db();
+        let a_week_ago = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        insert_test_message_full(&conn, &mut known_years, "acc:/:p1", "会議は明日です", "erin@example.com", "team@example.com", "Agenda attached.", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:p2", "Привет", "erin@example.com", "team@example.com", "Greetings.", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:p3", "Zürich trip", "erin@example.com", "team@example.com", "Tickets.", a_week_ago);
+        for (q, id) in [("会議", "acc:/:p1"), ("При", "acc:/:p2"), ("Zür", "acc:/:p3")] {
+            assert_eq!(search_ok(&conn, q, &known_years), vec![id.to_string()], "{q}");
+        }
+    }
+
+    /// A field is the text before the first colon, so a value may hold colons (`subject:Re:`,
+    /// `body:https://…`), as in 0.11.8.
+    #[test]
+    fn test_search_field_value_may_hold_a_colon() {
+        let (conn, mut known_years) = setup_test_db();
+        let a_week_ago = chrono::Utc::now().timestamp_millis() - 7 * 24 * 3600 * 1000;
+        insert_test_message_full(&conn, &mut known_years, "acc:/:c1", "Re: budget", "erin@example.com", "team@example.com", "Notes.", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:c2", "Notes", "erin@example.com", "team@example.com", "Re the budget.", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:c3", "Link", "erin@example.com", "team@example.com", "See https://example.com/x today.", a_week_ago);
+        insert_test_message_full(&conn, &mut known_years, "acc:/:c4", "https://example.com/x", "erin@example.com", "team@example.com", "Other.", a_week_ago);
+        assert_eq!(search_ok(&conn, "subject:Re: budget", &known_years), vec!["acc:/:c1".to_string()]);
+        assert_eq!(search_ok(&conn, "body:https://example.com/x", &known_years), vec!["acc:/:c3".to_string()]);
+    }
+
     /// A possessive looks up its word with the `s`, as 0.11.8 did: `comment's` gets the synonyms
     /// of `comments`.
     #[test]
@@ -2794,8 +2822,9 @@ pub(crate) mod tests {
         ).unwrap();
     }
 
-    /// Each field the search tools document scopes to its own column, in FTS search and in the
-    /// hybrid search's vector filter; no other name scopes.
+    /// Each field the search tools document scopes to its own column, in FTS search (typed in
+    /// either case) and in the hybrid search's vector filter (checked for the lowercase name); no
+    /// other name scopes.
     #[test]
     fn test_each_documented_field_scopes_to_its_column() {
         // Written out here, not read from QUERY_COLUMNS, so a dropped or wrong entry fails.
@@ -4624,6 +4653,27 @@ pub(crate) mod tests {
 
     fn result_ids(results: &[Value]) -> Vec<String> {
         results.iter().map(|r| r["uniqueId"].as_str().unwrap().to_string()).collect()
+    }
+
+    /// With the model loaded, text that leaves no keyword term (`-- ?`, `AND`, `""`) or only a
+    /// scope-like word (`nobody: cares`, an empty column filter) still searches, by meaning.
+    #[test]
+    fn hybrid_search_reads_any_query_text_as_text() {
+        let Some(engine) = embedding_engine() else { return };
+        let (profile, _path, mut conn, mut known_years) = temp_email_db("any-text");
+        let now = chrono::Utc::now().timestamp_millis();
+        let row = email_row("acc:/:one", "Budget plan meeting", "the call about the invoice", now);
+        index_batch(&mut conn, &[row], Some(&engine), &mut known_years).unwrap();
+        let params = serde_json::json!({ "ignoreDate": true });
+        let synonyms = SynonymLookup::new();
+        for q in ["-- ?", "_", "AND", "OR", "NOT", "\"\"", "ⓐ", "nobody: cares", "acc:x", "\"meet body:x\"", "everybody: be ready"] {
+            search(&conn, q, &params, &synonyms, Some(&engine), &known_years)
+                .unwrap_or_else(|e| panic!("hybrid search for {q:?} failed: {e:?}"));
+        }
+        let results = search(&conn, "budget plan meeting", &params, &synonyms, Some(&engine), &known_years).unwrap();
+        assert_eq!(result_ids(&results), vec!["acc:/:one".to_string()]);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(profile);
     }
 
     /// sqlite-vec answers at most VEC_K_MAX nearest vectors and refuses a larger k, and a search at

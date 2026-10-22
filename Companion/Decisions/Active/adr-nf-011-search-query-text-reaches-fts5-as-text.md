@@ -119,13 +119,22 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
   the word after a kept `AND` or `OR` still expands; the text-less tests include enclosed letters and
   a lone mark, and `test_search_keeps_private_use_characters` is two-sided (red with
   `is_alphanumeric`); `test_rust_process_parity` `test_scoped_search_with_embeddings_finds_only_the_field` checks the
-  same with the embedding model loaded.
+  same with the embedding model loaded; `hybrid_search_reads_any_query_text_as_text` and its
+  memory twin run text that leaves no keyword term or an empty column filter through the hybrid
+  search (red without its empty-input guards); `test_search_finds_short_partial_words_in_any_script`
+  and its memory twin find `会議`, `При` and `Zür` (red when the star counts characters, not
+  bytes); `test_search_field_value_may_hold_a_colon` scopes `subject:Re: budget` and
+  `body:https://example.com/x` (red when the field ends at the last colon).
 - A differential against the released 0.11.8 helper (Thunderbird-shaped `search` and
   `memorySearch`, with and without the embedding model, 2026-10-21) found no query that newly
   fails, and no common query shape that finds less, apart from the intended apostrophe change
   above (`O'Brien`, `don't`) and the possessive of a short word ending in `ie` (`Tie's` searches
   `tie*`, not 0.11.8's `Ties*`, and misses mail saying only "ties"), a variant form the owner's
-  rule in the next item leaves to the vector side.
+  rule in the next item leaves to the vector side. Two differences find fewer rows on purpose: a
+  capitalized field (`Subject:Invoice`) now filters the hybrid search's vector candidates, which
+  0.11.8's case-sensitive check missed, so vector neighbours outside the field are no longer
+  returned; and a typographic possessive (`comment’s`) now expands like the straight one, so its
+  run of words loses the automatic prefix star.
 - The apostrophe trade was approved by the owner on 2026-10-21: a word with an inner apostrophe
   finds the text as typed (`O'Brien`, `don't`), and no longer the spelling without it (`Don't`
   misses "Dont", `you're` misses "your", `we'll` misses "well", which 0.11.8 found by deleting
@@ -136,8 +145,8 @@ In Thunderbird a failed search reaches the chat tools as an error, and Chat Hist
   - Rare input: a few code points are read differently from unicode61's Unicode 6.1 data (code
     points unassigned in 6.1, which it indexes, are dropped; New Tai Lue vowel signs, letters
     today but marks in 6.1, are kept and match nothing). A `*` inside a word (`budg*et`) is part
-    of the word, not a prefix marker. A field with a space before its value (`from: "jane doe"`)
-    takes a phrase without starting a new run of words. Typed parentheses are text, not grouping
+    of the word, not a prefix marker. A field followed by a phrase (`from: "jane doe"`, or
+    `from:"jane doe"`) takes it without starting a new run of words. Typed parentheses are text, not grouping
     (`(budget OR plan) review`; 0.11.8 failed on them).
   - Pre-existing in 0.11.8, tracked separately: a kept `NOT` is not applied to hybrid vector
     candidates (#21); a long chain of kept `NOT`s (about 256) exceeds FTS5's expression depth and
