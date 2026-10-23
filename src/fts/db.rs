@@ -5499,4 +5499,115 @@ pub(crate) mod tests {
         drop(conn);
         let _ = std::fs::remove_dir_all(profile);
     }
+
+    /// A date sort reads 4,096 keyword candidates: with exactly that many matches, the newest
+    /// (oldest) one is found although it is the worst by keyword, so any smaller pool misses it.
+    /// One vector keeps the search hybrid (an index part way through its embedding rebuild).
+    #[test]
+    fn a_date_sort_reads_4096_keyword_candidates() {
+        let Some(engine) = embedding_engine() else { return };
+        let now = mid_year_ms();
+        for (sort, weak_date) in [("date_desc", now + 1000), ("date_asc", now - 4095 * 1000)] {
+            let (profile, _path, mut conn, mut known_years) = temp_email_db(&format!("pool-keyword-{sort}"));
+            let strong = |i: i64| email_row(&format!("acc:/:strong-{i}"), "Budget", "budget budget budget budget", now - i * 1000);
+            index_batch(&mut conn, &[strong(0)], Some(&engine), &mut known_years).unwrap();
+            let mut rows: Vec<Value> = (1..4095).map(strong).collect();
+            rows.push(email_row("acc:/:weak", "Notes", "budget", weak_date));
+            rows.extend((0..16384).map(|i| email_row(&format!("acc:/:other-{i}"), "Weather", "rain tomorrow", now - 10_000_000 - i * 1000)));
+            index_batch(&mut conn, &rows, None, &mut known_years).unwrap();
+            // The weak row is the last of the 4,096 keyword matches, and still a match.
+            let fts_query = build_fts_match(Some("budget"), QUERY_COLUMNS, true, &SynonymLookup::new());
+            let all = search_fts_candidates(&conn, &fts_query, None, None, 4096, &known_years).unwrap();
+            assert_eq!(all.len(), 4096);
+            assert_eq!(all.last().unwrap().msg_id, "acc:/:weak");
+            assert!(crate::fts::hybrid::bm25_rank_to_score(all.last().unwrap().rank) * config::hybrid::EMAIL_TEXT_WEIGHT >= config::hybrid::MIN_SCORE);
+            assert_eq!(vec_count(&conn), 1);
+            let params = serde_json::json!({ "ignoreDate": true, "limit": 1, "sort": sort });
+            let results = search(&conn, "budget", &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap();
+            assert_eq!(result_ids(&results), ["acc:/:weak"], "{sort}");
+            drop(conn);
+            let _ = std::fs::remove_dir_all(profile);
+        }
+    }
+
+    /// A date sort reads 4,096 vector candidates: with exactly that many, the newest (oldest) match
+    /// by meaning alone is found although it is the farthest, so any smaller pool misses it.
+    #[test]
+    fn a_date_sort_reads_4096_vector_candidates() {
+        let Some(engine) = embedding_engine() else { return };
+        let now = mid_year_ms();
+        let q = "plan the vacation itinerary";
+        let body = "plan the vacation itinerary for the team";
+        let meaning_body = "Here is the vacation itinerary";
+        // The rows' embeddings as indexing writes them; the 4,095 equal rows share one.
+        let embed = |subject: &str, body: &str| f32_vec_to_blob(&engine.embed(&crate::embeddings::text_prep::prepare_email_text(subject, "sender@example.com", "", body)).unwrap());
+        let (strong_blob, meaning_blob) = (embed("Plan", body), embed("Vacation", meaning_body));
+        for (sort, meaning_date) in [("date_desc", now + 1000), ("date_asc", now - 4095 * 1000)] {
+            let (profile, _path, mut conn, mut known_years) = temp_email_db(&format!("pool-vector-{sort}"));
+            let mut rows: Vec<Value> = (0..4095).map(|i| email_row(&format!("acc:/:strong-{i}"), "Plan", body, now - i * 1000)).collect();
+            rows.push(email_row("acc:/:meaning", "Vacation", meaning_body, meaning_date));
+            index_batch(&mut conn, &rows, None, &mut known_years).unwrap();
+            let tx = conn.transaction().unwrap();
+            for rowid in 1..=4096 {
+                let blob = if rowid == 4096 { &meaning_blob } else { &strong_blob };
+                tx.execute("INSERT INTO messages_vec(rowid, embedding) VALUES (?1, ?2)", params![rowid, blob]).unwrap();
+            }
+            tx.commit().unwrap();
+            // The meaning row is the farthest of the 4,096 vectors, and still a match.
+            let query_blob = f32_vec_to_blob(&engine.embed(q).unwrap());
+            let all = search_vec_candidates(&conn, "messages_vec", "message_meta", &query_blob, 4096, None, None, None).unwrap();
+            assert_eq!(all.len(), 4096);
+            assert_eq!(all.last().unwrap().0, 4096);
+            assert!(all.last().unwrap().1 > all[0].1);
+            let dates = HashMap::from([(4096, meaning_date)]);
+            let merged = crate::fts::hybrid::merge_results(&[], &[*all.last().unwrap()], &dates, config::hybrid::EMAIL_VECTOR_WEIGHT, config::hybrid::EMAIL_TEXT_WEIGHT, SearchSort::Relevance, 1);
+            assert_eq!(merged.len(), 1, "a match by meaning");
+            let params = serde_json::json!({ "ignoreDate": true, "limit": 1, "sort": sort });
+            let results = search(&conn, q, &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap();
+            assert_eq!(result_ids(&results), ["acc:/:meaning"], "{sort}");
+            assert_eq!(results[0]["snippet"], "", "found by meaning alone");
+            drop(conn);
+            let _ = std::fs::remove_dir_all(profile);
+        }
+    }
+
+    /// When reading the vector-only candidates' dates fails, the email or memory search fails (not
+    /// an empty answer), ends its read transaction, and the next search is answered.
+    #[test]
+    fn a_search_whose_date_lookup_fails_fails_and_the_next_is_answered() {
+        let Some(engine) = embedding_engine() else { return };
+        let (profile, _path, mut conn, mut known_years) = temp_email_db("dates-fail");
+        index_batch(&mut conn, &[email_row("acc:/:found", "Vacation", "Here is the vacation itinerary", mid_year_ms())], Some(&engine), &mut known_years).unwrap();
+        let (_memory_path, mut memory) = crate::fts::memory_db::open_or_create_memory_db(&profile).unwrap();
+        let row = serde_json::json!({ "memId": "found", "role": "session", "sessionId": "persistent_chat",
+            "content": "Here is the vacation itinerary", "dateMs": mid_year_ms(), "turnIndex": 0 });
+        crate::fts::memory_db::memory_index_batch(&mut memory, &[row], Some(&engine)).unwrap();
+        let params = serde_json::json!({ "ignoreDate": true });
+        let synonyms = SynonymLookup::new();
+        // `AND` leaves no keyword term, and an undated vector search reads no metadata: the first
+        // metadata read is the date lookup.
+        assert_eq!(build_fts_match(Some("AND"), QUERY_COLUMNS, true, &synonyms), "");
+        assert_eq!(build_fts_match(Some("AND"), &[], true, &synonyms), "");
+        assert_eq!(vec_count(&conn), 1);
+        assert_eq!(crate::fts::memory_db::memory_vec_count(&memory), 1);
+        let denied_search = |c: &Connection, name: &'static [u8], run: &dyn Fn() -> anyhow::Result<Vec<Value>>| {
+            let mut state = DeniedTable { name, denied: 0 };
+            unsafe { ffi::sqlite3_set_authorizer(c.handle(), Some(deny_reads_of_table), &mut state as *mut DeniedTable as *mut c_void) };
+            let result = run();
+            unsafe { ffi::sqlite3_set_authorizer(c.handle(), None, std::ptr::null_mut()) };
+            assert!(state.denied > 0, "the date lookup was refused");
+            assert!(result.is_err(), "a failed date lookup is not an empty answer");
+            assert!(c.is_autocommit(), "the failed search ended its read transaction");
+        };
+        denied_search(&conn, b"message_meta", &|| search(&conn, "AND", &params, &synonyms, Some(&engine), &known_years));
+        denied_search(&memory, b"memory_meta", &|| crate::fts::memory_db::memory_search(&memory, "AND", &params, &synonyms, Some(&engine)));
+        let next = search(&conn, "plan the vacation itinerary", &params, &synonyms, Some(&engine), &known_years).unwrap();
+        assert_eq!(result_ids(&next), ["acc:/:found"]);
+        let next = crate::fts::memory_db::memory_search(&memory, "plan the vacation itinerary", &params, &synonyms, Some(&engine)).unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0]["memId"], "found");
+        drop(conn);
+        drop(memory);
+        let _ = std::fs::remove_dir_all(profile);
+    }
 }

@@ -104,3 +104,9 @@ Unit tests (model loaded where named):
   `a_hybrid_search_puts_equal_matches_newer_first`, `memory_search_puts_equal_matches_newer_first`;
   the date sort through each keyword fallback in `search_whose_merge_keeps_nothing_answers_by_keyword`
   and `search_with_no_vector_within_the_dates_answers_by_keyword`.
+- `a_date_sort_reads_4096_keyword_candidates` and `a_date_sort_reads_4096_vector_candidates` (model:
+  exactly 4,096 matches in one leg, the newest or oldest the worst of them, found first in both
+  directions; red with a pool of 4,095, or with either leg alone at 2,048).
+- `a_search_whose_date_lookup_fails_fails_and_the_next_is_answered` (model: a refused date lookup
+  fails the email and the memory search, ends the read transaction, and the next search answers;
+  red when either caller swallows the error).
