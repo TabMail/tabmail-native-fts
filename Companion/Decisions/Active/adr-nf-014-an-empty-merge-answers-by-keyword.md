@@ -20,7 +20,8 @@ keyword leg found every row with the word (review of #25: 600 rows with "budget"
 
 When the merge keeps nothing and the keyword leg found matches, the search answers by keyword only,
 as it already does with an empty vector table and with no vector candidate within the dates
-(ADR-NF-013 item 5): `search_fts_only` for email (newest first, as before), `memory_search_fts_only`
+(ADR-NF-013 item 5): `search_fts_only` for email (newest first, as before; *amended 2026-10-22, ADR-NF-017: in the
+search's `sort`, relevance the best keyword match first*), `memory_search_fts_only`
 for memory (best keyword match first). It logs that it did. Nothing else changes: whenever the
 merge keeps at least one result, that result list is the answer, scored as before (owner
 2026-10-21, after the study below: "do the recommendations. Great how it works right now").
@@ -63,7 +64,7 @@ RRF is weighted reciprocal-rank fusion with the vector threshold; "RRF, all" is 
 
 - A search for a common word returns its keyword matches instead of nothing. A small or new memory
   database, where most words are in at least half the rows, meets this most.
-- Such an answer is ranked by keyword (email: newest first), with no match by meaning alone among
+- Such an answer is ranked by keyword (email: newest first; since ADR-NF-017, in the search's `sort`), with no match by meaning alone among
   it, as with an empty vector table.
 
 ## Rejected

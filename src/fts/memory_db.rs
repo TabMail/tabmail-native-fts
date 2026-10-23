@@ -519,12 +519,19 @@ fn memory_search_rows(
     }
 
     // --- Merge ---
+    // Memory search has no sort option: the best match first, ties newer first.
     let text_pairs: Vec<(i64, f64)> = fts_candidates.iter().map(|c| (c.rowid, c.rank)).collect();
+    let mut dates: HashMap<i64, i64> = fts_candidates.iter().map(|c| (c.rowid, c.date_ms)).collect();
+    let vector_only = vec_candidates.iter().map(|&(rowid, _)| rowid).filter(|rowid| !dates.contains_key(rowid));
+    let vector_only_dates = super::db::fetch_dates(conn, "memory_meta", vector_only)?;
+    dates.extend(vector_only_dates);
     let merged = crate::fts::hybrid::merge_results(
         &text_pairs,
         &vec_candidates,
+        &dates,
         config::hybrid::MEMORY_VECTOR_WEIGHT,
         config::hybrid::MEMORY_TEXT_WEIGHT,
+        crate::fts::hybrid::SearchSort::Relevance,
         limit as usize,
     );
 
@@ -2866,6 +2873,31 @@ pub(crate) mod tests {
         let found: Vec<String> = memory_search(&conn, query, &params, &SynonymLookup::new(), Some(&engine)).unwrap()
             .iter().map(|r| r["memId"].as_str().unwrap().to_string()).collect();
         assert_eq!(found, vec!["turn:40".to_string()]);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Equal memory matches (the same text, so the same score both ways) come newer first, whatever
+    /// order they were written in, and the limit keeps the newest of them.
+    #[test]
+    fn memory_search_puts_equal_matches_newer_first() {
+        let Some(engine) = embedding_engine() else { return };
+        let (dir, mut conn) = temp_memory_db("equal-newer-first");
+        let hour = 3_600_000;
+        let now = chrono::Utc::now().timestamp_millis();
+        let turn = |id: String, content: &str, date_ms: i64, i: i64| serde_json::json!({ "memId": id, "role": "session",
+            "sessionId": "persistent_chat", "content": content, "dateMs": date_ms, "turnIndex": i });
+        let ages = [5, 2, 7, 0, 3, 6, 1, 4];
+        let mut rows: Vec<Value> = ages.iter().enumerate().map(|(i, &h)| turn(format!("same-{h}"), "the quarterly budget review", now - h * hour, i as i64)).collect();
+        rows.extend((0..20).map(|i| turn(format!("other-{i}"), "rain tomorrow", now - (100 + i) * hour, 8 + i)));
+        memory_index_batch(&mut conn, &rows, Some(&engine)).unwrap();
+        let search_with = |limit: i64| memory_search(&conn, "quarterly budget review", &serde_json::json!({ "ignoreDate": true, "limit": limit }), &SynonymLookup::new(), Some(&engine)).unwrap();
+        let ids = |results: &[Value]| -> Vec<String> { results.iter().map(|r| r["memId"].as_str().unwrap().to_string()).collect() };
+        let all = search_with(100);
+        let newest_first: Vec<String> = (0..8).map(|h| format!("same-{h}")).collect();
+        assert_eq!(ids(&all[..8]), newest_first);
+        assert!(all[..8].iter().all(|r| r["rank"] == all[0]["rank"]), "an exact tie");
+        assert_eq!(ids(&search_with(3)), newest_first[..3]);
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }
