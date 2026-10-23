@@ -129,6 +129,13 @@ A `search` or `memorySearch` with a query returns at most 512 results, whatever 
 given, so it stays a hybrid (keyword and meaning) search; narrow it by dates instead. A memory
 listing (no query) returns the page asked for. See ADR-NF-013.
 
+`search` takes an optional `sort`: `relevance` (the default), `date_desc` or `date_asc`; any
+other value is refused. The helper sorts the matches, then takes `limit`: the best matches first
+(equal ones newer first), or the newest or oldest matches (equal dates the better match first). A
+date sort picks its matches from 4,096 candidates per leg, so narrow a common word by dates. A query
+of only fields (`from:"alice@example.com"`) is answered by keyword over every match, newest first
+by default. Memory search orders equal matches newer first. See ADR-NF-017.
+
 Each Thunderbird profile gets its own isolated FTS and memory databases.
 
 **Size limit.** A client can bound the memory database: `memoryIndexBatch` takes an

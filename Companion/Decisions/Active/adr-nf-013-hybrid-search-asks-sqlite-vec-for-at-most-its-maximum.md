@@ -53,6 +53,8 @@ best `limit`, so nearer messages outside the dates took the places of matches in
   (a weak keyword-only match among them) left out. So a search can return fewer results than its
   keyword-only answer gave, and at most 512. Both callers take any count up to `limit`.
   Thunderbird keeps the helper's order for a relevance sort and sorts by date otherwise.
+  *(Amended 2026-10-22, ADR-NF-017: the helper sorts before it takes the limit, by `sort`; Thunderbird
+  passes it instead of sorting, tabmail-thunderbird#150.)*
 - Known limitation, approved by the owner 2026-10-21, fixed next in the train (#26): the date filter
   and the field filter run on sqlite-vec's nearest k over the whole archive. When k or more messages
   outside the dates (or the field's matches) are nearer the query, a match inside them by meaning

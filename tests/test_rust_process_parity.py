@@ -333,6 +333,52 @@ class TestRustHelperProcess(unittest.TestCase):
             except Exception:
                 proc.kill()
 
+    def test_search_sort_over_the_wire(self):
+        """`search` sorts by the `sort` asked for before it takes the limit, and an unknown `sort` is
+        answered with an error (the helper keeps answering)."""
+        proc = subprocess.Popen([self.rust_helper_path], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            _send_message(proc, {"id": "1", "method": "hello", "params": {"addonVersion": "1.9.1"}})
+            self.assert_success(_read_message(proc), "hello")
+            _send_message(proc, {"id": "2", "method": "init", "params": {"profilePath": self.temp_dir}})
+            self.assert_success(_read_message(proc), "init")
+            now = int(time.time() * 1000)
+            rows = [{"msgId": f"sort-{i}", "folderId": "account:/Sort", "subject": f"Update {i}", "from_": "alice@example.com",
+                     "to_": "team@example.com", "body": f"Status of item {i}.", "dateMs": now - i * 60_000, "hasAttachments": False}
+                    for i in range(10)]
+            _send_message(proc, {"id": "3", "method": "indexBatch", "params": {"rows": _filler_rows("sort-filler") + rows}})
+            self.assert_success(_read_message(proc), "indexBatch")
+
+            def search(request_id, **params):
+                _send_message(proc, {"id": request_id, "method": "search", "params": {"q": "from:alice@example.com", "ignoreDate": True, "limit": 3, **params}})
+                response = _read_message(proc)
+                self.assertEqual(response.get("id"), request_id)
+                return response
+
+            for request_id, params, expected in [
+                ("default", {}, ["sort-0", "sort-1", "sort-2"]),
+                ("relevance", {"sort": "relevance"}, ["sort-0", "sort-1", "sort-2"]),
+                ("desc", {"sort": "date_desc"}, ["sort-0", "sort-1", "sort-2"]),
+                ("asc", {"sort": "date_asc"}, ["sort-9", "sort-8", "sort-7"]),
+            ]:
+                response = search(request_id, **params)
+                self.assert_success(response, request_id)
+                self.assertEqual([r["uniqueId"] for r in response["result"]], expected, request_id)
+            for request_id, sort in [("misspelt", "newest"), ("number", 1)]:
+                response = search(request_id, sort=sort)
+                self.assertIn("error", response, response)
+                self.assertNotIn("result", response, response)
+            self.assert_success(search("after", sort="date_asc"), "after an error")
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+
     def _dated_memory_search_case(self, profile, outside_each_side, inside_content):
         """Indexes, with the embedding model loaded, exchanges about the itinerary (the nearest to
         the query) on both sides of a one-day range, exchanges within it (`inside_content`, one at
