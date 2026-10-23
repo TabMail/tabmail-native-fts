@@ -1050,9 +1050,10 @@ fn search_rows(
     );
 
     // Only fields (`from:a@example.com`): nothing for the vector leg to mean, so the answer is by
-    // keyword over every match, in sort order. A field's matches differ by keyword score only through
-    // each year shard's statistics and the field's length, so for relevance they are tied: newest
-    // first, and "the latest from X" is exact under the default sort.
+    // keyword over every match, in sort order. A field names which messages, not how well they match:
+    // its matches' keyword scores (each year shard's statistics, the field's length, how often the
+    // value is in it) are no measure of relevance, so for relevance they are tied: newest first, and
+    // "the latest from X" is exact under the default sort.
     if query_is_field_only(&fts_query) {
         let order = if sort == SearchSort::Relevance { SearchSort::DateDesc } else { sort };
         log::info!("Search of fields only, by keyword in {order:?} order");

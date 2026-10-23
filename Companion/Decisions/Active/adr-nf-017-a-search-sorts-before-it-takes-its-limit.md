@@ -31,7 +31,8 @@ sender's emails were kept was close to random.
 4. A query of only field terms (`from:`, `to:`, `cc:`, `bcc:`, `subject:`, `body:`, with operators
    between them and no free word, phrase or group: `query_is_field_only`) skips the vector leg and
    answers by keyword over every match, in sort order. For relevance its matches are treated as tied
-   (their keyword scores differ only by each year shard's statistics and the field's length): newest
+   (a field names which messages, not how well they match: their keyword scores, from shard
+   statistics, field length and how often the value is in it, are no measure of relevance): newest
    first. So "the latest from X" is exact under the default sort, and "the oldest from X" with
    `date_asc`.
 5. Every keyword-only answer (no model, no vector candidate within the dates or the field, an empty
@@ -43,7 +44,7 @@ sender's emails were kept was close to random.
 
 ## Study (a real Thunderbird archive, 2026-10-22)
 
-A copy of the owner's Thunderbird index (300,357 messages, 17 year shards), read by an uncommitted
+A copy of a real Thunderbird index (300,357 messages, 17 year shards), read by an uncommitted
 harness; only aggregate numbers were kept and the copy was deleted. 69 queries: 24 generic phrases and
 45 words from the index's own vocabulary by document frequency (15 each at 2-20%, 0.2-2% and
 0.02-0.2% of messages). No dates, the last 365 days and the last 30 days; newest and oldest first. The
@@ -101,7 +102,8 @@ Unit tests (model loaded where named):
   oldest from a sender score worst, by a longer From, and are returned first),
   `a_date_sorted_search_finds_the_newest_and_oldest_match` (model: weak newest and oldest matches
   outside the best 3 are first), `a_date_sorted_search_orders_a_match_by_meaning_by_its_date`,
-  `a_hybrid_search_puts_equal_matches_newer_first`, `memory_search_puts_equal_matches_newer_first`;
+  `a_hybrid_search_puts_equal_matches_newer_first`, `memory_search_puts_equal_matches_newer_first`,
+  `memory_search_puts_the_best_match_before_a_newer_weaker_one` (red with memory's merge by date);
   the date sort through each keyword fallback in `search_whose_merge_keeps_nothing_answers_by_keyword`
   and `search_with_no_vector_within_the_dates_answers_by_keyword`.
 - `a_date_sort_reads_4096_keyword_candidates` and `a_date_sort_reads_4096_vector_candidates` (model:

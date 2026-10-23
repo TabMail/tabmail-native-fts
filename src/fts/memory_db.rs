@@ -2901,4 +2901,24 @@ pub(crate) mod tests {
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    /// Memory search puts the best match first, before a newer weaker one (it has no date sort).
+    #[test]
+    fn memory_search_puts_the_best_match_before_a_newer_weaker_one() {
+        let Some(engine) = embedding_engine() else { return };
+        let (dir, mut conn) = temp_memory_db("best-before-newer");
+        let hour = 3_600_000;
+        let now = chrono::Utc::now().timestamp_millis();
+        let turn = |id: String, content: &str, date_ms: i64, i: i64| serde_json::json!({ "memId": id, "role": "session",
+            "sessionId": "persistent_chat", "content": content, "dateMs": date_ms, "turnIndex": i });
+        let mut rows: Vec<Value> = (0..4).map(|i| turn(format!("best-{i}"), "the quarterly budget review", now - (10 + i) * hour, i)).collect();
+        rows.push(turn("weak-new".to_string(), "the quarterly budget", now, 4));
+        rows.extend((0..20).map(|i| turn(format!("other-{i}"), "rain tomorrow", now - (100 + i) * hour, 5 + i)));
+        memory_index_batch(&mut conn, &rows, Some(&engine)).unwrap();
+        let found: Vec<String> = memory_search(&conn, "quarterly budget review", &serde_json::json!({ "ignoreDate": true, "limit": 100 }), &SynonymLookup::new(), Some(&engine))
+            .unwrap().iter().map(|r| r["memId"].as_str().unwrap().to_string()).collect();
+        assert_eq!(found[..5], ["best-0", "best-1", "best-2", "best-3", "weak-new"]);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
