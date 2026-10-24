@@ -470,10 +470,12 @@ fn memory_search_rows(
     }
     let limit = super::db::cap_search_limit(limit);
 
-    // Fall back to FTS-only when no embedding engine
+    // By keyword without the model, and for a query that excludes a word: the vector leg would return
+    // the nearest by meaning, the excluded entries among them (issue #21).
+    let fts_query = build_fts_match(Some(query), &[], true, synonyms);
     let engine = match engine {
-        Some(e) => e,
-        None => return memory_search_fts_only(conn, query, params, synonyms, ignore_date, limit),
+        Some(e) if !super::db::query_excludes(&fts_query) => e,
+        _ => return memory_search_fts_only(conn, query, params, synonyms, ignore_date, limit),
     };
 
     let from_ts = if !ignore_date {
@@ -490,7 +492,6 @@ fn memory_search_rows(
     let candidate_limit = limit * config::hybrid::CANDIDATE_MULTIPLIER;
 
     // --- FTS5 candidates ---
-    let fts_query = build_fts_match(Some(query), &[], true, synonyms);
     log::info!(
         "Memory hybrid search: \"{}\" -> FTS \"{}\"",
         query,
@@ -2231,6 +2232,25 @@ pub(crate) mod tests {
         let cut = search(serde_json::json!({ "ignoreDate": true, "previewChars": 10 }));
         assert_eq!(cut.len(), 1);
         assert_eq!(cut[0]["content"], &content[..10]);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A search that excludes a word (a kept NOT) returns no entry with it: what an entry means
+    /// can't exclude it, so the search answers by keyword. Issue #21.
+    #[test]
+    fn memory_search_excluding_a_word_returns_none_of_it() {
+        let Some(engine) = embedding_engine() else { return };
+        let (dir, mut conn) = temp_memory_db("not");
+        let now = chrono::Utc::now().timestamp_millis();
+        let row = |id: &str, content: &str, turn: i64| serde_json::json!({ "memId": id, "role": "session",
+            "sessionId": "persistent_chat", "content": content, "dateMs": now, "turnIndex": turn });
+        let rows = [row("itinerary", "The vacation itinerary and hotels", 0), row("plans", "Vacation plans for the summer", 1)];
+        memory_index_batch(&mut conn, &rows, Some(&engine)).unwrap();
+        let params = serde_json::json!({ "ignoreDate": true });
+        let results = memory_search(&conn, "vacation NOT itinerary", &params, &SynonymLookup::new(), Some(&engine)).unwrap();
+        let ids: Vec<&str> = results.iter().map(|r| r["memId"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["plans"]);
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }
