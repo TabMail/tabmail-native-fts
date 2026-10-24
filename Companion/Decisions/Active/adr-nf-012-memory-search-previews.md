@@ -26,6 +26,8 @@ although Thunderbird shows only the first 400 characters of each.
    whole exchange.
 4. No capability flag: a helper without this support ignores the parameter and answers whole rows, as
    it always has, and Thunderbird updates its helper itself.
+   **Amended 2026-10-24 by ADR-NF-018:** `hello` now advertises `memoryPreviewV1`, because an
+   add-on that meets an un-updated helper got whole rows over the cap.
 
 ## Rejected
 

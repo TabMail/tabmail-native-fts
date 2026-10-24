@@ -180,6 +180,10 @@ archives of any size.
 
 - **[Full ADR](Companion/Decisions/Active/adr-nf-017-a-search-sorts-before-it-takes-its-limit.md)** — #46: callers sorted the best `limit` by date, so date sorts missed the newest/oldest match; now `search` `sort` = `relevance` (default) | `date_desc` | `date_asc` (else error, `SearchSort`), sort THEN limit in `merge_results` (relevance ties newer first, date ties better match first, then rowid; vector-only dates via `fetch_dates` json_each). Date sort pool `DATE_SORT_POOL` 4,096 per leg (study on a 300k-message TB archive: 1,024/2,048/4,096, 4,096 right in every dated set, same median cost). Field-only query (`query_is_field_only`: from:/to:/cc:/bcc:/subject:/body: + operators) skips the vector leg, keyword over ALL matches, relevance = newest first. Keyword-only fallbacks order by the sort (email relevance now rank first, amends ADR-NF-014). Memory merge ties newer first, no sort. iOS tabmail-ios#265.
 
+## ADR-NF-018: Capabilities for the Behaviour 0.11.8 Lacks
+
+- **[Full ADR](Companion/Decisions/Active/adr-nf-018-capabilities-for-the-behaviour-0-11-8-lacks.md)** — `hello` capabilities `memoryPreviewV1` (previewChars), `memoryFilterBeforeLimitV1` (dated memory search filters before the limit), `searchSortV1` (`search` `sort`, TB #164): a 0.11.8 helper reports the same version as main but returned 0 of 6 dated matches and a 1.25 MB listing over the 1 MiB cap (TB release review 2026-10-24); callers refuse on the receiving connection's capabilities. Amends ADR-NF-012 item 4. Voice unaffected (pinned build).
+
 ---
 
 ## Template for New Decisions

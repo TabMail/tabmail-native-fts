@@ -995,10 +995,15 @@ fn handle_hello(msg_id: &str, params: &Value) -> anyhow::Result<Value> {
 }
 
 fn hello_capabilities() -> Value {
+    // The last three name behaviour a 0.11.8 helper lacks while reporting the same
+    // version, so a caller can refuse a request whose answer would be wrong (ADR-NF-018).
     serde_json::json!({
         "folderMembershipV1": true,
         "folderMembershipSummaryV1": true,
-        "memorySizeLimitV1": true
+        "memorySizeLimitV1": true,
+        "memoryPreviewV1": true,
+        "memoryFilterBeforeLimitV1": true,
+        "searchSortV1": true
     })
 }
 
@@ -2012,6 +2017,9 @@ mod tests {
         assert_eq!(hello_capabilities()["folderMembershipV1"], true);
         assert_eq!(hello_capabilities()["folderMembershipSummaryV1"], true);
         assert_eq!(hello_capabilities()["memorySizeLimitV1"], true);
+        assert_eq!(hello_capabilities()["memoryPreviewV1"], true);
+        assert_eq!(hello_capabilities()["memoryFilterBeforeLimitV1"], true);
+        assert_eq!(hello_capabilities()["searchSortV1"], true);
     }
 
     #[test]
