@@ -2,6 +2,10 @@
 
 **Status:** Accepted (2026-10-21, issue #28). Fixes the second known limitation of ADR-NF-013. The
 iOS app makes the same change in step (tabmail-ios#240; `HybridMerge` mirrors `hybrid::merge_results`).
+*Superseded 2026-10-24 by ADR-NF-020 (#51): every keyword match is a result, so the merge is never
+empty while the keyword leg matched, and this fallback is deleted. The `..._keeps_one_result_answers_by_it`
+tests below were renamed `..._ranks_keyword_matches_scoring_about_0_after_a_match_by_meaning` and now
+expect the match by meaning followed by the 30 keyword matches.*
 
 ## Context
 

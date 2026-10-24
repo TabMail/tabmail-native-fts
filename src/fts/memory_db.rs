@@ -536,13 +536,6 @@ fn memory_search_rows(
         limit as usize,
     );
 
-    // Words matched but the merge kept nothing (a word in at least half the entries scores about 0 by keyword, and a
-    // weak vector match adds too little to reach MIN_SCORE): answer by keyword, as with no vectors.
-    if merged.is_empty() && !text_pairs.is_empty() {
-        log::info!("Memory hybrid merge kept none of {} keyword matches, falling back to FTS-only search", text_pairs.len());
-        return memory_search_fts_only(conn, query, params, synonyms, ignore_date, limit);
-    }
-
     // --- Assemble results ---
     let mut fts_map: HashMap<i64, MemoryFtsCandidate> =
         fts_candidates.into_iter().map(|c| (c.rowid, c)).collect();
@@ -781,7 +774,9 @@ fn memory_search_fts_candidates(
         bind.push(rusqlite::types::Value::from(to));
     }
 
-    sql.push_str(" ORDER BY rank ASC LIMIT ?");
+    // Equal ranks newer first, as `memory_search_fts_only` orders them: every keyword candidate is a
+    // result (#51), so the pool decides which tied matches are answered.
+    sql.push_str(" ORDER BY rank ASC, meta.dateMs DESC LIMIT ?");
     bind.push(rusqlite::types::Value::from(limit));
 
     let mut stmt = conn.prepare(&sql)?;
@@ -2876,11 +2871,115 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A merge that keeps a single result is the answer too: the words of the query are in 30
-    /// entries but past the embedding input, so they score about 0 both ways, and one entry without
-    /// the words is kept by meaning.
+    /// The keyword candidates of equal rank are the newest, whatever order the entries were indexed
+    /// in: each one is a result (#51), so the candidate limit picks which tied matches are answered.
     #[test]
-    fn memory_search_whose_merge_keeps_one_result_answers_by_it() {
+    fn memory_keyword_candidates_of_equal_rank_are_the_newest() {
+        let (dir, mut conn) = temp_memory_db("tied-candidates");
+        let hour = 3_600_000;
+        let now = chrono::Utc::now().timestamp_millis();
+        // Indexed oldest first: the oldest have the lowest rowids.
+        let rows: Vec<Value> = (0..12).rev().map(|i| serde_json::json!({ "memId": format!("session:s{i}"), "role": "session",
+            "content": "the quarterly budget", "sessionId": format!("s{i}"), "turnIndex": 0, "dateMs": now - i * hour })).collect();
+        memory_index_batch(&mut conn, &rows, None).unwrap();
+        let mut ids: Vec<String> = memory_search_fts_candidates(&conn, "budget", None, None, 4).unwrap().into_iter().map(|c| c.mem_id).collect();
+        ids.sort();
+        assert_eq!(ids, ["session:s0", "session:s1", "session:s2", "session:s3"]);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A keyword match that scores exactly 0 (the query matches only the memId, a column weighted 0)
+    /// is a result too, though its vector alone could not keep it (#51).
+    #[test]
+    fn memory_search_returns_a_keyword_match_that_scores_0() {
+        let Some(engine) = embedding_engine() else { return };
+        let (dir, mut conn) = temp_memory_db("keyword-scores-0");
+        let q = "quasarmarker";
+        let row = serde_json::json!({ "memId": "turn:quasarmarker", "role": "session", "sessionId": "s1", "turnIndex": 0,
+            "dateMs": chrono::Utc::now().timestamp_millis(), "content": "The penguin walks across the ice and eats fish." });
+        memory_index_batch(&mut conn, &[row], Some(&engine)).unwrap();
+        let fts_query = build_fts_match(Some(q), &[], true, &SynonymLookup::new());
+        let candidates = memory_search_fts_candidates(&conn, &fts_query, None, None, 100).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].rank, 0.0);
+        let params = serde_json::json!({ "ignoreDate": true, "limit": 100 });
+        for engine in [None, Some(&engine)] {
+            let found: Vec<Value> = memory_search(&conn, q, &params, &SynonymLookup::new(), engine).unwrap();
+            assert_eq!(found.len(), 1, "engine: {}", engine.is_some());
+            assert_eq!(found[0]["memId"], "turn:quasarmarker");
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// With more keyword matches than the candidates a search takes, the best match is among them
+    /// even when the weaker ones are newer: candidates are taken by rank, then date (#51).
+    #[test]
+    fn memory_search_keeps_the_best_keyword_match_over_newer_weaker_ones_at_a_small_limit() {
+        let Some(engine) = embedding_engine() else { return };
+        let (dir, mut conn) = temp_memory_db("best-over-newer");
+        let now = chrono::Utc::now().timestamp_millis();
+        let hour = 3_600_000;
+        let row = |id: &str, content: String, date: i64| serde_json::json!({ "memId": id, "role": "session", "sessionId": "s1", "turnIndex": 0, "dateMs": date, "content": content });
+        let mut rows = vec![row("turn:best", "budget ".repeat(50), now - 24 * hour)];
+        rows.extend((0..12).map(|i| row(&format!("turn:weak-{i}"), format!("budget {}", "padding ".repeat(200)), now - i * hour)));
+        memory_index_batch(&mut conn, &rows, None).unwrap();
+        // One vector, of an unrelated entry (an embedding rebuild partway), keeps the search hybrid.
+        memory_index_batch(&mut conn, &[row("turn:other", "The penguin walks across the ice and eats fish.".to_string(), now + hour)], Some(&engine)).unwrap();
+        assert!(rows.len() > config::hybrid::CANDIDATE_MULTIPLIER as usize);
+        let params = serde_json::json!({ "ignoreDate": true, "limit": 1 });
+        for engine in [None, Some(&engine)] {
+            let found: Vec<Value> = memory_search(&conn, "budget", &params, &SynonymLookup::new(), engine).unwrap();
+            assert_eq!(found.len(), 1, "engine: {}", engine.is_some());
+            assert_eq!(found[0]["memId"], "turn:best", "engine: {}", engine.is_some());
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A hybrid memory search never returns fewer keyword matches than a keyword-only search with the
+    /// same dates and limit: the release smoke test's 8 entries all say "meeting" and "notes", and
+    /// a search for either returned 1 (#51).
+    #[test]
+    fn memory_search_returns_every_keyword_match_of_a_word_in_most_entries() {
+        let Some(engine) = embedding_engine() else { return };
+        let (dir, mut conn) = temp_memory_db("common-word");
+        let day = 86_400_000;
+        let now = chrono::Utc::now().timestamp_millis();
+        let topics = crate::fts::db::tests::COMMON_WORD_TOPICS;
+        let rows: Vec<Value> = topics.iter().enumerate().map(|(i, topic)| serde_json::json!({ "memId": format!("session:s{i}"),
+            "role": "session", "content": format!("User: tell me about {topic}\nAgent: we talked about {topic} and the meeting notes"),
+            "sessionId": format!("s{i}"), "turnIndex": 0, "dateMs": now - (8 - i as i64) * day })).collect();
+        memory_index_batch(&mut conn, &rows, Some(&engine)).unwrap();
+        let ids = |q: &str, params: &Value, engine: Option<&EmbeddingEngine>| -> Vec<String> {
+            memory_search(&conn, q, params, &SynonymLookup::new(), engine).unwrap()
+                .iter().map(|r| r["memId"].as_str().unwrap().to_string()).collect()
+        };
+        for q in ["meeting", "notes", "talked"] {
+            assert_eq!(ids(q, &serde_json::json!({ "ignoreDate": true }), None).len(), 8, "every entry has {q}");
+            for (params, room) in [
+                (serde_json::json!({ "ignoreDate": true, "limit": 100 }), true),
+                (serde_json::json!({ "from": now - 4 * day - day / 2, "to": now, "limit": 100 }), true),
+                (serde_json::json!({ "ignoreDate": true, "limit": 3 }), false),
+            ] {
+                let keyword = ids(q, &params, None);
+                let hybrid = ids(q, &params, Some(&engine));
+                assert!(hybrid.len() >= keyword.len(), "{q} {params}: {hybrid:?} < {keyword:?}");
+                if room {
+                    assert!(keyword.iter().all(|id| hybrid.contains(id)), "{q} {params}: {hybrid:?} lacks some of {keyword:?}");
+                }
+            }
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Keyword matches that score about 0 both ways are results too, after a match by meaning that
+    /// scores higher: the words of the query are in 30 entries but past the embedding input, and one
+    /// entry without the words is near it by meaning (#51; until then only that one was returned).
+    #[test]
+    fn memory_search_ranks_keyword_matches_scoring_about_0_after_a_match_by_meaning() {
         let Some(engine) = embedding_engine() else { return };
         let (dir, mut conn) = temp_memory_db("merge-keeps-one");
         let now = chrono::Utc::now().timestamp_millis();
@@ -2895,7 +2994,9 @@ pub(crate) mod tests {
         let params = serde_json::json!({ "ignoreDate": true, "limit": 100 });
         let found: Vec<String> = memory_search(&conn, query, &params, &SynonymLookup::new(), Some(&engine)).unwrap()
             .iter().map(|r| r["memId"].as_str().unwrap().to_string()).collect();
-        assert_eq!(found, vec!["turn:40".to_string()]);
+        let mut expected = vec!["turn:40".to_string()];
+        expected.extend((0..30).map(|i| format!("turn:{i}")));
+        assert_eq!(found, expected, "the match by meaning first, then the keyword matches newest first");
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -1147,8 +1147,8 @@ fn search_rows(
     });
 
     // Fall back to FTS-only when there are no vector candidates: the vec table is empty (e.g., during
-    // embedding rebuild), or no vector is within the dates (or among the field's matches).
-    // Without this, hybrid weights (text_weight=0.3) penalize text-only results below MIN_SCORE.
+    // embedding rebuild), or no vector is within the dates (or among the field's matches). It orders
+    // every keyword match, where the merge would order only the keyword leg's candidates.
     if vec_candidates.is_empty() {
         log::info!("No vector candidates (vec table may be empty, or none within the dates or the field), falling back to FTS-only search");
         return search_fts_only(conn, &fts_query, params, limit, known_years, sort);
@@ -1169,13 +1169,6 @@ fn search_rows(
         sort,
         limit as usize,
     );
-
-    // Words matched but the merge kept nothing (a word in at least half the messages scores about 0 by keyword, and a
-    // weak vector match adds too little to reach MIN_SCORE): answer by keyword, as with no vectors.
-    if merged.is_empty() && !text_pairs.is_empty() {
-        log::info!("Hybrid merge kept none of {} keyword matches, falling back to FTS-only search", text_pairs.len());
-        return search_fts_only(conn, &fts_query, params, limit, known_years, sort);
-    }
 
     // --- Assemble results ---
     let mut fts_map: HashMap<i64, FtsCandidate> =
@@ -1372,8 +1365,10 @@ fn search_fts_candidates(
         sq
     }).collect();
 
+    // Equal ranks newer first, as `search_fts_only` orders them: every keyword candidate is a result
+    // (#51), so the pool decides which tied matches are answered.
     let sql = format!(
-        "{} ORDER BY rank ASC LIMIT ?{lp}",
+        "{} ORDER BY rank ASC, dateMs DESC LIMIT ?{lp}",
         subqueries.join(" UNION ALL "),
         lp = limit_param,
     );
@@ -5330,9 +5325,12 @@ pub(crate) mod tests {
         let mut expected = budget(5..10);
         expected.sort();
         assert_eq!(dated, expected);
-        // Fewer than the matches: the best `limit` (all tied), newest first; in a date sort the
-        // newest or oldest `limit`.
-        assert_eq!(search_with(serde_json::json!({ "ignoreDate": true, "limit": 5 })), budget(0..5));
+        // Fewer than the matches: `limit` of them; in a date sort the newest or oldest `limit`. By
+        // relevance which 5 is not pinned: the 30 are the same text, and the ones among sqlite-vec's
+        // nearest `limit` x CANDIDATE_MULTIPLIER (equal distances, any of them) score a little higher.
+        let best = search_with(serde_json::json!({ "ignoreDate": true, "limit": 5 }));
+        assert_eq!(best.len(), 5);
+        assert!(best.iter().all(|id| budget(0..30).contains(id)), "{best:?}");
         assert_eq!(search_with(serde_json::json!({ "ignoreDate": true, "limit": 5, "sort": "date_desc" })), budget(0..5));
         let mut oldest = budget(25..30);
         oldest.reverse();
@@ -5361,11 +5359,94 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(profile);
     }
 
-    /// A merge that keeps a single result is the answer too: the words of the query are in 30
-    /// messages but past the embedding input, so they score about 0 both ways, and one message
-    /// without the words is kept by meaning.
+    /// The keyword candidates of equal rank are the newest, whatever order the rows were indexed
+    /// in: each one is a result (#51), so the candidate limit picks which tied matches are answered.
     #[test]
-    fn search_whose_merge_keeps_one_result_answers_by_it() {
+    fn keyword_candidates_of_equal_rank_are_the_newest() {
+        let (mut conn, mut known_years) = setup_test_db();
+        let hour = 3_600_000;
+        let now = mid_year_ms();
+        // Indexed oldest first: the oldest have the lowest rowids.
+        let rows: Vec<Value> = (0..12).rev().map(|i| email_row(&format!("acc:/:budget-{i}"), "Budget", "the quarterly budget", now - i * hour)).collect();
+        index_batch(&mut conn, &rows, None, &mut known_years).unwrap();
+        let mut ids: Vec<String> = search_fts_candidates(&conn, "budget", None, None, 4, &known_years).unwrap().into_iter().map(|c| c.msg_id).collect();
+        ids.sort();
+        assert_eq!(ids, ["acc:/:budget-0", "acc:/:budget-1", "acc:/:budget-2", "acc:/:budget-3"]);
+    }
+
+    /// A keyword match that scores exactly 0 (the query matches only the msgId, a column weighted 0)
+    /// is a result too, though its vector alone could not keep it (#51).
+    #[test]
+    fn search_returns_a_keyword_match_that_scores_0() {
+        let Some(engine) = embedding_engine() else { return };
+        let (profile, _path, mut conn, mut known_years) = temp_email_db("keyword-scores-0");
+        let q = "quasarmarker";
+        let row = email_row("acc:/:quasarmarker", "Penguin", "The penguin walks across the ice and eats fish.", mid_year_ms());
+        index_batch(&mut conn, &[row], Some(&engine), &mut known_years).unwrap();
+        let fts_query = build_fts_match(Some(q), QUERY_COLUMNS, true, &SynonymLookup::new());
+        let candidates = search_fts_candidates(&conn, &fts_query, None, None, 100, &known_years).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].rank, 0.0);
+        let params = serde_json::json!({ "ignoreDate": true, "limit": 100 });
+        for engine in [None, Some(&engine)] {
+            let found = result_ids(&search(&conn, q, &params, &SynonymLookup::new(), engine, &known_years).unwrap());
+            assert_eq!(found, ["acc:/:quasarmarker"], "engine: {}", engine.is_some());
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    /// The topics of the release smoke test's rows (PLAN_RELEASE_1_10): every row says "we talked
+    /// about <topic> and the meeting notes".
+    pub(crate) const COMMON_WORD_TOPICS: [&str; 8] = [
+        "the quarterly budget review with finance", "a dentist appointment next week", "planning the team offsite in the mountains",
+        "debugging the login page timeout", "the budget for the offsite catering", "renewing the car insurance",
+        "notes on the product launch email", "the meeting about hiring a designer",
+    ];
+
+    /// A hybrid search never returns fewer keyword matches than a keyword-only search with the same
+    /// dates, limit and sort: a word in most messages scores about 0 by keyword (FTS5 clamps its IDF),
+    /// and the one or two messages it stands out in by meaning were the whole answer (#51).
+    #[test]
+    fn search_returns_every_keyword_match_of_a_word_in_most_messages() {
+        let Some(engine) = embedding_engine() else { return };
+        let (profile, _path, mut conn, mut known_years) = temp_email_db("common-word");
+        let day = 86_400_000;
+        // One year shard: each word is in every message of it.
+        let now = mid_year_ms();
+        let rows: Vec<Value> = COMMON_WORD_TOPICS.iter().enumerate().map(|(i, topic)| {
+            email_row(&format!("acc:/:m{i}"), "Notes", &format!("we talked about {topic} and the meeting notes"), now - (8 - i as i64) * day)
+        }).collect();
+        index_batch(&mut conn, &rows, Some(&engine), &mut known_years).unwrap();
+        let ids = |q: &str, params: &Value, engine: Option<&EmbeddingEngine>| {
+            result_ids(&search(&conn, q, params, &SynonymLookup::new(), engine, &known_years).unwrap())
+        };
+        for q in ["meeting", "notes", "talked"] {
+            assert_eq!(ids(q, &serde_json::json!({ "ignoreDate": true }), None).len(), 8, "every message has {q}");
+            for sort in ["relevance", "date_desc", "date_asc"] {
+                for (params, room) in [
+                    (serde_json::json!({ "ignoreDate": true, "limit": 100, "sort": sort }), true),
+                    (serde_json::json!({ "from": now - 4 * day - day / 2, "to": now, "limit": 100, "sort": sort }), true),
+                    (serde_json::json!({ "ignoreDate": true, "limit": 3, "sort": sort }), false),
+                ] {
+                    let keyword = ids(q, &params, None);
+                    let hybrid = ids(q, &params, Some(&engine));
+                    assert!(hybrid.len() >= keyword.len(), "{q} {params}: {hybrid:?} < {keyword:?}");
+                    if room {
+                        assert!(keyword.iter().all(|id| hybrid.contains(id)), "{q} {params}: {hybrid:?} lacks some of {keyword:?}");
+                    }
+                }
+            }
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    /// Keyword matches that score about 0 both ways are results too, after a match by meaning that
+    /// scores higher: the words of the query are in 30 messages but past the embedding input, and one
+    /// message without the words is near it by meaning (#51; until then only that one was returned).
+    #[test]
+    fn search_ranks_keyword_matches_scoring_about_0_after_a_match_by_meaning() {
         let Some(engine) = embedding_engine() else { return };
         let (profile, _path, mut conn, mut known_years) = temp_email_db("merge-keeps-one");
         let now = chrono::Utc::now().timestamp_millis();
@@ -5377,7 +5458,9 @@ pub(crate) mod tests {
         index_batch(&mut conn, &rows, Some(&engine), &mut known_years).unwrap();
         let params = serde_json::json!({ "ignoreDate": true, "limit": 100 });
         let found = result_ids(&search(&conn, query, &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap());
-        assert_eq!(found, vec!["acc:/:meaning".to_string()]);
+        let mut expected = vec!["acc:/:meaning".to_string()];
+        expected.extend((0..30).map(|i| format!("acc:/:words-{i}")));
+        assert_eq!(found, expected, "the match by meaning first, then the keyword matches newest first");
         drop(conn);
         let _ = std::fs::remove_dir_all(profile);
     }
