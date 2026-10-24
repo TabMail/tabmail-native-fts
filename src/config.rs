@@ -160,7 +160,8 @@ pub mod hybrid {
     // result was the truly newest match in every dated query set, at about the median cost of 2,048.
     pub const DATE_SORT_POOL: i64 = VEC_K_MAX;
 
-    // Minimum combined score to return (filters noise).
+    // Minimum combined score of a candidate found by meaning alone (filters noise). A keyword match
+    // is a result whatever its score (#51).
     pub const MIN_SCORE: f64 = 0.1;
 
     // Vector score threshold for rescaling. Scores below this map to 0;

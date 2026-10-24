@@ -47,6 +47,8 @@ pub struct HybridCandidate {
     pub rowid: i64,
     pub text_score: f64,
     pub vector_score: f64,
+    /// Found by keyword: a result whatever its score (#51).
+    pub keyword_match: bool,
 }
 
 /// A merged result with final combined score.
@@ -86,7 +88,8 @@ pub fn cosine_distance_to_score(distance: f64) -> f64 {
 /// `dates`: each candidate's dateMs; a candidate without one (its row is gone) is left out
 /// `vector_weight`: weight for semantic score (0.0..1.0)
 /// `text_weight`: weight for keyword score (0.0..1.0)
-/// `sort`: the order of every candidate at `MIN_SCORE` or above, before `limit` is taken
+/// `sort`: the order of every keyword match and every other candidate at `MIN_SCORE` or above,
+/// before `limit` is taken
 /// `limit`: maximum number of results to return
 pub fn merge_results(
     text_results: &[(i64, f64)],
@@ -109,6 +112,7 @@ pub fn merge_results(
                 rowid,
                 text_score: score,
                 vector_score: 0.0,
+                keyword_match: true,
             });
     }
 
@@ -122,10 +126,14 @@ pub fn merge_results(
                 rowid,
                 text_score: 0.0,
                 vector_score: score,
+                keyword_match: false,
             });
     }
 
-    // Compute final scores and filter
+    // Compute final scores and filter. Every keyword match is a result, however low it scores: a word
+    // in at least half the rows scores about 0 by keyword (FTS5 clamps its IDF), and dropping those
+    // returned fewer matches than a keyword-only search (#51). MIN_SCORE gates only the candidates
+    // found by meaning alone.
     let mut results: Vec<HybridResult> = candidates
         .into_values()
         .filter_map(|c| {
@@ -133,13 +141,15 @@ pub fn merge_results(
             let th = config::hybrid::VECTOR_SCORE_THRESHOLD;
             let adjusted_vector = ((c.vector_score - th) / (1.0 - th)).max(0.0);
             let final_score = vector_weight * adjusted_vector + text_weight * c.text_score;
+            if !c.keyword_match && final_score < config::hybrid::MIN_SCORE {
+                return None;
+            }
             Some(HybridResult {
                 rowid: c.rowid,
                 final_score,
                 date_ms: *dates.get(&c.rowid)?,
             })
         })
-        .filter(|r| r.final_score >= config::hybrid::MIN_SCORE)
         .collect();
 
     // Sort, then a last tie-break by rowid so equal results come back in one order.
@@ -263,6 +273,26 @@ mod tests {
         for sort in [SearchSort::Relevance, SearchSort::DateDesc, SearchSort::DateAsc] {
             assert_eq!(rowids(&merge_results(&text, &[], &dates, 0.7, 0.3, sort, 10)), [1, 2, 3, 4, 5, 6], "{sort:?}");
         }
+    }
+
+    /// Every keyword match is a result, however low it scores (a word in most rows scores about 0
+    /// by keyword); a candidate found by meaning alone is kept only at MIN_SCORE or above (#51).
+    #[test]
+    fn every_keyword_match_is_kept_and_meaning_alone_needs_min_score() {
+        // rank -0.000001: about 0 by keyword. Distance 1.0: 0 by meaning.
+        let text = vec![(1, -0.000001), (2, -0.000001), (3, -0.000001)];
+        // 3 also found by meaning, weakly; 4 by meaning alone, weakly; 5 by meaning alone, strongly.
+        let vector = vec![(3, 1.0), (4, 1.0), (5, 0.0)];
+        let dates: HashMap<i64, i64> = (1..=5).map(|r| (r, 10 * r)).collect();
+        for sort in [SearchSort::Relevance, SearchSort::DateDesc, SearchSort::DateAsc] {
+            let merged = merge_results(&text, &vector, &dates, 0.7, 0.3, sort, 10);
+            let mut kept = rowids(&merged);
+            kept.sort();
+            assert_eq!(kept, [1, 2, 3, 5], "{sort:?}");
+            assert!(merged.iter().filter(|r| r.rowid != 5).all(|r| r.final_score < config::hybrid::MIN_SCORE), "{sort:?}");
+        }
+        // By relevance the match by meaning comes first.
+        assert_eq!(rowids(&merge_results(&text, &vector, &dates, 0.7, 0.3, SearchSort::Relevance, 1)), [5]);
     }
 
     /// A candidate with no date (its row is gone) is left out, as its row could not be answered.
