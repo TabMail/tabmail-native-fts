@@ -64,6 +64,10 @@ may still rank above a keyword match, as before.
   about 0 kept, a weak vector-only one dropped, a strong one kept.
 - `keyword_candidates_of_equal_rank_are_the_newest` and its memory twin: 12 tied rows indexed oldest
   first, a pool of 4 holds the 4 newest.
+- `search_returns_a_keyword_match_that_scores_0` and its memory twin: a query matching only the
+  msgId / memId (columns weighted 0, rank exactly 0) is a result with the model loaded.
+- `memory_search_keeps_the_best_keyword_match_over_newer_weaker_ones_at_a_small_limit`: 13 matches,
+  the best one older, limit 1: the pool takes rank before date, so the best match is answered.
 - Mutants (ledger `PLAN_NF_COMMON_WORD/reviews/mutation-ledger.jsonl`): keyword gated by `MIN_SCORE`,
   vector-only ungated, the vector leg clearing the flag, a vector-only candidate counted as keyword,
   each pool without the date tie-break: all detected.

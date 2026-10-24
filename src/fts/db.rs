@@ -5374,6 +5374,28 @@ pub(crate) mod tests {
         assert_eq!(ids, ["acc:/:budget-0", "acc:/:budget-1", "acc:/:budget-2", "acc:/:budget-3"]);
     }
 
+    /// A keyword match that scores exactly 0 (the query matches only the msgId, a column weighted 0)
+    /// is a result too, though its vector alone could not keep it (#51).
+    #[test]
+    fn search_returns_a_keyword_match_that_scores_0() {
+        let Some(engine) = embedding_engine() else { return };
+        let (profile, _path, mut conn, mut known_years) = temp_email_db("keyword-scores-0");
+        let q = "quasarmarker";
+        let row = email_row("acc:/:quasarmarker", "Penguin", "The penguin walks across the ice and eats fish.", mid_year_ms());
+        index_batch(&mut conn, &[row], Some(&engine), &mut known_years).unwrap();
+        let fts_query = build_fts_match(Some(q), QUERY_COLUMNS, true, &SynonymLookup::new());
+        let candidates = search_fts_candidates(&conn, &fts_query, None, None, 100, &known_years).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].rank, 0.0);
+        let params = serde_json::json!({ "ignoreDate": true, "limit": 100 });
+        for engine in [None, Some(&engine)] {
+            let found = result_ids(&search(&conn, q, &params, &SynonymLookup::new(), engine, &known_years).unwrap());
+            assert_eq!(found, ["acc:/:quasarmarker"], "engine: {}", engine.is_some());
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
     /// The topics of the release smoke test's rows (PLAN_RELEASE_1_10): every row says "we talked
     /// about <topic> and the meeting notes".
     pub(crate) const COMMON_WORD_TOPICS: [&str; 8] = [

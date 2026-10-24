@@ -279,8 +279,9 @@ mod tests {
     /// by keyword); a candidate found by meaning alone is kept only at MIN_SCORE or above (#51).
     #[test]
     fn every_keyword_match_is_kept_and_meaning_alone_needs_min_score() {
-        // rank -0.000001: about 0 by keyword. Distance 1.0: 0 by meaning.
-        let text = vec![(1, -0.000001), (2, -0.000001), (3, -0.000001)];
+        // rank -0.000001: about 0 by keyword; rank 0 (a match only in a column weighted 0): exactly 0.
+        // Distance 1.0: 0 by meaning.
+        let text = vec![(1, -0.000001), (2, 0.0), (3, -0.000001)];
         // 3 also found by meaning, weakly; 4 by meaning alone, weakly; 5 by meaning alone, strongly.
         let vector = vec![(3, 1.0), (4, 1.0), (5, 0.0)];
         let dates: HashMap<i64, i64> = (1..=5).map(|r| (r, 10 * r)).collect();
