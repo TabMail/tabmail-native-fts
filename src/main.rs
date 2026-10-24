@@ -2013,13 +2013,22 @@ mod tests {
     }
 
     #[test]
-    fn test_hello_advertises_folder_membership_v1() {
-        assert_eq!(hello_capabilities()["folderMembershipV1"], true);
-        assert_eq!(hello_capabilities()["folderMembershipSummaryV1"], true);
-        assert_eq!(hello_capabilities()["memorySizeLimitV1"], true);
-        assert_eq!(hello_capabilities()["memoryPreviewV1"], true);
-        assert_eq!(hello_capabilities()["memoryFilterBeforeLimitV1"], true);
-        assert_eq!(hello_capabilities()["searchSortV1"], true);
+    fn test_hello_response_advertises_capabilities() {
+        // Read from the reply a caller receives, not the constructor: callers refuse
+        // a request when a flag is missing there (ADR-NF-018). The test binary runs
+        // outside any system install directory, so the hello migrates nothing.
+        let hello = handle_hello("hello-1", &serde_json::json!({})).unwrap();
+        let capabilities = &hello["result"]["capabilities"];
+        for flag in [
+            "folderMembershipV1",
+            "folderMembershipSummaryV1",
+            "memorySizeLimitV1",
+            "memoryPreviewV1",
+            "memoryFilterBeforeLimitV1",
+            "searchSortV1",
+        ] {
+            assert_eq!(capabilities[flag], true, "{flag}");
+        }
     }
 
     #[test]
