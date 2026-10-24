@@ -4905,6 +4905,9 @@ pub(crate) mod tests {
             ("lunch NOT from:erin@example.com", vec!["acc:/:frank"]),
             ("lunch NOT from:frank@example.com", vec!["acc:/:erin"]),
             ("lunch on friday NOT from:erin@example.com", vec!["acc:/:frank"]),
+            // An operator after the NOT leaves it excluding.
+            ("lunch NOT from:erin@example.com AND lunch", vec!["acc:/:frank"]),
+            ("lunch NOT from:erin@example.com OR dinner", vec!["acc:/:frank"]),
             ("vacation NOT itinerary", vec!["acc:/:plans"]),
             ("vacation NOT from:erin@example.com", vec![]),
         ] {
@@ -5391,6 +5394,8 @@ pub(crate) mod tests {
             "invoice NOT receipt",
             "abcd NOT don't",
             "lunch OR dinner NOT from:erin@example.com",
+            "lunch NOT from:erin@example.com AND lunch",
+            "vacation NOT itinerary OR summer",
         ] {
             assert!(query_excludes(&built(q)), "{q} -> {}", built(q));
         }

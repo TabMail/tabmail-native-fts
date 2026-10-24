@@ -2248,9 +2248,12 @@ pub(crate) mod tests {
         let rows = [row("itinerary", "The vacation itinerary and hotels", 0), row("plans", "Vacation plans for the summer", 1)];
         memory_index_batch(&mut conn, &rows, Some(&engine)).unwrap();
         let params = serde_json::json!({ "ignoreDate": true });
-        let results = memory_search(&conn, "vacation NOT itinerary", &params, &SynonymLookup::new(), Some(&engine)).unwrap();
-        let ids: Vec<&str> = results.iter().map(|r| r["memId"].as_str().unwrap()).collect();
-        assert_eq!(ids, vec!["plans"]);
+        // An operator after the NOT leaves it excluding.
+        for q in ["vacation NOT itinerary", "vacation NOT itinerary AND summer", "vacation NOT itinerary OR summer"] {
+            let results = memory_search(&conn, q, &params, &SynonymLookup::new(), Some(&engine)).unwrap();
+            let ids: Vec<&str> = results.iter().map(|r| r["memId"].as_str().unwrap()).collect();
+            assert_eq!(ids, vec!["plans"], "{q}");
+        }
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }

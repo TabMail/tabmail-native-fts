@@ -23,8 +23,9 @@ embedding model loaded, the search is hybrid, and the vector leg cannot exclude:
    (ADR-NF-017), which is by keyword too.
 2. A NOT that `build_fts_match` drops (first, last, after another operator), quoted, lower-case or
    a field's value excludes nothing and changes nothing.
-3. Queries without a NOT are unchanged: the field filter is the AND of the field terms, which every
-   message satisfying the query's fields satisfies when nothing is negated.
+3. Queries without a NOT follow the existing path, unchanged. Its field filter is the AND of the
+   field terms, so with an OR between fields (`budget from:a OR from:b`) the vector leg can find
+   fewer matches by meaning than the query allows (recall only; no excluded result).
 
 ## Consequences
 
@@ -51,12 +52,14 @@ Each test was checked against a mutated build ("red" = fails there).
 - `search_excluding_a_sender_or_a_word_returns_none_of_it` (unit, model loaded): `lunch NOT
   from:erin@example.com` (and frank's, and a longer query) returns only the other sender's lunch;
   `vacation NOT itinerary` only the message without "itinerary"; `vacation NOT from:erin@example.com`
-  nothing; each in relevance, date_desc and date_asc order. Red on main (599b8eb: erin's mail for
+  nothing; an AND or OR after the NOT (`lunch NOT from:erin@example.com AND lunch`, `... OR dinner`)
+  still excludes; each in relevance, date_desc and date_asc order. Red on main (599b8eb: erin's mail for
   `NOT from:erin`), with the email search ignoring the NOT, and with only a NOT before a field
   counted (red at `vacation NOT itinerary`).
 - `memory_search_excluding_a_word_returns_none_of_it` (unit, model loaded): `vacation NOT itinerary`
-  returns only the entry without "itinerary". Red on main and with the memory search ignoring the
-  NOT.
+  returns only the entry without "itinerary", and so do `... AND summer` and `... OR summer`. Red on
+  main, with the memory search ignoring the NOT, and with the scan forgetting a NOT at a later AND or
+  OR (review r1).
 - `a_query_that_keeps_a_not_excludes` (unit): a kept NOT before a field, a word, a phrase, a
   synonym group or a spelling group excludes; a dropped, quoted, lower-case NOT or a field's value
   does not. Red with `query_excludes` always false, with any `NOT` substring counted, and with any
