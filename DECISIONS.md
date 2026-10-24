@@ -184,6 +184,10 @@ archives of any size.
 
 - **[Full ADR](Companion/Decisions/Active/adr-nf-018-capabilities-for-the-behaviour-0-11-8-lacks.md)** — `hello` capabilities `memoryPreviewV1` (previewChars), `memoryFilterBeforeLimitV1` (dated memory search filters before the limit), `searchSortV1` (`search` `sort`, TB #164): a 0.11.8 helper reports the same version as main but returned 0 of 6 dated matches and a 1.25 MB listing over the 1 MiB cap (TB release review 2026-10-24); callers refuse on the receiving connection's capabilities. Amends ADR-NF-012 item 4. Voice unaffected (pinned build).
 
+## ADR-NF-019: A Search That Excludes Answers by Keyword; an OR Filters Each Alternative
+
+- **[Full ADR](Companion/Decisions/Active/adr-nf-019-a-search-that-excludes-answers-by-keyword.md)** — #21: hybrid `X NOT from:Y` returned Y's mail (`extract_column_scope_filter` dropped the NOT, the vector leg searched only Y's mail), and a NOT before a word was ignored by the vector leg (email and memory). Now a query keeping a NOT (`query_excludes`, a bare `NOT` token in `split_column_scope`'s scan) answers by keyword only: `search_fts_only` / `memory_search_fts_only`. Dropped/quoted/lower-case NOT unchanged. The vector field filter now splits at each OR outside a group (each alternative = AND of its fields, joined by OR; an alternative without a field = no filter), so `from:a OR from:b x` searches both senders by meaning, not mail from both. Rejected: NOT in the field filter (FTS5 NOT is binary), post-filtering vector candidates (fewer than k). iOS tabmail-ios#301.
+
 ---
 
 ## Template for New Decisions
