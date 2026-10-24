@@ -1,4 +1,4 @@
-# ADR-NF-019: A Search That Excludes Answers by Keyword
+# ADR-NF-019: A Search That Excludes Answers by Keyword; an OR Filters Each Alternative
 
 **Status:** Accepted (2026-10-24, issue #21). The iOS app follows with tabmail-ios#301.
 
@@ -13,6 +13,10 @@ embedding model loaded, the search is hybrid, and the vector leg cannot exclude:
   the vector leg searched only erin's mail and returned it (issue #21, in 0.11.8 too).
 - A NOT before a word, a phrase or a group (email and memory) never reached the vector leg, which
   returned the nearest by meaning, the excluded mail and entries among them.
+- The same filter joined every field with AND, ignoring OR: `from:a OR from:b plan the trip` let the
+  vector leg search only mail from both a and b (none), and `subject:launch OR plan the trip` only
+  mail with "launch" in its subject, so a match by meaning for the other alternative was lost
+  (recall only; issue #21's comments).
 
 ## Decision
 
@@ -23,13 +27,17 @@ embedding model loaded, the search is hybrid, and the vector leg cannot exclude:
    (ADR-NF-017), which is by keyword too.
 2. A NOT that `build_fts_match` drops (first, last, after another operator), quoted, lower-case or
    a field's value excludes nothing and changes nothing.
-3. Queries without a NOT follow the existing path, unchanged. Its field filter is the AND of the
-   field terms, so with an OR between fields (`budget from:a OR from:b`) the vector leg can find
-   fewer matches by meaning than the query allows (recall only; no excluded result).
+3. The vector filter (`extract_column_scope_filter`) is the rows the query's fields allow, its free
+   terms matching anything. `split_column_scope` splits the fields at each OR outside a group
+   (FTS5's OR binds loosest); each alternative keeps the AND of its own fields, and the
+   alternatives are joined with OR (`from_:"a" OR from_:"b"`). An alternative with no field allows
+   every row, so there is no filter, as for a query without fields. A query with no OR gets the
+   filter it had.
 
 ## Consequences
 
 - A search never returns mail or an entry its query excludes.
+- A search with an OR finds by meaning within what each alternative allows.
 - A search with a NOT finds no match by meaning alone. NOT is reached only by a capital NOT between
   two terms, which no tool description documents; models write it Gmail-style.
 - The vector leg is skipped for such a search, so it costs no embedding.
@@ -60,6 +68,13 @@ Each test was checked against a mutated build ("red" = fails there).
   returns only the entry without "itinerary", and so do `... AND summer` and `... OR summer`. Red on
   main, with the memory search ignoring the NOT, and with the scan forgetting a NOT at a later AND or
   OR (review r1).
+- `search_with_an_or_finds_by_meaning_within_what_each_alternative_allows` (unit, model loaded: two
+  matches by meaning alone, from b and from c): `from:a@example.com OR from:b@example.com plan the
+  vacation itinerary` returns b's only; `subject:launch OR plan the vacation itinerary` both. Red with
+  the fields not split at OR (main's filter), with an alternative without a field still filtered, and
+  with the alternatives joined by AND.
+- `test_extract_column_scope_filter_keeps_each_alternative_between_ors` (unit): the filters above,
+  explicit AND, and an OR inside a group. Red under the same three mutations.
 - `a_query_that_keeps_a_not_excludes` (unit): a kept NOT before a field, a word, a phrase, a
   synonym group or a spelling group excludes; a dropped, quoted, lower-case NOT or a field's value
   does not. Red with `query_excludes` always false, with any `NOT` substring counted, and with any

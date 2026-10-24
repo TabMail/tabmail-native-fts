@@ -897,17 +897,24 @@ fn query_has_column_scope(fts_query: &str) -> bool {
     COLUMN_SCOPE_PREFIXES.iter().any(|p| fts_query.contains(p))
 }
 
-/// Extract only the column-scoped terms from a processed FTS5 query.
-/// Given `from_:"alice@example.com" hiring*`, returns `from_:"alice@example.com"`.
+/// The vector filter of a processed FTS5 query: the rows its fields allow, its free terms matching
+/// anything (a query with a NOT never gets here: it answers by keyword). Each alternative between
+/// ORs keeps its own fields: `from_:"a@example.com" OR from_:"b@example.com" "budget"*` gives
+/// `from_:"a@example.com" OR from_:"b@example.com"`. An alternative with no field allows every row,
+/// so there is no filter (""), as for a query without fields.
 fn extract_column_scope_filter(fts_query: &str) -> String {
-    split_column_scope(fts_query).0.join(" ")
+    let alternatives = split_column_scope(fts_query).0;
+    if alternatives.iter().any(|fields| fields.is_empty()) {
+        return String::new();
+    }
+    alternatives.iter().map(|fields| fields.join(" ")).collect::<Vec<_>>().join(" OR ")
 }
 
 /// Whether a processed FTS5 query is only column-scoped terms, with operators between them: no free
 /// word or phrase (`from:alice@example.com`, `from:a@example.com OR to:a@example.com`).
 fn query_is_field_only(fts_query: &str) -> bool {
-    let (scoped_terms, has_free_text, _) = split_column_scope(fts_query);
-    !scoped_terms.is_empty() && !has_free_text
+    let (alternatives, has_free_text, _) = split_column_scope(fts_query);
+    alternatives.iter().any(|fields| !fields.is_empty()) && !has_free_text
 }
 
 /// Whether a processed FTS5 query excludes something (a kept NOT): `lunch NOT from_:"erin@example.com"`,
@@ -917,11 +924,12 @@ pub(crate) fn query_excludes(fts_query: &str) -> bool {
     split_column_scope(fts_query).2
 }
 
-/// A processed FTS5 query's column-scoped terms, whether it has any other term than an operator, and
-/// whether it keeps a NOT. Every free word, phrase and group `build_fts_match` writes starts with a
-/// quote or a parenthesis, so an operator is the only bare word outside them.
-fn split_column_scope(fts_query: &str) -> (Vec<String>, bool, bool) {
-    let mut scoped_terms: Vec<String> = Vec::new();
+/// A processed FTS5 query's column-scoped terms in each alternative between its ORs (FTS5's OR binds
+/// loosest), whether it has any other term than an operator, and whether it keeps a NOT. Every free
+/// word, phrase and group `build_fts_match` writes starts with a quote or a parenthesis, so an
+/// operator is the only bare word outside them.
+fn split_column_scope(fts_query: &str) -> (Vec<Vec<String>>, bool, bool) {
+    let mut alternatives: Vec<Vec<String>> = vec![Vec::new()];
     let mut has_free_text = false;
     let mut excludes = false;
     let bytes = fts_query.as_bytes();
@@ -963,7 +971,7 @@ fn split_column_scope(fts_query: &str) -> (Vec<String>, bool, bool) {
                 }
             }
 
-            scoped_terms.push(fts_query[start..i].to_string());
+            alternatives.last_mut().expect("one alternative at least").push(fts_query[start..i].to_string());
         } else {
             // Non-scoped token — skip it
             has_free_text |= bytes[i] == b'"' || bytes[i] == b'(';
@@ -988,12 +996,16 @@ fn split_column_scope(fts_query: &str) -> (Vec<String>, bool, bool) {
                 while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
                     i += 1;
                 }
-                excludes |= &fts_query[start..i] == "NOT";
+                match &fts_query[start..i] {
+                    "NOT" => excludes = true,
+                    "OR" => alternatives.push(Vec::new()),
+                    _ => {}
+                }
             }
         }
     }
 
-    (scoped_terms, has_free_text, excludes)
+    (alternatives, has_free_text, excludes)
 }
 
 /// Fetch all rowids matching a column-scope filter query across all year shards.
@@ -3028,6 +3040,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_extract_column_scope_filter_keeps_each_alternative_between_ors() {
+        // Each alternative keeps the AND of its own fields; free terms match anything.
+        assert_eq!(
+            extract_column_scope_filter(r#"from_:"a@example.com" OR from_:"b@example.com" "budget"*"#),
+            r#"from_:"a@example.com" OR from_:"b@example.com""#
+        );
+        assert_eq!(
+            extract_column_scope_filter(r#"from_:"a@example.com" "budget"* OR from_:"b@example.com" subject:launch"#),
+            r#"from_:"a@example.com" OR from_:"b@example.com" subject:launch"#
+        );
+        // An alternative without a field allows every row: no filter.
+        assert_eq!(extract_column_scope_filter(r#""itinerary"* OR subject:"launch"*"#), "");
+        assert_eq!(extract_column_scope_filter(r#"from_:"a@example.com" AND "budget"* OR "lunch"*"#), "");
+        // An OR inside a group is not between alternatives.
+        assert_eq!(
+            extract_column_scope_filter(r#"from_:"a@example.com" AND ("hiring" OR "recruit")"#),
+            r#"from_:"a@example.com""#
+        );
+    }
+
+    #[test]
     fn test_fetch_eligible_rowids_filters_by_sender() {
         let (conn, mut known_years) = setup_test_db();
 
@@ -4916,6 +4949,38 @@ pub(crate) mod tests {
                 let results = search(&conn, q, &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap();
                 assert_eq!(result_ids(&results), expected, "{q} {sort}");
             }
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    /// A search with an OR finds by meaning within what each alternative allows: within either
+    /// sender of `from:a OR from:b ...` (not only mail from both), and anywhere when an alternative
+    /// has no field (`subject:launch OR plan the vacation itinerary`). Issue #21.
+    #[test]
+    fn search_with_an_or_finds_by_meaning_within_what_each_alternative_allows() {
+        let Some(engine) = embedding_engine() else { return };
+        let (profile, _path, mut conn, mut known_years) = temp_email_db("or");
+        let now = chrono::Utc::now().timestamp_millis();
+        let row = |id: &str, from: &str, subject: &str, body: &str| {
+            serde_json::json!({ "msgId": id, "subject": subject, "from": from, "body": body, "dateMs": now })
+        };
+        // Near the queries by meaning, with none of their words: one from b, one from c.
+        let rows = [
+            row("acc:/:from-b", "b@example.com", "Holiday", "The route and hotels for our summer holiday"),
+            row("acc:/:from-c", "c@example.com", "Holiday", "The route and hotels for our summer trip"),
+        ];
+        index_batch(&mut conn, &rows, Some(&engine), &mut known_years).unwrap();
+        for (q, expected) in [
+            ("from:a@example.com OR from:b@example.com plan the vacation itinerary", vec!["acc:/:from-b"]),
+            ("subject:launch OR plan the vacation itinerary", vec!["acc:/:from-b", "acc:/:from-c"]),
+        ] {
+            let params = serde_json::json!({ "ignoreDate": true });
+            let results = search(&conn, q, &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap();
+            let mut ids = result_ids(&results);
+            ids.sort();
+            assert_eq!(ids, expected, "{q}");
+            assert!(results.iter().all(|r| r["snippet"] == ""), "found by meaning, not by their words: {q}");
         }
         drop(conn);
         let _ = std::fs::remove_dir_all(profile);
