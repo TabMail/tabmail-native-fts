@@ -123,7 +123,9 @@ The memory database enables:
 `memorySearch` takes an optional `previewChars` (a positive integer): each result's
 `content` and `snippet` then come back cut to that many characters, so a reply of long
 entries stays small (Thunderbird refuses a native message over 1 MiB). The stored
-entries are unchanged. See ADR-NF-012 in `DECISIONS.md`.
+entries are unchanged. See ADR-NF-012 in `DECISIONS.md`. Helpers with this support
+advertise `capabilities.memoryPreviewV1` in `hello`, and those whose dated memory search filters
+by date before taking its limit advertise `capabilities.memoryFilterBeforeLimitV1` (ADR-NF-018).
 
 A `search` or `memorySearch` with a query returns at most 512 results, whatever `limit` it is
 given, so it stays a hybrid (keyword and meaning) search; narrow it by dates instead. A memory
@@ -134,7 +136,7 @@ other value is refused. The helper sorts the matches, then takes `limit`: the be
 (equal ones newer first), or the newest or oldest matches (equal dates the better match first). A
 date sort picks its matches from 4,096 candidates per leg, so narrow a common word by dates. A query
 of only fields (`from:"alice@example.com"`) is answered by keyword over every match, newest first
-by default. Memory search orders equal matches newer first. See ADR-NF-017.
+by default. Memory search orders equal matches newer first. See ADR-NF-017. Helpers with `sort` advertise `capabilities.searchSortV1` in `hello`.
 
 Each Thunderbird profile gets its own isolated FTS and memory databases.
 

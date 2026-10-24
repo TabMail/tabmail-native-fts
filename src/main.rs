@@ -995,10 +995,15 @@ fn handle_hello(msg_id: &str, params: &Value) -> anyhow::Result<Value> {
 }
 
 fn hello_capabilities() -> Value {
+    // The last three name behaviour a 0.11.8 helper lacks while reporting the same
+    // version, so a caller can refuse a request whose answer would be wrong (ADR-NF-018).
     serde_json::json!({
         "folderMembershipV1": true,
         "folderMembershipSummaryV1": true,
-        "memorySizeLimitV1": true
+        "memorySizeLimitV1": true,
+        "memoryPreviewV1": true,
+        "memoryFilterBeforeLimitV1": true,
+        "searchSortV1": true
     })
 }
 
@@ -2008,10 +2013,22 @@ mod tests {
     }
 
     #[test]
-    fn test_hello_advertises_folder_membership_v1() {
-        assert_eq!(hello_capabilities()["folderMembershipV1"], true);
-        assert_eq!(hello_capabilities()["folderMembershipSummaryV1"], true);
-        assert_eq!(hello_capabilities()["memorySizeLimitV1"], true);
+    fn test_hello_response_advertises_capabilities() {
+        // Read from the reply a caller receives, not the constructor: callers refuse
+        // a request when a flag is missing there (ADR-NF-018). The test binary runs
+        // outside any system install directory, so the hello migrates nothing.
+        let hello = handle_hello("hello-1", &serde_json::json!({})).unwrap();
+        let capabilities = &hello["result"]["capabilities"];
+        for flag in [
+            "folderMembershipV1",
+            "folderMembershipSummaryV1",
+            "memorySizeLimitV1",
+            "memoryPreviewV1",
+            "memoryFilterBeforeLimitV1",
+            "searchSortV1",
+        ] {
+            assert_eq!(capabilities[flag], true, "{flag}");
+        }
     }
 
     #[test]
