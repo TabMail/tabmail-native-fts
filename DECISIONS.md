@@ -166,7 +166,7 @@ archives of any size.
 
 ## ADR-NF-014: A Hybrid Search Whose Merge Keeps Nothing Answers by Keyword
 
-- **[Full ADR](Companion/Decisions/Active/adr-nf-014-an-empty-merge-answers-by-keyword.md)** — #28: a word in at least half the rows (FTS5 IDF clamp to ~0) + weak vectors put every fused score under `MIN_SCORE` 0.1, so hybrid search returned nothing; now an empty merge with keyword matches falls back to `search_fts_only` / `memory_search_fts_only`. Scoring unchanged: study on real TB/iOS email + memory DBs, current `merge_results` best or tied in 4 of 5 DBs (unthresholded RRF higher only on a 25-turn Voice DB, by filling the page with non-matches) vs weighted RRF, min-max normalisation, query-length gating, keyword-only (known-item MRR@10). iOS in step, tabmail-ios#240. Email fallback order now follows `sort` (relevance: best keyword first), ADR-NF-017.
+- **[Full ADR](Companion/Decisions/Active/adr-nf-014-an-empty-merge-answers-by-keyword.md)** — #28: a word in at least half the rows (FTS5 IDF clamp to ~0) + weak vectors put every fused score under `MIN_SCORE` 0.1, so hybrid search returned nothing; now an empty merge with keyword matches falls back to `search_fts_only` / `memory_search_fts_only`. Scoring unchanged: study on real TB/iOS email + memory DBs, current `merge_results` best or tied in 4 of 5 DBs (unthresholded RRF higher only on a 25-turn Voice DB, by filling the page with non-matches) vs weighted RRF, min-max normalisation, query-length gating, keyword-only (known-item MRR@10). iOS in step, tabmail-ios#240. Email fallback order now follows `sort` (relevance: best keyword first), ADR-NF-017. **Fallback deleted by ADR-NF-020** (every keyword match is a result).
 
 ## ADR-NF-015: Memory Dates Are Indexed
 
@@ -187,6 +187,10 @@ archives of any size.
 ## ADR-NF-019: A Search That Excludes Answers by Keyword; an OR Filters Each Alternative
 
 - **[Full ADR](Companion/Decisions/Active/adr-nf-019-a-search-that-excludes-answers-by-keyword.md)** — #21: hybrid `X NOT from:Y` returned Y's mail (`extract_column_scope_filter` dropped the NOT, the vector leg searched only Y's mail), and a NOT before a word was ignored by the vector leg (email and memory). Now a query keeping a NOT (`query_excludes`, a bare `NOT` token in `split_column_scope`'s scan) answers by keyword only: `search_fts_only` / `memory_search_fts_only`. Dropped/quoted/lower-case NOT unchanged. The vector field filter now splits at each OR outside a group (each alternative = AND of its fields, joined by OR; an alternative without a field = no filter), so `from:a OR from:b x` searches both senders by meaning, not mail from both. Rejected: NOT in the field filter (FTS5 NOT is binary), post-filtering vector candidates (fewer than k). iOS tabmail-ios#301.
+
+## ADR-NF-020: Every Keyword Match Is a Hybrid Result
+
+- **[Full ADR](Companion/Decisions/Active/adr-nf-020-every-keyword-match-is-a-hybrid-result.md)** — #51: a word in most rows (FTS5 IDF clamp, ~0 keyword score) kept only the rows the vector leg lifted over `MIN_SCORE` (smoke test: `meeting` 1 of 8, email + memory). Now every keyword candidate is a result (`HybridCandidate.keyword_match`); `MIN_SCORE` gates vector-only candidates; ranking unchanged. ADR-NF-014's empty-merge fallback DELETED. Keyword pools tie-break `rank ASC, dateMs DESC`. Owner invariant: hybrid never returns fewer than keyword-only. Rejected parallel hybrid+keyword larger-set, max-relative threshold. iOS paired issue.
 
 ---
 
