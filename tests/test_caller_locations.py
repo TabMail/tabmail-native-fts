@@ -356,10 +356,15 @@ class TestCallerLocations(unittest.TestCase):
             # Counted when the memory opened, null when it was left closed; never a wrong count.
             if damage is None:
                 self.assertEqual(init["result"]["memoryDocs"], 200, init)
-                self.assertEqual([e["content"] for e in read["result"]], ["exchange 0"], read)
             else:
                 self.assertIn(init["result"]["memoryDocs"], (None, 200), init)
-                self.assertTrue("result" in read or "error" in read, read)
+            # A read the damage reaches answers its error, never an empty success; one it doesn't
+            # reach answers the entry.
+            if damage in ("schema", "memory_meta", "memory_fts_content", "memory_fts_data", "memory_fts_config"):
+                self.assertIn("error", read, read)
+                self.assertNotIn("result", read, read)
+            else:
+                self.assertEqual([e["content"] for e in read["result"]], ["exchange 0"], read)
 
         # Nothing was deleted before the user clears: the entries are all still there.
         if damage == "schema":
