@@ -298,17 +298,19 @@ class TestCallerLocations(unittest.TestCase):
         self.assertGreater(len(log.read_bytes()), len(log_before))
 
     def test_a_corrupt_memory_page_never_stops_init_and_clear_recovers_it(self):
-        """An older memory (no date index) with a corrupt page in memory_meta,
-        whose date index then cannot be built, or in the full-text tables init
-        counts: init still succeeds, email search answers, and memoryClear
+        """An older memory (no date index) with a corrupt page: its schema
+        page, memory_meta (whose date index then cannot be built) or a
+        full-text table. Every start still answers init and email search, the
+        memory's entries stay until the user clears them, and memoryClear
         recovers the memory (#41). Before, every init failed, so email search
         was down and the memory could not be cleared."""
-        for table in ("memory_meta", "memory_fts_content", "memory_fts_data", "memory_fts_docsize", "memory_fts_idx"):
-            with self.subTest(table=table):
-                self._corrupt_memory_page_session(table)
+        for damage in (None, "schema", "memory_meta", "memory_fts_content", "memory_fts_data",
+                       "memory_fts_docsize", "memory_fts_idx", "memory_fts_config"):
+            with self.subTest(damage=damage):
+                self._corrupt_memory_page_session(damage)
 
-    def _corrupt_memory_page_session(self, table):
-        db_dir = self.caller / "db" / table
+    def _corrupt_memory_page_session(self, damage):
+        db_dir = self.caller / "db" / (damage or "healthy")
         args = ["--log-dir", str(self.caller / "logs")]
         model_dir = self.caller / "models"
         if not model_dir.exists():
@@ -320,29 +322,62 @@ class TestCallerLocations(unittest.TestCase):
         memory = [{"memId": f"turn:{i}", "role": "session", "content": f"exchange {i}",
                    "sessionId": "persistent_chat", "turnIndex": i, "dateMs": now_ms - i * DAY_MS}
                   for i in range(200)]
-        init, _, _ = self._session(args, [("init", init_params), ("indexBatch", {"rows": email}),
-                                          ("memoryIndexBatch", {"rows": memory})])
+        init, _, stored = self._session(args, [("init", init_params), ("indexBatch", {"rows": email}),
+                                            ("memoryIndexBatch", {"rows": memory})])
+        self.assertEqual(stored["result"]["count"], 200, stored)
         memory_db = Path(init["result"]["memoryDbPath"])
-        # A memory written before the date index, then a storage fault in one of its tables.
+        # A memory written before the date index, then a storage fault in one of its pages.
         conn = sqlite3.connect(memory_db)
         conn.execute("DROP INDEX memory_meta_dateMs")
-        root = conn.execute("SELECT rootpage FROM sqlite_master WHERE name = ?", (table,)).fetchone()[0]
         page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        if damage == "schema":
+            # Page 1 after the file header: the schema, read before any table.
+            offset, length = 100, page_size - 100
+        elif damage:
+            root = conn.execute("SELECT rootpage FROM sqlite_master WHERE name = ?", (damage,)).fetchone()[0]
+            offset, length = (root - 1) * page_size, page_size
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         conn.close()
-        with open(memory_db, "r+b") as f:
-            f.seek((root - 1) * page_size)
-            f.write(b"\xa5" * page_size)
+        if damage:
+            with open(memory_db, "r+b") as f:
+                f.seek(offset)
+                f.write(b"\xa5" * length)
+        before = hashlib.sha256(memory_db.read_bytes()).hexdigest()
 
-        init, search, cleared, written, read = self._session(args, [
+        # Every start, not only the first: init and email search answer, and so does a memory read.
+        for _ in range(2):
+            init, search, read = self._session(args, [
+                ("init", init_params),
+                ("search", {"q": "quarterly", "ignoreDate": True}),
+                ("memoryRead", {"timestampMs": now_ms, "toleranceMs": 0}),
+            ])
+            self.assertTrue(init["result"]["ok"], init)
+            self.assertEqual([r["uniqueId"] for r in search["result"]], ["acc:/:quarterly"], search)
+            # Counted when the memory opened, null when it was left closed; never a wrong count.
+            if damage is None:
+                self.assertEqual(init["result"]["memoryDocs"], 200, init)
+                self.assertEqual([e["content"] for e in read["result"]], ["exchange 0"], read)
+            else:
+                self.assertIn(init["result"]["memoryDocs"], (None, 200), init)
+                self.assertTrue("result" in read or "error" in read, read)
+
+        # Nothing was deleted before the user clears: the entries are all still there.
+        if damage == "schema":
+            self.assertEqual(hashlib.sha256(memory_db.read_bytes()).hexdigest(), before)
+        else:
+            healthy = "memory_fts_content" if damage == "memory_meta" else "memory_meta"
+            conn = sqlite3.connect(memory_db)
+            kept = conn.execute(f"SELECT COUNT(*) FROM {healthy}").fetchone()[0]
+            conn.close()
+            self.assertEqual(kept, 200)
+
+        init, cleared, written, read = self._session(args, [
             ("init", init_params),
-            ("search", {"q": "quarterly", "ignoreDate": True}),
             ("memoryClear", {}),
             ("memoryIndexBatch", {"rows": memory[:1]}),
             ("memoryRead", {"timestampMs": now_ms, "toleranceMs": 0}),
         ])
         self.assertTrue(init["result"]["ok"], init)
-        self.assertEqual([r["uniqueId"] for r in search["result"]], ["acc:/:quarterly"], search)
         self.assertTrue(cleared["result"]["ok"], cleared)
         self.assertEqual(written["result"]["count"], 1, written)
         self.assertEqual([e["content"] for e in read["result"]], ["exchange 0"], read)

@@ -209,7 +209,15 @@ fn run_multi_threaded(
     // Read-only connections for the reader thread. The writer locks one for the whole of a
     // clear, to close it before the files are deleted and open it again after.
     let reader_email_conn = Arc::new(Mutex::new(crate::fts::db::open_read_only_connection(&email_db_path)?));
-    let reader_memory_conn = Arc::new(Mutex::new(memory_db::open_read_only_memory_connection(&memory_db_path)?));
+    // A memory that cannot be opened is left closed, as at init: the reader opens it again at each request.
+    let reader_memory_conn = match memory_db::open_read_only_memory_connection(&memory_db_path) {
+        Ok(conn) => conn,
+        Err(e) => {
+            log::warn!("Reader's memory connection left closed, it could not be opened: {:?}", e);
+            Connection::open_in_memory()?
+        }
+    };
+    let reader_memory_conn = Arc::new(Mutex::new(reader_memory_conn));
 
     // Shared stdout for writing responses from both threads
     let shared_stdout: Arc<Mutex<Stdout>> = Arc::new(Mutex::new(out_stream));
@@ -369,28 +377,29 @@ fn lock_conn(conn: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
 }
 
 /// Whether `conn` is the in-memory stand-in a clear puts in a connection's place while it
-/// replaces the files, rather than a connection to the database: SQLite names an in-memory
-/// database with an empty name. A name rusqlite can't give (one not in UTF-8, as on Linux under a
-/// folder whose name isn't) is a database's.
+/// replaces the files (or init in place of a memory it could not open), rather than a connection
+/// to the database: SQLite names an in-memory database with an empty name. A name rusqlite can't
+/// give (one not in UTF-8, as on Linux under a folder whose name isn't) is a database's.
 fn is_stand_in(conn: &Connection) -> bool {
     matches!(conn.path(), Some(""))
 }
 
 /// Opens the database again in place of a stand-in that a failed clear left (`open` failed, the
-/// files couldn't be opened), so the first request after the fault ends is served from the
-/// database. It never deletes anything: rows written since stay. Failing, it is tried again at
-/// the next request. When the clear deleted the files but couldn't create them, only the writer's
-/// open creates the database: reads fail until the next write.
+/// files couldn't be opened) or that init left for a memory it could not open, so the first
+/// request after the fault ends is served from the database. It never deletes anything: rows
+/// written since stay. Failing, it is tried again at the next request. When the clear deleted the
+/// files but couldn't create them, only the writer's open creates the database: reads fail until
+/// the next write.
 fn reopen_stand_in(conn: &mut Connection, what: &str, open: impl FnOnce() -> anyhow::Result<Connection>) {
     if !is_stand_in(conn) {
         return;
     }
     match open() {
         Ok(new_conn) => {
-            log::info!("Reopened the {what} connection a failed clear left closed");
+            log::info!("Reopened the {what} connection a failed clear or open left closed");
             *conn = new_conn;
         }
-        Err(e) => log::error!("Failed to reopen the {what} connection a failed clear left closed: {:?}", e),
+        Err(e) => log::error!("Failed to reopen the {what} connection a failed clear or open left closed: {:?}", e),
     }
 }
 
@@ -1188,25 +1197,29 @@ fn handle_init(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Res
     // Initialize memory DB (separate database file, inside tabmail_fts/ subdir)
     let fts_subdir = new_fts_parent.join("tabmail_fts");
     std::fs::create_dir_all(&fts_subdir)?;
-    let (memory_db_path, memory_conn) = memory_db::open_or_create_memory_db(&fts_subdir)?;
+    // A memory that cannot be opened (a corrupt page, a full disk) is left closed rather than failing
+    // init: a failed init fails every start, taking email search down and leaving Clear chat history,
+    // which runs through the helper, unable to recover the memory (#41). As after a failed clear, a
+    // stand-in takes its place, which each request tries to open again: memory requests answer an
+    // error until it opens, and memoryClear rebuilds it. `memoryDocs` is then null.
+    let memory_db_path = memory_db::memory_db_path(&fts_subdir);
+    let memory_conn = match memory_db::open_or_create_memory_db(&fts_subdir) {
+        Ok((_, conn)) => conn,
+        Err(e) => {
+            log::warn!("Memory database left closed, it could not be opened: {:?}", e);
+            Connection::open_in_memory()?
+        }
+    };
     state.memory_db_path = Some(memory_db_path.clone());
     state.memory_conn = Some(memory_conn);
 
-    // A count that fails (a corrupt memory page) leaves `memoryDocs` null rather than failing init:
-    // a failed init fails every start, taking email search down and leaving Clear chat history,
-    // which runs through the helper, unable to recover the memory (#41).
     let memory_docs = {
         let conn = state
             .memory_conn
             .as_ref()
             .context("memory db connection missing after init")?;
-        match memory_db::memory_db_count(conn) {
-            Ok(count) => Some(count),
-            Err(e) => {
-                log::warn!("Memory entries could not be counted: {e}");
-                None
-            }
-        }
+        // Null for a memory left closed.
+        if is_stand_in(conn) { None } else { Some(memory_db::memory_db_count(conn)?) }
     };
 
     log::info!(
