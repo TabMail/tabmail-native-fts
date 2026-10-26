@@ -330,9 +330,10 @@ fn migrate_monolithic_to_shards(conn: &Connection, known_years: &mut HashSet<i32
     Ok(())
 }
 
-pub fn init_database(conn: &Connection) -> anyhow::Result<()> {
-    log::info!("Initializing database schema (year-sharded FTS)");
-
+/// The writer's settings for the email database, on every writer open: a new database, an
+/// existing one, and the writer's reopen after a clear. Only `journal_mode` is kept in the file;
+/// the rest hold for the connection, so an open that skipped them ran on a plain open's defaults (#55).
+fn set_email_writer_pragmas(conn: &Connection) -> anyhow::Result<()> {
     // IMPORTANT:
     // SQLite PRAGMA statements do NOT reliably accept parameters, so we must interpolate.
     // Numeric values still come from config constants (repo rule: no scattered magic numbers).
@@ -345,12 +346,21 @@ PRAGMA cache_size = {cache_size};\n\
 PRAGMA mmap_size = {mmap_size};\n\
 PRAGMA busy_timeout = {busy_timeout};\n\
 PRAGMA wal_autocheckpoint = {wal_autocheckpoint};\n\
+PRAGMA journal_size_limit = {journal_size_limit};\n\
 ",
         cache_size = config::sqlite::PRAGMA_CACHE_SIZE_KIB_NEG,
         mmap_size = config::sqlite::PRAGMA_MMAP_SIZE_BYTES,
         busy_timeout = config::sqlite::PRAGMA_BUSY_TIMEOUT_MS,
         wal_autocheckpoint = config::sqlite::PRAGMA_WAL_AUTOCHECKPOINT_PAGES,
+        journal_size_limit = config::sqlite::PRAGMA_JOURNAL_SIZE_LIMIT_BYTES,
     ))?;
+    Ok(())
+}
+
+pub fn init_database(conn: &Connection) -> anyhow::Result<()> {
+    log::info!("Initializing database schema (year-sharded FTS)");
+
+    set_email_writer_pragmas(conn)?;
 
     // Create non-FTS tables. FTS shard tables are created lazily via ensure_shard().
     conn.execute_batch(
@@ -478,6 +488,7 @@ pub fn open_or_create_db(profile_dir: &Path) -> anyhow::Result<(PathBuf, Connect
 
     if has_monolithic {
         log::info!("Detected monolithic messages_fts — running year-shard migration");
+        set_email_writer_pragmas(&conn)?;
         // Ensure vector tables exist (pre-v0.7.0 migration)
         ensure_vector_tables(&conn)?;
         // Run crash-safe migration to year shards
@@ -486,6 +497,7 @@ pub fn open_or_create_db(profile_dir: &Path) -> anyhow::Result<(PathBuf, Connect
         known_years = load_known_years(&conn)?;
     } else if has_shards {
         log::info!("Using existing year-sharded FTS database");
+        set_email_writer_pragmas(&conn)?;
         ensure_vector_tables(&conn)?;
         known_years = load_known_years(&conn)?;
     } else {
@@ -5841,4 +5853,120 @@ pub(crate) mod tests {
         drop(memory);
         let _ = std::fs::remove_dir_all(profile);
     }
+
+    // --- the writer's settings and the bounds of the log (#55) ---
+
+    /// What a connection runs with: synchronous, busy_timeout, cache_size, mmap_size,
+    /// wal_autocheckpoint, journal_size_limit.
+    fn writer_settings(conn: &Connection) -> [i64; 6] {
+        let p = |name: &str| conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get::<_, i64>(0)).unwrap();
+        ["synchronous", "busy_timeout", "cache_size", "mmap_size", "wal_autocheckpoint", "journal_size_limit"].map(p)
+    }
+
+    /// Every writer open sets the writer's settings: a new database, an existing one after a
+    /// restart, an older unsharded one, and the writer's reopen after a clear.
+    #[test]
+    fn test_every_writer_open_of_the_email_database_sets_the_writer_settings() {
+        let expected = [
+            1, // NORMAL
+            config::sqlite::PRAGMA_BUSY_TIMEOUT_MS,
+            config::sqlite::PRAGMA_CACHE_SIZE_KIB_NEG,
+            config::sqlite::PRAGMA_MMAP_SIZE_BYTES,
+            config::sqlite::PRAGMA_WAL_AUTOCHECKPOINT_PAGES,
+            config::sqlite::PRAGMA_JOURNAL_SIZE_LIMIT_BYTES,
+        ];
+        let (profile, path, mut conn, mut known_years) = temp_email_db("writer-settings");
+        // A plain open's settings differ, so an open that skips the settings fails here.
+        let defaults = writer_settings(&Connection::open(profile.join("plain.db")).unwrap());
+        for k in [0, 1, 2, 3, 5] {
+            assert_ne!(defaults[k], expected[k], "setting {k} is SQLite's default");
+        }
+        assert_eq!(writer_settings(&conn), expected, "a new database");
+        let row = email_row("acc:/:one", "subject", "body", chrono::Utc::now().timestamp_millis());
+        index_batch(&mut conn, &[row], None, &mut known_years).unwrap();
+        drop(conn);
+
+        let (_, conn, known_years) = open_or_create_db(&profile).unwrap();
+        assert!(!known_years.is_empty(), "the reopen must take the existing-database path");
+        assert_eq!(writer_settings(&conn), expected, "an existing database");
+        drop(conn);
+
+        let conn = open_writer_connection(&path).unwrap();
+        assert_eq!(writer_settings(&conn), expected, "the writer's reopen");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&profile);
+
+        // A database from before the year shards, with its single messages_fts table.
+        let older = std::env::temp_dir().join(format!("tabmail-fts-older-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&older);
+        std::fs::create_dir_all(older.join("tabmail_fts")).unwrap();
+        Connection::open(older.join("tabmail_fts").join("fts.db")).unwrap().execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE VIRTUAL TABLE messages_fts USING fts5(subject, body);
+             CREATE TABLE message_meta (rowid INTEGER PRIMARY KEY, dateMs INTEGER NOT NULL, hasAttachments INTEGER NOT NULL, parsedIcsAttachments TEXT);
+             CREATE TABLE message_ids (msgId TEXT PRIMARY KEY);",
+        ).unwrap();
+        let (_, conn, _) = open_or_create_db(&older).unwrap();
+        let monolithic: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'messages_fts'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(monolithic, 0, "the open must take the migration path");
+        assert_eq!(writer_settings(&conn), expected, "an older database");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&older);
+    }
+
+    /// The most the log may keep on disk between writes, stated here rather than taken from the
+    /// settings, so a change to the settings that lets the log grow fails these tests.
+    const WAL_KEPT_CEILING_BYTES: u64 = 16 * 1024 * 1024;
+    /// The most the log may reach while small batches are written.
+    const WAL_PEAK_CEILING_BYTES: u64 = 24 * 1024 * 1024;
+
+    fn email_wal_size(path: &Path) -> u64 {
+        std::fs::metadata(format!("{}-wal", path.display())).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// `count` rows of about `words` distinct-looking words each, ids from `first`.
+    fn sized_email_rows(first: usize, count: usize, words: usize) -> Vec<Value> {
+        let now = chrono::Utc::now().timestamp_millis();
+        (first..first + count)
+            .map(|i| {
+                let body: String = (0..words).map(|w| format!("w{:x}", (i * 7919 + w * 104_729) % 1_000_003)).collect::<Vec<_>>().join(" ");
+                email_row(&format!("acc:/INBOX:{i}"), &format!("subject {i}"), &body, now - (i as i64 % 3650) * 86_400_000)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_the_email_log_comes_back_down_after_one_large_batch() {
+        let (profile, path, mut conn, mut known_years) = temp_email_db("wal-large-batch");
+        index_batch(&mut conn, &sized_email_rows(0, 1500, 1000), None, &mut known_years).unwrap();
+        assert!(email_wal_size(&path) > 2 * WAL_KEPT_CEILING_BYTES, "the fixture must grow the log: {}", email_wal_size(&path));
+
+        // The next write starts the log again, cut back to its limit.
+        index_batch(&mut conn, &sized_email_rows(1500, 1, 10), None, &mut known_years).unwrap();
+
+        assert!(email_wal_size(&path) <= WAL_KEPT_CEILING_BYTES, "the log kept {} bytes", email_wal_size(&path));
+        assert_eq!(db_count(&conn).unwrap(), 1501);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&profile);
+    }
+
+    #[test]
+    fn test_small_email_batches_keep_the_log_small() {
+        let (profile, path, mut conn, mut known_years) = temp_email_db("wal-small-batches");
+        let (mut largest, mut first) = (0, 0);
+        for _ in 0..100 {
+            index_batch(&mut conn, &sized_email_rows(first, 25, 1000), None, &mut known_years).unwrap();
+            first += 25;
+            largest = largest.max(email_wal_size(&path));
+        }
+        let written = std::fs::metadata(&path).unwrap().len();
+        assert!(written > 2 * WAL_PEAK_CEILING_BYTES, "the fixture must write more than the bound: {written}");
+        assert!(largest <= WAL_PEAK_CEILING_BYTES, "the log reached {largest} bytes");
+        assert_eq!(db_count(&conn).unwrap(), 2500);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&profile);
+    }
+
 }
