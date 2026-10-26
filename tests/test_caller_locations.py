@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import stat
 import subprocess
 import tempfile
@@ -295,6 +296,61 @@ class TestCallerLocations(unittest.TestCase):
         # The default model folder's unreadable files are what it tried to load.
         self.assertFalse(init["result"]["hasEmbeddings"])
         self.assertGreater(len(log.read_bytes()), len(log_before))
+
+    def test_a_corrupt_memory_page_never_stops_init_and_clear_recovers_it(self):
+        """An older memory (no date index) with a corrupt page in memory_meta,
+        whose date index then cannot be built, or in the full-text tables init
+        counts: init still succeeds, email search answers, and memoryClear
+        recovers the memory (#41). Before, every init failed, so email search
+        was down and the memory could not be cleared."""
+        for table in ("memory_meta", "memory_fts_content", "memory_fts_data", "memory_fts_docsize", "memory_fts_idx"):
+            with self.subTest(table=table):
+                self._corrupt_memory_page_session(table)
+
+    def _corrupt_memory_page_session(self, table):
+        db_dir = self.caller / "db" / table
+        args = ["--log-dir", str(self.caller / "logs")]
+        model_dir = self.caller / "models"
+        if not model_dir.exists():
+            model_dir = self._caller_model_dir()
+        init_params = {"profilePath": str(db_dir), "modelDir": str(model_dir)}
+        now_ms = int(time.time() * 1000)
+        email = [{"msgId": "acc:/:quarterly", "subject": "Quarterly", "from": "sender@example.com",
+                  "body": "the quarterly budget", "dateMs": now_ms}]
+        memory = [{"memId": f"turn:{i}", "role": "session", "content": f"exchange {i}",
+                   "sessionId": "persistent_chat", "turnIndex": i, "dateMs": now_ms - i * DAY_MS}
+                  for i in range(200)]
+        init, _, _ = self._session(args, [("init", init_params), ("indexBatch", {"rows": email}),
+                                          ("memoryIndexBatch", {"rows": memory})])
+        memory_db = Path(init["result"]["memoryDbPath"])
+        # A memory written before the date index, then a storage fault in one of its tables.
+        conn = sqlite3.connect(memory_db)
+        conn.execute("DROP INDEX memory_meta_dateMs")
+        root = conn.execute("SELECT rootpage FROM sqlite_master WHERE name = ?", (table,)).fetchone()[0]
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.close()
+        with open(memory_db, "r+b") as f:
+            f.seek((root - 1) * page_size)
+            f.write(b"\xa5" * page_size)
+
+        init, search, cleared, written, read = self._session(args, [
+            ("init", init_params),
+            ("search", {"q": "quarterly", "ignoreDate": True}),
+            ("memoryClear", {}),
+            ("memoryIndexBatch", {"rows": memory[:1]}),
+            ("memoryRead", {"timestampMs": now_ms, "toleranceMs": 0}),
+        ])
+        self.assertTrue(init["result"]["ok"], init)
+        self.assertEqual([r["uniqueId"] for r in search["result"]], ["acc:/:quarterly"], search)
+        self.assertTrue(cleared["result"]["ok"], cleared)
+        self.assertEqual(written["result"]["count"], 1, written)
+        self.assertEqual([e["content"] for e in read["result"]], ["exchange 0"], read)
+        # The cleared memory has its date index again.
+        conn = sqlite3.connect(memory_db)
+        indexed = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name = 'memory_meta_dateMs'").fetchone()[0]
+        conn.close()
+        self.assertEqual(indexed, 1)
 
     def test_memory_trim_brings_the_database_within_the_limit(self):
         db_dir = self.caller / "db" / "voice"

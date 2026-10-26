@@ -60,13 +60,28 @@ index's).
   - `a_memory_whose_creation_stopped_after_its_first_table_opens_and_works`
   - `a_new_memory_whose_date_index_cannot_be_built_fails_init_and_keeps_its_entries` and
     `an_older_memory_whose_date_index_cannot_be_built_fails_open_and_the_next_open_builds_it`
-    (a failed build fails init or the open visibly, keeps every entry, and the next one builds it)
+    (a failed build fails init or the open visibly, keeps every entry, and the next one builds it;
+    *the older-memory test now opens without the index, see the 2026-10-25 amendment below*)
 - **A build that fails stops init**, as any init statement does: the helper exits, and the next
   start tries again. If a `memory_meta` page is already corrupt at the first open of an older
   memory, every start fails until the memory is removed (Thunderbird's Clear chat history runs
   through the helper, so it cannot help; Voice's clear deletes the folder). No TabMail code writes
   such a page, and a corrupt `memory_fts` page already stops init. The owner chose to ship this
   as is on 2026-10-22; tracked in #41.
+  *Amended 2026-10-25 (#41, raised to P2 by the owner): on an existing memory, a build that fails
+  no longer fails the open. It logs a warning, the memory works without the index (reads by date
+  scan, as before it), and a later open builds it. The two init-time counts of `memory_fts`
+  (`open_or_create_memory_db`'s log line, `handle_init`'s `memoryDocs`) no longer fail init either:
+  a failed count is a warning and `memoryDocs` is null (only a Voice test stub reads it). So no
+  corrupt page in `memory_meta` or the `memory_fts` tables stops init: email search keeps working, a
+  read of the corrupt page answers its error, and memoryClear (Clear chat history) recovers the
+  memory, date index included. A NEW memory whose index cannot be built (a full disk at its creation)
+  still fails init, and the next start tries again. Tests:
+  `an_older_memory_whose_date_index_cannot_be_built_opens_and_the_next_open_builds_it` (was
+  `..._fails_open_...`), `an_older_memory_with_a_corrupt_page_opens_and_memory_clear_recovers_it`,
+  and the process test `test_a_corrupt_memory_page_never_stops_init_and_clear_recovers_it` (a corrupt
+  page in `memory_meta`, `memory_fts_content`, `_data`, `_docsize`, `_idx`; each of the three
+  changes is needed: reverting one fails its tables).*
 - **Build cost on an existing memory:** once, on the first open. It reads the dates alone: about
   0.1 s for 300,000 dates on an Apple Silicon Mac.
 - **Ongoing cost:** each memory write and removal also updates the index. The index takes about 15

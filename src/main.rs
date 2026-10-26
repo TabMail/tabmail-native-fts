@@ -1192,16 +1192,25 @@ fn handle_init(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Res
     state.memory_db_path = Some(memory_db_path.clone());
     state.memory_conn = Some(memory_conn);
 
+    // A count that fails (a corrupt memory page) leaves `memoryDocs` null rather than failing init:
+    // a failed init fails every start, taking email search down and leaving Clear chat history,
+    // which runs through the helper, unable to recover the memory (#41).
     let memory_docs = {
         let conn = state
             .memory_conn
             .as_ref()
             .context("memory db connection missing after init")?;
-        memory_db::memory_db_count(conn)?
+        match memory_db::memory_db_count(conn) {
+            Ok(count) => Some(count),
+            Err(e) => {
+                log::warn!("Memory entries could not be counted: {e}");
+                None
+            }
+        }
     };
 
     log::info!(
-        "Both databases initialized: {} email docs, {} memory entries",
+        "Both databases initialized: {} email docs, {:?} memory entries",
         docs,
         memory_docs
     );

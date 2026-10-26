@@ -196,16 +196,25 @@ pub fn open_or_create_memory_db(fts_dir: &Path) -> anyhow::Result<(PathBuf, Conn
         log::info!("Using existing memory database schema");
         // Migrate: add vector tables if missing (pre-v0.7.0 databases)
         ensure_memory_vector_tables(&conn)?;
-        // A memory written before the date index gets it here, built once from the dates alone.
-        conn.execute_batch(MEMORY_META_DATE_INDEX)?;
+        // A memory written before the date index gets it here, built once from the dates alone. A
+        // build that fails (a corrupt memory_meta page, a full disk) leaves the memory without it:
+        // reads by date scan, as before the index, and a later open builds it. Failing the open
+        // would fail init on every start, taking email search down and leaving Clear chat history,
+        // which runs through the helper, unable to recover the memory (#41).
+        if let Err(e) = conn.execute_batch(MEMORY_META_DATE_INDEX) {
+            log::warn!("Memory date index not built, reads by date scan until a later open builds it: {e}");
+        }
         // In-place tokenizer migration (ADR-024) — same lockstep change as the
         // email shards; without this, memory search would tokenize differently
         // from email search on pre-existing profiles.
         rebuild_memory_fts_if_stale_tokenizer(&mut conn)?;
     }
 
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM memory_fts", [], |r| r.get(0))?;
-    log::info!("Memory database initialized: {} entries indexed", count);
+    // Only logged: a count that fails (a corrupt memory page) must not fail the open, and so init (#41).
+    match memory_db_count(&conn) {
+        Ok(count) => log::info!("Memory database initialized: {} entries indexed", count),
+        Err(e) => log::warn!("Memory database initialized; its entries could not be counted: {e}"),
+    }
 
     Ok((db_path, conn))
 }
@@ -2671,10 +2680,10 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// When an older memory's index cannot be built on open, the open fails visibly and keeps
-    /// every entry, and the next open builds it.
+    /// When an older memory's index cannot be built on open, the open still succeeds and keeps every
+    /// entry, reads by date answer without it, and the next open that can builds it (#41).
     #[test]
-    fn an_older_memory_whose_date_index_cannot_be_built_fails_open_and_the_next_open_builds_it() {
+    fn an_older_memory_whose_date_index_cannot_be_built_opens_and_the_next_open_builds_it() {
         let now = chrono::Utc::now().timestamp_millis();
         let n = 20_000;
         let (dir, mut conn) = temp_memory_db("date-index-open-fails");
@@ -2684,8 +2693,10 @@ pub(crate) mod tests {
         drop(conn);
         let db = dir.join("memory.db");
         let (before_read, before_listed) = cold_reads_by_date(&db, now, n);
-        let error = open_or_create_memory_db(&dir).err().expect("open without the date index").to_string();
-        assert!(error.contains("memory_meta_dateMs"), "{error}");
+        let (_path, conn) = open_or_create_memory_db(&dir).unwrap();
+        assert_eq!(memory_db_count(&conn).unwrap(), n);
+        assert_eq!(memory_read_by_timestamp(&conn, now + n / 2, 0).unwrap()[0]["content"], format!("exchange {}", n / 2));
+        drop(conn);
         Connection::open(&db).unwrap().execute_batch("DROP TABLE memory_meta_dateMs;").unwrap();
         let (_path, conn) = open_or_create_memory_db(&dir).unwrap();
         assert_eq!(memory_db_count(&conn).unwrap(), n);
@@ -2694,6 +2705,44 @@ pub(crate) mod tests {
         let (read, listed) = cold_reads_by_date(&db, now, n);
         assert!(read * 5 < before_read, "a one-entry read: {before_read} pages before, {read} after");
         assert!(listed * 5 < before_listed, "a listing page: {before_listed} pages before, {listed} after");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An older memory with a corrupt memory_meta page opens: the date index cannot be built, which
+    /// used to fail every open and so every init (#41). Reads of the corrupt page answer an error,
+    /// and memoryClear recovers the memory, date index included.
+    #[test]
+    fn an_older_memory_with_a_corrupt_page_opens_and_memory_clear_recovers_it() {
+        use std::io::{Seek, SeekFrom, Write};
+        let now = chrono::Utc::now().timestamp_millis();
+        let (dir, mut conn) = temp_memory_db("corrupt-meta-page");
+        short_entries(&mut conn, now, 200);
+        conn.execute_batch("DROP INDEX memory_meta_dateMs;").unwrap();
+        drop(conn);
+        let db = dir.join("memory.db");
+        let (root, page_size): (i64, i64) = {
+            let conn = Connection::open(&db).unwrap();
+            let root = conn.query_row("SELECT rootpage FROM sqlite_master WHERE name = 'memory_meta'", [], |r| r.get(0)).unwrap();
+            let page_size = conn.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap();
+            (root, page_size)
+        };
+        assert!(!dir.join("memory.db-wal").exists() || std::fs::metadata(dir.join("memory.db-wal")).unwrap().len() == 0);
+        let mut file = std::fs::OpenOptions::new().write(true).open(&db).unwrap();
+        file.seek(SeekFrom::Start(((root - 1) * page_size) as u64)).unwrap();
+        file.write_all(&vec![0xA5u8; page_size as usize]).unwrap();
+        drop(file);
+
+        let (path, conn) = open_or_create_memory_db(&dir).unwrap();
+        let error = memory_read_by_timestamp(&conn, now + 100, 0).expect_err("a read of the corrupt page").to_string();
+        assert!(error.contains("malformed"), "{error}");
+        let (conn, deleted) = memory_clear_rebuild_standalone(&path, conn).unwrap();
+        deleted.unwrap();
+        let mut conn = conn;
+        short_entries(&mut conn, now, 3);
+        assert_eq!(memory_read_by_timestamp(&conn, now + 1, 0).unwrap()[0]["content"], "exchange 1");
+        let indexed: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'memory_meta_dateMs'", [], |r| r.get(0)).unwrap();
+        assert_eq!(indexed, 1);
+        drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }
 
