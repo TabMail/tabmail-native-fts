@@ -430,6 +430,74 @@ class TestCallerLocations(unittest.TestCase):
         self.assertIn("result", newest, newest)
         self.assertIn("note 399", str(newest["result"]))
 
+    def _idle_helper_gives_trimmed_space_back(self, older):
+        db_dir = self.caller / "db" / "voice"
+        memory_db = db_dir / "tabmail_fts" / "memory.db"
+        if older:
+            # A memory from before #11: auto_vacuum NONE, fixed by its first table.
+            memory_db.parent.mkdir(parents=True)
+            conn = sqlite3.connect(memory_db)
+            conn.executescript("PRAGMA auto_vacuum = NONE; CREATE TABLE fixes_the_mode (a); DROP TABLE fixes_the_mode;")
+            conn.close()
+        init_params = {"profilePath": str(db_dir), "modelDir": str(self._caller_model_dir())}
+        # Few rows, as each costs an embedding, each long, so the text outweighs the vectors
+        # (stored in chunks that free only when empty).
+        rows = self._rows(0, 300, 1000)
+
+        def files_size():
+            return sum(f.stat().st_size for f in (memory_db, Path(f"{memory_db}-wal")) if f.exists())
+
+        proc = self._spawn(["--log-dir", str(self.caller / "logs")])
+        watchdog = threading.Timer(SESSION_DEADLINE_S, proc.kill)
+        watchdog.start()
+        try:
+            responses = []
+            for i, (method, params) in enumerate(
+                [("init", init_params), ("memoryIndexBatch", {"rows": rows}), ("memoryStats", {})]
+            ):
+                _send_message(proc, {"id": f"r{i}", "method": method, "params": params})
+                responses.append(_read_message(proc))
+            self.assertIn("result", responses[-1], responses)
+            limit = responses[-1]["result"]["usedBytes"] // 2
+            _send_message(proc, {"id": "trim", "method": "memoryTrim", "params": {"maxBytes": limit}})
+            trim = _read_message(proc)
+            self.assertTrue(trim["result"]["withinLimit"], trim)
+            peak = files_size()
+            self.assertGreater(peak, limit, "the trim must leave the files over the limit")
+
+            # Nothing more is asked: the idle helper gives the freed pages back on its own.
+            deadline = time.monotonic() + SESSION_DEADLINE_S / 2
+            while files_size() > limit and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertLessEqual(files_size(), limit, f"still {files_size()} bytes of {peak} with a limit of {limit}")
+
+            _send_message(proc, {"id": "stats", "method": "memoryStats", "params": {}})
+            stats = _read_message(proc)
+            _send_message(
+                proc,
+                {"id": "read", "method": "memoryRead", "params": {"timestampMs": rows[-1]["dateMs"], "toleranceMs": 60_000}},
+            )
+            newest = _read_message(proc)
+        finally:
+            proc.stdin.close()
+            proc.wait(timeout=SESSION_DEADLINE_S)
+            watchdog.cancel()
+            proc.stdout.close()
+        self.assertEqual(stats["result"]["docs"], len(rows) - trim["result"]["trimmed"])
+        self.assertIn("note 299", str(newest["result"]))
+        conn = sqlite3.connect(memory_db)
+        try:
+            self.assertEqual(conn.execute("PRAGMA auto_vacuum").fetchone()[0], 2)
+            self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        finally:
+            conn.close()
+
+    def test_the_idle_helper_gives_a_trimmed_memory_back_to_the_disk(self):
+        self._idle_helper_gives_trimmed_space_back(older=False)
+
+    def test_the_idle_helper_converts_an_older_memory_and_gives_its_space_back(self):
+        self._idle_helper_gives_trimmed_space_back(older=True)
+
     def _rows(self, start, count, words):
         return [
             {

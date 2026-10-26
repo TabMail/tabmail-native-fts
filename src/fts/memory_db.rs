@@ -25,11 +25,11 @@ use crate::config;
 /// first open of a memory written before it.
 const MEMORY_META_DATE_INDEX: &str = "CREATE INDEX IF NOT EXISTS memory_meta_dateMs ON memory_meta(dateMs);";
 
-/// Initialize the memory database schema
-pub fn init_memory_database(conn: &Connection) -> anyhow::Result<()> {
-    log::info!("Initializing memory database schema");
-
-    // Apply same PRAGMA settings as main FTS database
+/// The writer connection's settings, set at every open: all but `journal_mode` last only as long
+/// as the connection, so an existing memory needs them as much as a new one. The write-ahead log
+/// is checkpointed every `WAL_AUTOCHECKPOINT_PAGES` and cut back to `JOURNAL_SIZE_LIMIT_BYTES`
+/// when it restarts; without the limit it keeps its largest size (#11).
+fn set_memory_writer_pragmas(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(&format!(
         "\
 PRAGMA journal_mode = WAL;\n\
@@ -39,12 +39,22 @@ PRAGMA cache_size = {cache_size};\n\
 PRAGMA mmap_size = {mmap_size};\n\
 PRAGMA busy_timeout = {busy_timeout};\n\
 PRAGMA wal_autocheckpoint = {wal_autocheckpoint};\n\
+PRAGMA journal_size_limit = {journal_size_limit};\n\
 ",
         cache_size = config::sqlite::PRAGMA_CACHE_SIZE_KIB_NEG,
         mmap_size = config::sqlite::PRAGMA_MMAP_SIZE_BYTES,
         busy_timeout = config::sqlite::PRAGMA_BUSY_TIMEOUT_MS,
-        wal_autocheckpoint = config::sqlite::PRAGMA_WAL_AUTOCHECKPOINT_PAGES,
+        wal_autocheckpoint = config::memory::WAL_AUTOCHECKPOINT_PAGES,
+        journal_size_limit = config::memory::JOURNAL_SIZE_LIMIT_BYTES,
     ))?;
+    Ok(())
+}
+
+/// Initialize the memory database schema
+pub fn init_memory_database(conn: &Connection) -> anyhow::Result<()> {
+    log::info!("Initializing memory database schema");
+
+    set_memory_writer_pragmas(conn)?;
 
     // Memory schema: simpler than email (no cc, bcc, attachments, etc.)
     // Fields:
@@ -166,6 +176,16 @@ fn rebuild_memory_fts_if_stale_tokenizer(conn: &mut Connection) -> anyhow::Resul
     Ok(())
 }
 
+/// Opens the memory database's file for the writer. A new file is first set to give freed pages
+/// back to the disk a step at a time (`compact_memory_step`, #11): that holds only before its first
+/// table, and the FTS5 probe creates one. On an existing file it changes nothing (only a VACUUM can).
+fn open_memory_file(db_path: &Path) -> anyhow::Result<Connection> {
+    let conn = Connection::open(db_path).with_context(|| format!("open memory db {}", db_path.display()))?;
+    conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")?;
+    super::db::ensure_fts5_available(&conn)?;
+    Ok(conn)
+}
+
 /// The memory database's file in `fts_dir`.
 pub fn memory_db_path(fts_dir: &Path) -> PathBuf {
     fts_dir.join("memory.db")
@@ -177,11 +197,7 @@ pub fn open_or_create_memory_db(fts_dir: &Path) -> anyhow::Result<(PathBuf, Conn
     log::info!("Initializing memory database");
     log::info!("  Memory DB Path: {}", db_path.display());
 
-    let mut conn = Connection::open(&db_path)
-        .with_context(|| format!("open memory db {}", db_path.display()))?;
-    
-    // Verify FTS5 is available
-    super::db::ensure_fts5_available(&conn)?;
+    let mut conn = open_memory_file(&db_path)?;
 
     // Check if schema exists. memory_meta is created after memory_fts, so a memory whose creation
     // stopped between them (a full disk, a crash) is completed by init's IF NOT EXISTS statements
@@ -199,6 +215,7 @@ pub fn open_or_create_memory_db(fts_dir: &Path) -> anyhow::Result<(PathBuf, Conn
         init_memory_database(&conn)?;
     } else {
         log::info!("Using existing memory database schema");
+        set_memory_writer_pragmas(&conn)?;
         // Migrate: add vector tables if missing (pre-v0.7.0 databases)
         ensure_memory_vector_tables(&conn)?;
         // A memory written before the date index gets it here, built once from the dates alone.
@@ -885,6 +902,57 @@ pub fn memory_used_bytes(conn: &Connection) -> anyhow::Result<i64> {
     Ok((page_count - freelist_count) * page_size)
 }
 
+/// One step of giving the memory's free pages back to the disk (#11), which the writer runs while
+/// no request waits. It starts once at least `COMPACT_MIN_FREE_PERCENT` of the file is free (fewer
+/// are left to later writes, which reuse them) and, once `started`, goes on until none is. Answers
+/// whether it did work: the writer passes that back as `started` and asks again.
+///
+/// - A memory created with `auto_vacuum = INCREMENTAL` (every memory since #11, and every one
+///   memoryClear rebuilt) frees `COMPACT_STEP_PAGES` per step.
+/// - An older one (`auto_vacuum = NONE`) cannot free pages until one VACUUM converts it. That
+///   VACUUM copies what is kept (about 14 s per GB), the copy on disk rather than in RAM. It keeps
+///   every rowid here: the bundled SQLite's VACUUM keeps the rowids of any table with an index
+///   (`xferOptimization`: `OP_NewRowid` only for a table with neither an INTEGER PRIMARY KEY nor an
+///   index), and each table here without an INTEGER PRIMARY KEY has its PRIMARY KEY's:
+///   `memory_ids`, whose rowid joins `memory_fts`, `memory_meta` and `memory_vec`, and
+///   sqlite-vec's vector chunks, which it reads by rowid. SQLite documents only that VACUUM "may
+///   change" such rowids, so a test pins it on the bundled version.
+///
+/// Once no page is free, the log is checkpointed and cut to nothing, so the files shrink now
+/// rather than at the next write.
+pub fn compact_memory_step(conn: &Connection, started: bool) -> anyhow::Result<bool> {
+    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+    let free: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+    if free == 0 || (!started && free * 100 < page_count * config::memory::COMPACT_MIN_FREE_PERCENT) {
+        return Ok(false);
+    }
+    let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+    match mode {
+        2 => {
+            // One row per page freed: stepping it only once (as `execute_batch` does) frees one page.
+            let mut stmt = conn.prepare(&format!("PRAGMA incremental_vacuum({})", config::memory::COMPACT_STEP_PAGES))?;
+            let mut rows = stmt.query([])?;
+            while rows.next()?.is_some() {}
+        }
+        0 => {
+            log::info!("Converting the memory database once, so freed space can go back to the disk");
+            conn.execute_batch("PRAGMA temp_store = FILE; PRAGMA auto_vacuum = INCREMENTAL;")?;
+            let vacuumed = conn.execute_batch("VACUUM;");
+            conn.execute_batch("PRAGMA temp_store = MEMORY;")?;
+            vacuumed?;
+        }
+        _ => return Ok(false),
+    }
+    let left: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+    if left == 0 {
+        // Waits for a read in progress (the busy timeout); still busy, the log is cut when it restarts.
+        let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+        log::info!("Memory database compacted: {} bytes used{}", memory_used_bytes(conn)?, if busy != 0 { ", log left until its next restart" } else { "" });
+    }
+    // A step that freed nothing would only be asked again.
+    Ok(left < free)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryTrimResult {
     pub removed: i64,
@@ -1122,8 +1190,7 @@ pub fn memory_clear_rebuild_standalone(db_path: &Path, conn: Connection) -> anyh
 /// not there: what memoryClear opens after deleting the files, and what the writer opens again
 /// when a memoryClear failed before it could.
 pub fn open_memory_writer_connection(db_path: &Path) -> anyhow::Result<Connection> {
-    let conn = Connection::open(db_path)?;
-    super::db::ensure_fts5_available(&conn)?;
+    let conn = open_memory_file(db_path)?;
     init_memory_database(&conn)?;
     Ok(conn)
 }
@@ -1235,9 +1302,8 @@ fn truncate_for_log(s: &str) -> String {
 pub(crate) mod tests {
     use super::*;
 
-    /// A fresh on-disk memory database (WAL, like the helper's) in its own temp folder.
-    fn temp_memory_db(name: &str) -> (PathBuf, Connection) {
-        // As main() does before opening any connection; registering twice is a no-op.
+    /// Registers sqlite-vec, as main() does before opening any connection; twice is a no-op.
+    fn register_vec() {
         type ExtensionInit = unsafe extern "C" fn(
             *mut rusqlite::ffi::sqlite3,
             *mut *mut std::os::raw::c_char,
@@ -1248,6 +1314,11 @@ pub(crate) mod tests {
                 sqlite_vec::sqlite3_vec_init as *const (),
             )));
         }
+    }
+
+    /// A fresh on-disk memory database (WAL, like the helper's) in its own temp folder.
+    fn temp_memory_db(name: &str) -> (PathBuf, Connection) {
+        register_vec();
         let dir = std::env::temp_dir().join(format!("tabmail-memory-trim-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1981,6 +2052,196 @@ pub(crate) mod tests {
             .collect::<Result<_, _>>().unwrap();
         let expected: Vec<String> = (trim.removed..40).map(|i| format!("turn:{i}")).collect();
         assert_eq!(kept, expected);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn pragma(conn: &Connection, name: &str) -> i64 {
+        conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0)).unwrap()
+    }
+
+    /// The memory's files on disk: the database and its log.
+    fn files_size(dir: &Path) -> u64 {
+        ["memory.db", "memory.db-wal"].iter().map(|f| std::fs::metadata(dir.join(f)).map(|m| m.len()).unwrap_or(0)).sum()
+    }
+
+    /// Compacts as the idle writer does, a step at a time, and answers how many steps did work.
+    fn compact_until_done(conn: &Connection) -> usize {
+        let mut steps = 0;
+        while compact_memory_step(conn, steps > 0).unwrap() {
+            steps += 1;
+            assert!(steps < 1000, "compaction must finish");
+        }
+        steps
+    }
+
+    /// Every ordinary table's rows, each with its real rowid (`_rowid_`, which a column named
+    /// rowid, as in sqlite-vec's vector chunks, does not hide).
+    fn every_row(conn: &Connection) -> Vec<(String, Vec<String>)> {
+        let tables: Vec<(String, String)> = conn
+            .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' AND sql NOT LIKE 'CREATE VIRTUAL%' ORDER BY name").unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+            .collect::<Result<_, _>>().unwrap();
+        tables.into_iter().map(|(table, sql)| {
+            let select = if sql.contains("WITHOUT ROWID") {
+                format!(r#"SELECT * FROM "{table}""#)
+            } else {
+                format!(r#"SELECT _rowid_, * FROM "{table}" ORDER BY _rowid_"#)
+            };
+            let mut stmt = conn.prepare(&select).unwrap();
+            let columns = stmt.column_count();
+            let rows = stmt
+                .query_map([], |r| Ok((0..columns).map(|i| format!("{:?}", r.get_ref(i).unwrap())).collect::<Vec<_>>().join("|"))).unwrap()
+                .collect::<Result<_, _>>().unwrap();
+            (table, rows)
+        }).collect()
+    }
+
+    /// What a search finds, by meaning and by word, each match named by its memId.
+    fn found(conn: &Connection, query: &[f32]) -> (Vec<(String, String)>, Vec<String>) {
+        let blob = crate::fts::db::f32_vec_to_blob(query);
+        let by_meaning = conn
+            .prepare("SELECT i.memId, v.distance FROM memory_vec v JOIN memory_ids i ON i.rowid = v.rowid WHERE v.embedding MATCH ?1 AND k = 25 ORDER BY v.distance").unwrap()
+            .query_map(params![blob], |r| Ok((r.get(0)?, format!("{:.6}", r.get::<_, f64>(1)?)))).unwrap()
+            .collect::<Result<_, _>>().unwrap();
+        let by_word = conn
+            .prepare("SELECT i.memId FROM memory_fts f JOIN memory_ids i ON i.rowid = f.rowid WHERE memory_fts MATCH 'question' ORDER BY i.memId").unwrap()
+            .query_map([], |r| r.get(0)).unwrap()
+            .collect::<Result<_, _>>().unwrap();
+        (by_meaning, by_word)
+    }
+
+    /// `n` exchanges, each with its own vector, then every third removed so the rowids have gaps.
+    fn fill_distinct_with_gaps(conn: &mut Connection, n: usize) {
+        let filler = "planning notes for the quarterly review meeting ".repeat(20);
+        let rows: Vec<Value> = (0..n)
+            .map(|i| serde_json::json!({
+                "memId": format!("turn:{i}"), "role": "session",
+                "content": format!("[USER]: question {i}\n\n[AGENT]: {filler}"),
+                "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": i as i64,
+            }))
+            .collect();
+        memory_index_batch(conn, &rows, None).unwrap();
+        let ids: Vec<i64> = conn
+            .prepare("SELECT rowid FROM memory_ids ORDER BY rowid").unwrap()
+            .query_map([], |r| r.get(0)).unwrap()
+            .collect::<Result<_, _>>().unwrap();
+        for (i, id) in ids.into_iter().enumerate() {
+            let vector: Vec<f32> = (0..config::embedding::EMBEDDING_DIMS).map(|j| ((i * 7 + j * 3) % 29) as f32 + 1.0).collect();
+            conn.execute("INSERT INTO memory_vec (rowid, embedding) VALUES (?1, ?2)", params![id, crate::fts::db::f32_vec_to_blob(&vector)]).unwrap();
+        }
+        let every_third: Vec<Value> = (0..n).step_by(3).map(|i| serde_json::json!(format!("turn:{i}"))).collect();
+        memory_remove_batch(conn, &every_third).unwrap();
+    }
+
+    #[test]
+    fn test_a_new_memory_can_give_space_back_and_every_open_sets_the_log_bounds() {
+        let (dir, conn) = temp_memory_db("pragmas");
+        assert_eq!(pragma(&conn, "auto_vacuum"), 2, "a new memory frees pages a step at a time");
+        drop(conn);
+        // An existing memory's open, which once kept SQLite's defaults.
+        let (_path, conn) = open_or_create_memory_db(&dir).unwrap();
+        assert_eq!(pragma(&conn, "journal_size_limit"), config::memory::JOURNAL_SIZE_LIMIT_BYTES);
+        assert_eq!(pragma(&conn, "wal_autocheckpoint"), config::memory::WAL_AUTOCHECKPOINT_PAGES);
+        assert_eq!(pragma(&conn, "busy_timeout"), config::sqlite::PRAGMA_BUSY_TIMEOUT_MS as i64);
+        assert_eq!(pragma(&conn, "synchronous"), 1, "NORMAL");
+        assert_eq!(pragma(&conn, "temp_store"), 2, "MEMORY");
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_idle_compaction_gives_a_trimmed_memory_back_to_the_disk_in_bounded_steps() {
+        let (dir, mut conn) = temp_memory_db("compact");
+        fill(&mut conn, 6000, |i| i as i64);
+        let limit = memory_used_bytes(&conn).unwrap() / 2;
+        assert!(memory_trim_to_bytes(&mut conn, limit, budget()).unwrap().within_limit);
+        let kept = rowids(&conn, "memory_meta");
+        let free = pragma(&conn, "freelist_count");
+        assert!(free * 100 >= pragma(&conn, "page_count") * config::memory::COMPACT_MIN_FREE_PERCENT, "the trim must leave space to give back");
+        assert!(free > config::memory::COMPACT_STEP_PAGES, "{free} free pages: too few for two steps");
+        let peak = files_size(&dir);
+        assert_eq!(pragma(&conn, "auto_vacuum"), 2);
+
+        // One step frees its share of pages, no more (the request waiting is served after it).
+        assert!(compact_memory_step(&conn, false).unwrap());
+        assert_eq!(pragma(&conn, "freelist_count"), free - config::memory::COMPACT_STEP_PAGES);
+        let mut steps = 1;
+        while compact_memory_step(&conn, true).unwrap() {
+            steps += 1;
+            assert!(steps < 1000, "compaction must finish");
+        }
+
+        assert_eq!(steps as i64, (free + config::memory::COMPACT_STEP_PAGES - 1) / config::memory::COMPACT_STEP_PAGES);
+        assert_eq!(pragma(&conn, "freelist_count"), 0);
+        let page_size = pragma(&conn, "page_size") as u64;
+        let db_len = std::fs::metadata(dir.join("memory.db")).unwrap().len();
+        assert_eq!(db_len, pragma(&conn, "page_count") as u64 * page_size, "the file holds only the pages in use");
+        assert_eq!(std::fs::metadata(dir.join("memory.db-wal")).map(|m| m.len()).unwrap_or(0), 0, "the log is cut");
+        assert!(files_size(&dir) <= peak - free as u64 * page_size, "freed pages go back: {} of {peak}", files_size(&dir));
+        assert_tables_hold(&conn, &kept);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_idle_compaction_leaves_a_few_free_pages_for_the_next_writes() {
+        let (dir, mut conn) = temp_memory_db("compact-few");
+        fill(&mut conn, 3000, |i| i as i64);
+        let few: Vec<Value> = (0..30).map(|i| serde_json::json!(format!("turn:{i}"))).collect();
+        memory_remove_batch(&mut conn, &few).unwrap();
+        let (free, pages) = (pragma(&conn, "freelist_count"), pragma(&conn, "page_count"));
+        assert!(free > 0 && free * 100 < pages * config::memory::COMPACT_MIN_FREE_PERCENT, "{free} free of {pages}");
+
+        assert!(!compact_memory_step(&conn, false).unwrap());
+
+        assert_eq!((pragma(&conn, "freelist_count"), pragma(&conn, "page_count")), (free, pages));
+        // Started by a larger share, it goes on until none is free.
+        assert!(compact_memory_step(&conn, true).unwrap());
+        assert_eq!(pragma(&conn, "freelist_count"), 0);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_idle_compaction_converts_an_older_memory_once_keeping_every_row_and_rowid() {
+        let dir = std::env::temp_dir().join(format!("tabmail-memory-trim-convert-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A memory from before #11: auto_vacuum NONE, fixed by its first table.
+        let older = Connection::open(memory_db_path(&dir)).unwrap();
+        older.execute_batch("PRAGMA auto_vacuum = NONE; CREATE TABLE fixes_the_mode (a); DROP TABLE fixes_the_mode;").unwrap();
+        drop(older);
+        register_vec();
+        let (_path, mut conn) = open_or_create_memory_db(&dir).unwrap();
+        assert_eq!(pragma(&conn, "auto_vacuum"), 0);
+        fill_distinct_with_gaps(&mut conn, 3000);
+        let limit = memory_used_bytes(&conn).unwrap() / 2;
+        assert!(memory_trim_to_bytes(&mut conn, limit, budget()).unwrap().within_limit);
+        let free = pragma(&conn, "freelist_count");
+        assert!(free * 100 >= pragma(&conn, "page_count") * config::memory::COMPACT_MIN_FREE_PERCENT);
+        let rows = every_row(&conn);
+        let query: Vec<f32> = (0..config::embedding::EMBEDDING_DIMS).map(|j| ((j * 5) % 17) as f32 + 1.0).collect();
+        let results = found(&conn, &query);
+        assert!(!results.0.is_empty() && !results.1.is_empty());
+        let peak = files_size(&dir);
+
+        assert_eq!(compact_until_done(&conn), 1, "one VACUUM converts it");
+
+        assert_eq!(pragma(&conn, "auto_vacuum"), 2, "later trims free a step at a time");
+        assert_eq!(pragma(&conn, "temp_store"), 2, "MEMORY again after the VACUUM");
+        assert_eq!(pragma(&conn, "freelist_count"), 0);
+        assert!(files_size(&dir) <= peak - free as u64 * pragma(&conn, "page_size") as u64);
+        // Every row of every table, the vector chunks too, with the rowids that join them.
+        assert!(every_row(&conn) == rows, "VACUUM changed a row or a rowid");
+        assert_eq!(found(&conn, &query), results);
+        drop(conn);
+        let (_path, conn) = open_or_create_memory_db(&dir).unwrap();
+        assert!(every_row(&conn) == rows);
+        assert_eq!(found(&conn, &query), results);
+        // A later start has nothing to give back (the FTS5 probe's dropped table leaves a few pages).
+        assert!(!compact_memory_step(&conn, false).unwrap());
+        assert_eq!(pragma(&conn, "auto_vacuum"), 2);
         drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
     }

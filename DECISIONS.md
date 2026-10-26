@@ -192,6 +192,10 @@ archives of any size.
 
 - **[Full ADR](Companion/Decisions/Active/adr-nf-020-every-keyword-match-is-a-hybrid-result.md)** — #51: a word in most rows (FTS5 IDF clamp, ~0 keyword score) kept only the rows the vector leg lifted over `MIN_SCORE` (smoke test: `meeting` 1 of 8, email + memory). Now every keyword candidate is a result (`HybridCandidate.keyword_match`); `MIN_SCORE` gates vector-only candidates; ranking unchanged. ADR-NF-014's empty-merge fallback DELETED. Keyword pools tie-break `rank ASC, dateMs DESC`. Owner invariant: hybrid never returns fewer than keyword-only. Rejected parallel hybrid+keyword larger-set, max-relative threshold. iOS paired issue.
 
+## ADR-NF-021: The Idle Writer Gives Trimmed Memory Space Back to the Disk
+
+- **[Full ADR](Companion/Decisions/Active/adr-nf-021-the-idle-writer-gives-trimmed-memory-space-back.md)** — #11: `memory.db` kept its largest size after a trim (`auto_vacuum` NONE) and `memory.db-wal` could reach ~800 MB (email's 200,000-page `wal_autocheckpoint`, no `journal_size_limit`); writer pragmas were set only on creation. Now every writer open sets them (`set_memory_writer_pragmas`; memory WAL 1000 pages + 12 MiB `journal_size_limit`), a new memory is `auto_vacuum = INCREMENTAL` (set before the FTS5 probe's table, `open_memory_file`), and the idle writer (`compact_memory_step`, `next_write_request` hook) starts at 10% free, frees 2048 pages per step until none, then `wal_checkpoint(TRUNCATE)`. An older NONE memory converts once by idle `VACUUM` (`temp_store = FILE`); rowids kept (bundled 3.46 `xferOptimization`, pinned by test). No VACUUM in `memoryTrim`. Amends ADR-NF-008.
+
 ---
 
 ## Template for New Decisions

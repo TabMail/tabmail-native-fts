@@ -42,8 +42,9 @@ The helper must not know who runs it: no client modes, no client names.
      Revisions).
    - `memoryStats` gains `usedBytes`.
    - **Used size** = `(page_count - freelist_count) * page_size`. Freed pages stay in the file and
-     are reused, so the file length is not the measure: the file keeps its largest size, and
-     memory stays within the limit inside it.
+     are reused, so the file length is not the measure: the file kept its largest size, and
+     memory stays within the limit inside it. (Since ADR-NF-021 the idle writer gives freed pages
+     back after a trim.)
    - A non-positive or non-integer `maxBytes` is an error, and nothing is written.
 
 4. **A caller that names its model folder never runs the orphan clean-up** (ADR-NF-007). The
@@ -125,6 +126,10 @@ The helper must not know who runs it: no client modes, no client names.
   write-ahead log (`memory.db-wal`) can grow to `PRAGMA_WAL_AUTOCHECKPOINT_PAGES` pages (about
   800 MB at 4 KB pages) during heavy writing and keeps that size after a checkpoint, and freed
   pages stay in the file. At the 100 MB choice the files can be several times the limit.
+  *Amended 2026-10-26 (ADR-NF-021, #11):* the memory's log now checkpoints at 1000 pages and is cut
+  to 12 MiB at each reset (`journal_size_limit`, set on every writer open), and the idle writer
+  gives freed pages back to the disk, so the files come down to about the pages in use shortly
+  after a trim.
 - **A bundling caller sends no update requests.** `hello` and `updateCheck`/`updateRequest` run
   the self-update mechanics, which install into Thunderbird's user-local helper folder when the
   helper's own folder can't be written. A client that ships its own copy (Voice) never sends
@@ -137,7 +142,9 @@ The helper must not know who runs it: no client modes, no client names.
   `VACUUM` copies everything kept and cannot be bounded by the trim's budget (about 31 s for
   2.2 GB measured, with the copy in RAM under `temp_store = MEMORY`), and it relied on `VACUUM`
   keeping `memory_ids` rowids, which SQLite does not document for a table without an INTEGER
-  PRIMARY KEY.
+  PRIMARY KEY. (ADR-NF-021, 2026-10-26: freed pages now go back at idle instead, by bounded
+  `incremental_vacuum` steps, with one idle `VACUUM` to convert an older memory; the rowids are kept
+  by the bundled SQLite and pinned by a test.)
 - The budget was checked only between delete transactions of up to 5,000 rows
   (`TRIM_DELETE_BATCH_MAX_ROWS`); one transaction of long rows took about 22 s, and 6,000 rows of
   360 KB took 219 s. Now asked after every row; the row cap is gone.
