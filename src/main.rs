@@ -1952,6 +1952,37 @@ mod tests {
     }
 
     #[test]
+    fn test_idle_memory_compaction_once_begun_frees_every_page() {
+        let dir = std::env::temp_dir().join(format!("tabmail-compact-begun-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("memory.db")).unwrap();
+        conn.execute_batch(
+            "PRAGMA auto_vacuum = INCREMENTAL; CREATE TABLE t (a);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20000) INSERT INTO t SELECT zeroblob(3000) FROM n;
+             DELETE FROM t WHERE rowid <= 2600;",
+        )
+        .unwrap();
+        let pragma = |name: &str| -> i64 { conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0)).unwrap() };
+        let (free, pages, step) = (pragma("freelist_count"), pragma("page_count"), config::memory::COMPACT_STEP_PAGES);
+        // Due to start, and after one step fewer than the starting share are free but some are.
+        assert!(free * 100 >= pages * config::memory::COMPACT_MIN_FREE_PERCENT, "{free} of {pages}");
+        assert!(free > step && (free - step) * 100 < (pages - step) * config::memory::COMPACT_MIN_FREE_PERCENT, "{free} of {pages}");
+
+        let (mut compacting, mut stopped) = (false, false);
+        let mut steps = 0;
+        while compact_memory_when_idle(&conn, &mut compacting, &mut stopped) {
+            steps += 1;
+            assert!(steps < 100, "compaction must finish");
+        }
+
+        assert_eq!(pragma("freelist_count"), 0, "a compaction begun goes on until no page is free");
+        assert!(!compacting && !stopped);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn test_writer_serves_a_waiting_request_after_at_most_one_shard() {
         let (tx, rx) = mpsc::channel();
         let mut conversions = 0;

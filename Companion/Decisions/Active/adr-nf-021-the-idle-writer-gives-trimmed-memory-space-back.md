@@ -35,7 +35,8 @@ Bounded work in SQLite itself is `auto_vacuum = INCREMENTAL` with `PRAGMA increm
    request waits for at most one step. When no page is free, `wal_checkpoint(TRUNCATE)` cuts the log
    so the files shrink now. An error stops compaction until the next start (logged).
 4. **An older memory (`auto_vacuum = NONE`) is converted once**, at the first idle moment with at
-   least 10% of it free: `auto_vacuum = INCREMENTAL; VACUUM`, with `temp_store = FILE` during the
+   least 10% of it free: a `VACUUM`, which writes the INCREMENTAL mode `open_memory_file` set on the
+   connection (`PRAGMA auto_vacuum` records it for the next VACUUM), with `temp_store = FILE` during the
    VACUUM so the copy goes to disk, not RAM (restored to `MEMORY` after, also on error). Owner
    2026-10-26: convert existing memories.
 

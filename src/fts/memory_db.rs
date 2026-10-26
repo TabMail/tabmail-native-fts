@@ -936,7 +936,8 @@ pub fn compact_memory_step(conn: &Connection, started: bool) -> anyhow::Result<b
         }
         0 => {
             log::info!("Converting the memory database once, so freed space can go back to the disk");
-            conn.execute_batch("PRAGMA temp_store = FILE; PRAGMA auto_vacuum = INCREMENTAL;")?;
+            // The VACUUM writes the mode `open_memory_file` set on this connection (INCREMENTAL).
+            conn.execute_batch("PRAGMA temp_store = FILE;")?;
             let vacuumed = conn.execute_batch("VACUUM;");
             conn.execute_batch("PRAGMA temp_store = MEMORY;")?;
             vacuumed?;
