@@ -166,8 +166,13 @@ fn rebuild_memory_fts_if_stale_tokenizer(conn: &mut Connection) -> anyhow::Resul
     Ok(())
 }
 
+/// The memory database's file in `fts_dir`.
+pub fn memory_db_path(fts_dir: &Path) -> PathBuf {
+    fts_dir.join("memory.db")
+}
+
 pub fn open_or_create_memory_db(fts_dir: &Path) -> anyhow::Result<(PathBuf, Connection)> {
-    let db_path = fts_dir.join("memory.db");
+    let db_path = memory_db_path(fts_dir);
 
     log::info!("Initializing memory database");
     log::info!("  Memory DB Path: {}", db_path.display());

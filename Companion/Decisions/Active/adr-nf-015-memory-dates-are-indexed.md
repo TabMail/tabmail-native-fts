@@ -60,13 +60,29 @@ index's).
   - `a_memory_whose_creation_stopped_after_its_first_table_opens_and_works`
   - `a_new_memory_whose_date_index_cannot_be_built_fails_init_and_keeps_its_entries` and
     `an_older_memory_whose_date_index_cannot_be_built_fails_open_and_the_next_open_builds_it`
-    (a failed build fails init or the open visibly, keeps every entry, and the next one builds it)
+    (a failed build fails init or the open visibly, keeps every entry, and the next one builds it;
+    *since the 2026-10-25 amendment below, a failed open no longer fails init*)
 - **A build that fails stops init**, as any init statement does: the helper exits, and the next
   start tries again. If a `memory_meta` page is already corrupt at the first open of an older
   memory, every start fails until the memory is removed (Thunderbird's Clear chat history runs
   through the helper, so it cannot help; Voice's clear deletes the folder). No TabMail code writes
   such a page, and a corrupt `memory_fts` page already stops init. The owner chose to ship this
   as is on 2026-10-22; tracked in #41.
+  *Amended 2026-10-25 (#41, raised to P2 by the owner): init no longer fails for a memory it
+  cannot open. Any failure of `open_or_create_memory_db` on start (a corrupt schema page, a corrupt
+  `memory_meta` page that stops the index build, a corrupt `memory_fts` page that stops its count, a
+  full disk) leaves the memory closed: `handle_init` puts an in-memory stand-in in its place, as a
+  failed clear does, and so does the reader's memory open at thread start. Each request tries to
+  open it again (`reopen_stand_in`); memory requests answer an error until it opens, memoryClear
+  (Clear chat history) rebuilds it, date index included, and email search is unaffected. Nothing is
+  deleted until the user clears. `memoryDocs` is null exactly when the memory was left closed (only
+  a Voice test stub reads it). The open itself is unchanged, so a failed index build on an older
+  memory still fails the open, and the next start that can builds the index. A first attempt
+  (7509dee) made the index build and the counts non-fatal inside the open; Codex r2 found the
+  schema page failing earlier, at the FTS5 probe, so the one stand-in replaced those catches.
+  Test: the process test `test_a_corrupt_memory_page_never_stops_init_and_clear_recovers_it` (a
+  healthy control and a corrupt schema page, `memory_meta`, `memory_fts_content`, `_data`,
+  `_docsize`, `_idx`, `_config`; two starts, entries kept before the clear, then recovery).*
 - **Build cost on an existing memory:** once, on the first open. It reads the dates alone: about
   0.1 s for 300,000 dates on an Apple Silicon Mac.
 - **Ongoing cost:** each memory write and removal also updates the index. The index takes about 15
