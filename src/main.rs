@@ -686,10 +686,12 @@ fn writer_thread_main(
 
     let mut attempted_shards: HashSet<i32> = HashSet::new();
     let mut shards_left = true;
+    let (mut memory_compacting, mut memory_compaction_stopped) = (false, false);
     loop {
         let next = next_write_request(&rx, || {
-            // Nothing to convert in a failed clear's stand-in; the next request reopens it.
-            !is_stand_in(&email_conn) && convert_one_shard_when_idle(&mut email_conn, &mut attempted_shards, &mut shards_left)
+            // Nothing to convert or compact in a failed clear's stand-in; the next request reopens it.
+            (!is_stand_in(&email_conn) && convert_one_shard_when_idle(&mut email_conn, &mut attempted_shards, &mut shards_left))
+                || (!is_stand_in(&memory_conn) && compact_memory_when_idle(&memory_conn, &mut memory_compacting, &mut memory_compaction_stopped))
         });
         let Some(msg) = next else { break };
         reopen_stand_in(&mut email_conn, "writer's email", || crate::fts::db::open_writer_connection(&email_db_path));
@@ -737,6 +739,26 @@ fn convert_one_shard_when_idle(conn: &mut Connection, attempted: &mut HashSet<i3
         Err(e) => {
             log::error!("[writer] Shard migration stopped until next start: {:?}", e);
             *shards_left = false;
+            false
+        }
+    }
+}
+
+/// One idle step of giving the memory's freed space back (#11): true while there is more to do.
+/// `compacting` carries a compaction already begun across steps and the requests between them. An
+/// error stops it for this process (logged; the next start retries), as for the shards.
+fn compact_memory_when_idle(conn: &Connection, compacting: &mut bool, stopped: &mut bool) -> bool {
+    if *stopped {
+        return false;
+    }
+    match memory_db::compact_memory_step(conn, *compacting) {
+        Ok(more) => {
+            *compacting = more;
+            more
+        }
+        Err(e) => {
+            log::error!("[writer] Memory compaction stopped until next start: {:?}", e);
+            *stopped = true;
             false
         }
     }
@@ -1900,6 +1922,75 @@ mod tests {
             assert!(!convert_one_shard_when_idle(&mut conn, &mut attempted, &mut shards_left), "an error must not keep the writer busy");
         }
         assert!(!shards_left);
+    }
+
+    #[test]
+    fn test_memory_compaction_stops_for_this_process_on_an_error() {
+        let dir = std::env::temp_dir().join(format!("tabmail-compact-error-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory.db");
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA auto_vacuum = INCREMENTAL; CREATE TABLE t (a);
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500) INSERT INTO t SELECT zeroblob(4000) FROM n;
+                 DELETE FROM t;",
+            )
+            .unwrap();
+        drop(writer);
+        // Space to give back, on a connection that cannot write it.
+        let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert!(memory_db::compact_memory_step(&conn, false).is_err());
+        let (mut compacting, mut stopped) = (false, false);
+        for _ in 0..3 {
+            assert!(!compact_memory_when_idle(&conn, &mut compacting, &mut stopped), "an error must not keep the writer busy");
+        }
+        drop(conn);
+        // Once the fault is gone, this process still does not try again (a failing VACUUM can take
+        // seconds per GB) ...
+        let writer = Connection::open(&path).unwrap();
+        let free = || -> i64 { writer.query_row("PRAGMA freelist_count", [], |r| r.get(0)).unwrap() };
+        let before = free();
+        assert!(!compact_memory_when_idle(&writer, &mut compacting, &mut stopped));
+        assert_eq!(free(), before, "a stopped compaction must not run");
+        // ... and the next start does.
+        let (mut compacting, mut stopped) = (false, false);
+        while compact_memory_when_idle(&writer, &mut compacting, &mut stopped) {}
+        assert_eq!(free(), 0);
+        drop(writer);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_idle_memory_compaction_once_begun_frees_every_page() {
+        let dir = std::env::temp_dir().join(format!("tabmail-compact-begun-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("memory.db")).unwrap();
+        conn.execute_batch(
+            "PRAGMA auto_vacuum = INCREMENTAL; CREATE TABLE t (a);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20000) INSERT INTO t SELECT zeroblob(3000) FROM n;
+             DELETE FROM t WHERE rowid <= 2600;",
+        )
+        .unwrap();
+        let pragma = |name: &str| -> i64 { conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0)).unwrap() };
+        let (free, pages, step) = (pragma("freelist_count"), pragma("page_count"), config::memory::COMPACT_STEP_PAGES);
+        // Due to start, and after one step fewer than the starting share are free but some are.
+        assert!(free * 100 >= pages * config::memory::COMPACT_MIN_FREE_PERCENT, "{free} of {pages}");
+        assert!(free > step && (free - step) * 100 < (pages - step) * config::memory::COMPACT_MIN_FREE_PERCENT, "{free} of {pages}");
+
+        let (mut compacting, mut stopped) = (false, false);
+        let mut steps = 0;
+        while compact_memory_when_idle(&conn, &mut compacting, &mut stopped) {
+            steps += 1;
+            assert!(steps < 100, "compaction must finish");
+        }
+
+        assert_eq!(pragma("freelist_count"), 0, "a compaction begun goes on until no page is free");
+        assert!(!compacting && !stopped);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

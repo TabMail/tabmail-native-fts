@@ -130,6 +130,19 @@ pub mod memory {
     // row. Only how rows compare matters: the estimates are scaled to the
     // measured used size, and the trim re-measures after each pass.
     pub const TRIM_ROW_OVERHEAD_BYTES: i64 = 512;
+
+    // The writer's write-ahead log (#11): checkpointed every this many pages (SQLite's default;
+    // chat turns are small writes), and cut back to this size each time it restarts, about three
+    // checkpoints' worth (Firefox's ratio). Without the limit the log keeps its largest size.
+    pub const WAL_AUTOCHECKPOINT_PAGES: i64 = 1000;
+    pub const JOURNAL_SIZE_LIMIT_BYTES: i64 = 12 * 1024 * 1024;
+    // Free pages (a trim, removed rows) go back to the disk once they are at least this share of
+    // the file, while the writer is idle (`compact_memory_step`), so the file stays within about
+    // this much of the used size.
+    pub const COMPACT_MIN_FREE_PERCENT: i64 = 10;
+    // Pages one idle `incremental_vacuum` step frees; the writer checks for requests between
+    // steps, so a request waits for at most one.
+    pub const COMPACT_STEP_PAGES: i64 = 2048;
 }
 
 pub mod hybrid {
