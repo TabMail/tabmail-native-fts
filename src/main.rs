@@ -1946,8 +1946,19 @@ mod tests {
         for _ in 0..3 {
             assert!(!compact_memory_when_idle(&conn, &mut compacting, &mut stopped), "an error must not keep the writer busy");
         }
-        assert!(stopped);
         drop(conn);
+        // Once the fault is gone, this process still does not try again (a failing VACUUM can take
+        // seconds per GB) ...
+        let writer = Connection::open(&path).unwrap();
+        let free = || -> i64 { writer.query_row("PRAGMA freelist_count", [], |r| r.get(0)).unwrap() };
+        let before = free();
+        assert!(!compact_memory_when_idle(&writer, &mut compacting, &mut stopped));
+        assert_eq!(free(), before, "a stopped compaction must not run");
+        // ... and the next start does.
+        let (mut compacting, mut stopped) = (false, false);
+        while compact_memory_when_idle(&writer, &mut compacting, &mut stopped) {}
+        assert_eq!(free(), 0);
+        drop(writer);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

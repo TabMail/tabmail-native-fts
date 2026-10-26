@@ -459,11 +459,12 @@ class TestCallerLocations(unittest.TestCase):
                 responses.append(_read_message(proc))
             self.assertIn("result", responses[-1], responses)
             limit = responses[-1]["result"]["usedBytes"] // 2
+            # Measured before the trim: the idle helper may compact before its answer is read.
+            peak = files_size()
+            self.assertGreater(peak, limit)
             _send_message(proc, {"id": "trim", "method": "memoryTrim", "params": {"maxBytes": limit}})
             trim = _read_message(proc)
             self.assertTrue(trim["result"]["withinLimit"], trim)
-            peak = files_size()
-            self.assertGreater(peak, limit, "the trim must leave the files over the limit")
 
             # Nothing more is asked: the idle helper gives the freed pages back on its own.
             deadline = time.monotonic() + SESSION_DEADLINE_S / 2

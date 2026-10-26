@@ -284,7 +284,9 @@ fn ensure_memory_vector_tables(conn: &Connection) -> anyhow::Result<()> {
 }
 
 /// Open a read-only connection to an existing memory database.
-/// Used by the reader thread in multi-threaded mode.
+/// Used by the reader thread in multi-threaded mode. It does not map the file: on Windows a file
+/// that another handle maps cannot be cut shorter (SQLite reports the truncation as done), so a
+/// mapping reader would keep the file at its peak after the writer compacts it (#11).
 pub fn open_read_only_memory_connection(db_path: &Path) -> anyhow::Result<Connection> {
     let conn = Connection::open_with_flags(
         db_path,
@@ -296,11 +298,9 @@ pub fn open_read_only_memory_connection(db_path: &Path) -> anyhow::Result<Connec
     conn.execute_batch(&format!(
         "\
 PRAGMA cache_size = {cache_size};\n\
-PRAGMA mmap_size = {mmap_size};\n\
 PRAGMA busy_timeout = {busy_timeout};\n\
 ",
         cache_size = config::sqlite::PRAGMA_CACHE_SIZE_KIB_NEG,
-        mmap_size = config::sqlite::PRAGMA_MMAP_SIZE_BYTES,
         busy_timeout = config::sqlite::PRAGMA_BUSY_TIMEOUT_MS,
     ))?;
 
@@ -2147,6 +2147,23 @@ pub(crate) mod tests {
         assert_eq!(pragma(&conn, "busy_timeout"), config::sqlite::PRAGMA_BUSY_TIMEOUT_MS as i64);
         assert_eq!(pragma(&conn, "synchronous"), 1, "NORMAL");
         assert_eq!(pragma(&conn, "temp_store"), 2, "MEMORY");
+        // memoryClear's rebuild, and the writer's reopen after a failed clear, make a new memory the same way.
+        let (conn, deleted) = memory_clear_rebuild_standalone(&memory_db_path(&dir), conn).unwrap();
+        deleted.unwrap();
+        assert_eq!(pragma(&conn, "auto_vacuum"), 2, "a cleared memory frees pages a step at a time");
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = open_memory_writer_connection(&memory_db_path(&dir)).unwrap();
+        assert_eq!(pragma(&conn, "auto_vacuum"), 2);
+        assert_eq!(pragma(&conn, "journal_size_limit"), config::memory::JOURNAL_SIZE_LIMIT_BYTES);
+        assert_eq!(pragma(&conn, "wal_autocheckpoint"), config::memory::WAL_AUTOCHECKPOINT_PAGES);
+        // The reader maps none of the file once it has read: a mapping would stop the file from
+        // shrinking on Windows (see open_read_only_memory_connection).
+        let reader = open_read_only_memory_connection(&memory_db_path(&dir)).unwrap();
+        assert_eq!(reader.query_row("SELECT COUNT(*) FROM memory_meta", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(pragma(&reader, "mmap_size"), 0);
+        drop(reader);
         drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -2215,7 +2232,7 @@ pub(crate) mod tests {
         drop(older);
         register_vec();
         let (_path, mut conn) = open_or_create_memory_db(&dir).unwrap();
-        assert_eq!(pragma(&conn, "auto_vacuum"), 0);
+        assert_eq!(pragma(&conn, "auto_vacuum"), 0, "the fixture is an older memory");
         fill_distinct_with_gaps(&mut conn, 3000);
         let limit = memory_used_bytes(&conn).unwrap() / 2;
         assert!(memory_trim_to_bytes(&mut conn, limit, budget()).unwrap().within_limit);
@@ -2242,6 +2259,79 @@ pub(crate) mod tests {
         assert_eq!(found(&conn, &query), results);
         // A later start has nothing to give back (the FTS5 probe's dropped table leaves a few pages).
         assert!(!compact_memory_step(&conn, false).unwrap());
+        assert_eq!(pragma(&conn, "auto_vacuum"), 2);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An older (auto_vacuum NONE) memory filled with `n` exchanges, then trimmed to half its size.
+    fn older_trimmed_memory(name: &str, n: usize) -> (PathBuf, Connection) {
+        let dir = std::env::temp_dir().join(format!("tabmail-memory-trim-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A memory from before #11: auto_vacuum NONE, fixed by its first table.
+        let older = Connection::open(memory_db_path(&dir)).unwrap();
+        older.execute_batch("PRAGMA auto_vacuum = NONE; CREATE TABLE fixes_the_mode (a); DROP TABLE fixes_the_mode;").unwrap();
+        drop(older);
+        register_vec();
+        let (_path, mut conn) = open_or_create_memory_db(&dir).unwrap();
+        assert_eq!(pragma(&conn, "auto_vacuum"), 0);
+        fill(&mut conn, n, |i| i as i64);
+        let limit = memory_used_bytes(&conn).unwrap() / 2;
+        assert!(memory_trim_to_bytes(&mut conn, limit, budget()).unwrap().within_limit);
+        (dir, conn)
+    }
+
+    #[test]
+    fn test_a_conversion_that_fails_keeps_every_row_and_the_next_start_converts() {
+        let (dir, conn) = older_trimmed_memory("convert-fails", 3000);
+        let rows = every_row(&conn);
+        let free = pragma(&conn, "freelist_count");
+        // The VACUUM cannot write (as on a full or failing disk).
+        let read_only = Connection::open_with_flags(memory_db_path(&dir), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+
+        assert!(compact_memory_step(&read_only, false).is_err(), "a failed conversion is an error, not done");
+
+        assert_eq!(pragma(&read_only, "temp_store"), 2, "MEMORY again after a failed VACUUM");
+        drop(read_only);
+        assert!(every_row(&conn) == rows, "a failed conversion changed a row");
+        assert_eq!((pragma(&conn, "auto_vacuum"), pragma(&conn, "freelist_count")), (0, free));
+        // The next start's writer converts it.
+        assert_eq!(compact_until_done(&conn), 1);
+        assert_eq!(pragma(&conn, "auto_vacuum"), 2);
+        assert!(every_row(&conn) == rows);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A VACUUM's copy goes to disk, so the conversion's memory does not grow with the memory kept.
+    /// SQLite's heap high-water mark counts every connection in the process, so the measure runs
+    /// alone in a process of its own (`conversion_memory_measure`).
+    #[test]
+    fn test_a_conversion_copies_to_disk_not_to_memory() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "fts::memory_db::tests::conversion_memory_measure", "--ignored", "--test-threads=1", "--nocapture"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    #[ignore = "run alone in its own process by test_a_conversion_copies_to_disk_not_to_memory"]
+    fn conversion_memory_measure() {
+        let (dir, conn) = older_trimmed_memory("convert-memory", 6000);
+        let kept = memory_used_bytes(&conn).unwrap();
+        // A small cache, so pages held for the copy show against the memory kept.
+        conn.execute_batch("PRAGMA cache_size = -1024;").unwrap();
+        let used = unsafe { rusqlite::ffi::sqlite3_memory_used() };
+        unsafe { rusqlite::ffi::sqlite3_memory_highwater(1) };
+
+        assert_eq!(compact_until_done(&conn), 1);
+
+        let peak = unsafe { rusqlite::ffi::sqlite3_memory_highwater(0) } - used;
+        println!("conversion: kept {kept} bytes, SQLite heap peak {peak} bytes over the start");
+        assert!(peak < kept / 3, "the VACUUM held {peak} bytes for {kept} kept");
         assert_eq!(pragma(&conn, "auto_vacuum"), 2);
         drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
