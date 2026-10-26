@@ -45,7 +45,11 @@ pub mod sqlite {
     pub const PRAGMA_BUSY_TIMEOUT_MS: i64 = 2000;
     pub const PRAGMA_CACHE_SIZE_KIB_NEG: i64 = -64000;
     pub const PRAGMA_MMAP_SIZE_BYTES: i64 = 268_435_456;
-    pub const PRAGMA_WAL_AUTOCHECKPOINT_PAGES: i64 = 200_000;
+    /// The email database's write-ahead log: checkpoint once it holds 1000 pages (SQLite's default;
+    /// 200,000 let it reach about 800 MB, measured no faster for a full index, #55), and cut it
+    /// back to this many bytes when it starts again.
+    pub const PRAGMA_WAL_AUTOCHECKPOINT_PAGES: i64 = 1000;
+    pub const PRAGMA_JOURNAL_SIZE_LIMIT_BYTES: i64 = 12 * 1024 * 1024;
 
     pub const FTS_PREFIXES: &str = "2 3 4";
     /// No tokenchars (ADR-024): unicode61 treats ALL non-alphanumeric characters

@@ -23,7 +23,9 @@ Bounded work in SQLite itself is `auto_vacuum = INCREMENTAL` with `PRAGMA increm
 1. **Every writer open sets the writer's pragmas** (`set_memory_writer_pragmas`), on an existing
    memory as on a new one, and the memory has its own WAL bounds: `wal_autocheckpoint` 1000 pages
    (`config::memory::WAL_AUTOCHECKPOINT_PAGES`) and `journal_size_limit` 12 MiB
-   (`JOURNAL_SIZE_LIMIT_BYTES`). The email database keeps its own settings.
+   (`JOURNAL_SIZE_LIMIT_BYTES`). The email database keeps its own settings. *(2026-10-26, #55,
+   ADR-NF-022: the email writer now sets its settings on every open too, with the same log bounds
+   in `config::sqlite`.)*
 2. **A new memory is created with `auto_vacuum = INCREMENTAL`** (`open_memory_file`). The mode holds
    only before the file's first table, and the FTS5 probe (`ensure_fts5_available`) creates one, so
    it is set right after the file opens, before the probe. A memory rebuilt by memoryClear is new.

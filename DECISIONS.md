@@ -212,3 +212,7 @@ archives of any size.
 **Consequences:**
 - [Trade-offs, both positive and negative]
 ```
+
+## ADR-NF-022: The Email Writer Sets Its Settings on Every Open and Bounds Its Log
+
+- **[Full ADR](Companion/Decisions/Active/adr-nf-022-the-email-writer-sets-its-settings-on-every-open-and-bounds-its-log.md)** — #55, email twin of ADR-NF-021: `init_database`'s pragmas ran only at creation and the writer's reopen, so an existing sharded or monolithic-migrated `fts.db` ran on a plain open's defaults (`synchronous` FULL, rusqlite's 5 s `busy_timeout`, default cache/mmap) after a restart; `wal_autocheckpoint` 200,000 pages with no `journal_size_limit` left `fts.db-wal` at 880 MB after a 30,000-message full index. Now `set_email_writer_pragmas` on every writer open (all `open_or_create_db` branches + `open_writer_connection`), `PRAGMA_WAL_AUTOCHECKPOINT_PAGES` 1000 and `PRAGMA_JOURNAL_SIZE_LIMIT_BYTES` 12 MiB. Bench: throughput within noise of 200,000 (FTS-only, two runs); peak ~100 MB = one batch's transaction (FTS5 merge), unavoidable. Rejected 4000/16000 pages, idle TRUNCATE.
