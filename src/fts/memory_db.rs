@@ -910,8 +910,9 @@ pub fn memory_used_bytes(conn: &Connection) -> anyhow::Result<i64> {
 /// - A memory created with `auto_vacuum = INCREMENTAL` (every memory since #11, and every one
 ///   memoryClear rebuilt) frees `COMPACT_STEP_PAGES` per step.
 /// - An older one (`auto_vacuum = NONE`) cannot free pages until one VACUUM converts it. That
-///   VACUUM copies what is kept (about 14 s per GB), the copy on disk rather than in RAM. It keeps
-///   every rowid here: the bundled SQLite's VACUUM keeps the rowids of any table with an index
+///   VACUUM copies what is kept (about 14-19 s per GB; a request waits for it, ADR-NF-021), the copy
+///   on disk rather than in RAM. It keeps every rowid here: the bundled SQLite's VACUUM keeps the
+///   rowids of any table with an index
 ///   (`xferOptimization`: `OP_NewRowid` only for a table with neither an INTEGER PRIMARY KEY nor an
 ///   index), and each table here without an INTEGER PRIMARY KEY has its PRIMARY KEY's:
 ///   `memory_ids`, whose rowid joins `memory_fts`, `memory_meta` and `memory_vec`, and
@@ -2260,6 +2261,46 @@ pub(crate) mod tests {
         // A later start has nothing to give back (the FTS5 probe's dropped table leaves a few pages).
         assert!(!compact_memory_step(&conn, false).unwrap());
         assert_eq!(pragma(&conn, "auto_vacuum"), 2);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The memory's log on disk. The bound #11 asks for is a log of a few MB, not one that keeps
+    /// its peak (it was free to reach about 800 MB): stated here, not taken from the config.
+    const WAL_CEILING_BYTES: u64 = 16 * 1024 * 1024;
+
+    fn wal_size(dir: &Path) -> u64 {
+        std::fs::metadata(dir.join("memory.db-wal")).map(|m| m.len()).unwrap_or(0)
+    }
+
+    #[test]
+    fn test_the_log_comes_back_down_after_one_large_write() {
+        let (dir, mut conn) = temp_memory_db("wal-peak");
+        // One transaction grows the log past any limit while it is open.
+        add_sized(&mut conn, 0, 3000, 600);
+        assert!(wal_size(&dir) > 2 * WAL_CEILING_BYTES, "the fixture must grow the log: {}", wal_size(&dir));
+
+        // The next write starts the log again, cut back to its limit.
+        add_sized(&mut conn, 3000, 1, 600);
+
+        assert!(wal_size(&dir) <= WAL_CEILING_BYTES, "the log kept {} bytes", wal_size(&dir));
+        assert_eq!(table_counts(&conn)[0], 3001);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_small_writes_keep_the_log_small() {
+        let (dir, mut conn) = temp_memory_db("wal-small");
+        let mut largest = 0;
+        for batch in 0..60 {
+            add_sized(&mut conn, batch * 50, 50, 600);
+            largest = largest.max(wal_size(&dir));
+        }
+        let written = std::fs::metadata(dir.join("memory.db")).unwrap().len() + wal_size(&dir);
+        assert!(written > 2 * WAL_CEILING_BYTES, "the fixture must write more than the bound: {written}");
+        assert!(largest <= WAL_CEILING_BYTES, "the log reached {largest} bytes");
+        assert_eq!(table_counts(&conn)[0], 3000);
         drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -61,10 +61,23 @@ gaps from removed rows. A SQLite upgrade that changed this fails that test.
 - The files on disk come down to about the pages in use shortly after a trim, while the helper is
   idle (`test_the_idle_helper_gives_a_trimmed_memory_back_to_the_disk`,
   `test_the_idle_helper_converts_an_older_memory_and_gives_its_space_back`).
-- The one-time conversion copies what is kept: about 14 s per GB (ADR-NF-008's measure), once per
-  older memory. A request that arrives meanwhile waits for it; at the 1 GB default that is within
-  the clients' 60 s request timeout. It needs free disk for the copy and its log, about twice what
-  is kept; without it the VACUUM fails, compaction stops until the next start, and nothing is lost.
+- The one-time conversion copies what is kept, once per older memory, and a request that arrives
+  meanwhile waits for it (a VACUUM cannot be stopped partway: its final copy back is one
+  uninterruptible backup step). Measured on synthetic memories: about 14 s per GB (ADR-NF-008's
+  2.2 GB) to about 17-19 s per GB (4.9 GB kept: 83 s for a waiting request, review round 2026-10-26).
+  So for an older memory keeping more than about 3 GB (Voice and Thunderbird offer limits up to
+  5 GB), one request can pass the clients' 60 s timeout. **Accepted by the owner (2026-10-26):** it
+  happens at most once per older memory, the request still runs afterwards, and a retry is harmless
+  (`memoryIndexBatch` skips a memId it already has; a trim or clear run late does what was asked).
+  Rejected for it: a size cap (large older memories would keep their peak until cleared) and an
+  interruptible conversion (much more code; the copy back cannot be interrupted, and a busy large
+  memory might never finish).
+- The conversion needs free disk for the copy and its log, about twice what is kept; without it
+  the VACUUM fails, compaction stops until the next start, and nothing is lost.
+- The memory reader does not map the file (`open_read_only_memory_connection`): on Windows a file
+  that another handle maps cannot be cut shorter, and SQLite's `winTruncate` reports that as done,
+  so a mapping reader kept the file at its peak (review round 2026-10-26). The writer may map: SQLite
+  unmaps the truncating handle's own mapping first.
 - `incremental_vacuum` moves pages but does not defragment, which is why Firefox rejected it for
   Places. The memory is small rows read by rowid and date index, so fragmentation is not measured
   to matter here.
