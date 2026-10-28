@@ -1262,9 +1262,9 @@ fn relevance_candidates(
 ///   end (the matches at their last date are left to the next window, as they may go on past it);
 /// - vector: sqlite-vec's `DATE_SORT_POOL` nearest within the window hold every match by meaning
 ///   alone in it (fewer were answered, or the farthest scores under `MIN_SCORE` by meaning alone).
-///   If not, every one of them is a match, and the window narrows to the dates of the first
-///   `DATE_WINDOW_NARROW_TO` of them in sort order (so it still holds the limit) and is searched
-///   again. A full pool's keyword matches missing from it are read for their own vector distances.
+///   If not, every one of them is a match, and every vector's distance within the window is read in
+///   one pass (more than the limit match, so the walk ends there). A full pool's keyword matches
+///   missing from it are read for their own vector distances.
 ///
 /// So every candidate's score is its own, whatever window found it. `None` when no vector is within
 /// the dates (or the field), or the vector search failed: the caller answers by keyword.
@@ -1282,12 +1282,18 @@ fn date_window_candidates(
 ) -> anyhow::Result<Option<HybridFound>> {
     let pool = config::hybrid::DATE_SORT_POOL;
     let newest_first = sort == SearchSort::DateDesc;
-    // A date bound for SQL: none at the end of time.
-    let bound = |d: i64| (d != i64::MIN && d != i64::MAX).then_some(d);
+    // Date bounds for SQL: none at the end of time on their side.
+    let lower = |d: i64| (d != i64::MIN).then_some(d);
+    let upper = |d: i64| (d != i64::MAX).then_some(d);
     // Whether a date is farther from the end the sort starts at than `edge`.
     let past = |date: i64, edge: i64| if newest_first { date < edge } else { date > edge };
     let vectors_within = |lo: i64, hi: i64, k: i64, among: Option<&HashSet<i64>>| {
-        search_vec_candidates(conn, "messages_vec", "message_meta", query_blob, k, bound(lo), bound(hi), among).map_err(|e| {
+        search_vec_candidates(conn, "messages_vec", "message_meta", query_blob, k, lower(lo), upper(hi), among).map_err(|e| {
+            log::warn!("Vector search failed, searching by keyword only: {e}");
+        })
+    };
+    let every_vector_within = |lo: i64, hi: i64| {
+        vec_distances_within(conn, query_blob, lower(lo), upper(hi), eligible).map_err(|e| {
             log::warn!("Vector search failed, searching by keyword only: {e}");
         })
     };
@@ -1309,7 +1315,7 @@ fn date_window_candidates(
             let rows = if fts_query.is_empty() {
                 vec![]
             } else {
-                search_fts_candidates(conn, fts_query, bound(lo), bound(hi), pool, sort, known_years)?
+                search_fts_candidates(conn, fts_query, lower(lo), upper(hi), pool, sort, known_years)?
             };
             let (first, last) = (rows.first().map(|c| c.date_ms), rows.last().map(|c| c.date_ms));
             let (edge, rows) = match (first, last) {
@@ -1328,39 +1334,28 @@ fn date_window_candidates(
             keyword_edge = Some(edge);
         }
 
-        // --- Vector: narrow the window until its pool holds every match by meaning alone ---
-        let mut edge = keyword_edge.expect("set above");
-        let farthest_score = |vectors: &[(i64, f64)]| {
-            vectors.iter().map(|&(_, distance)| crate::fts::hybrid::cosine_distance_to_score(distance)).fold(f64::INFINITY, f64::min)
-        };
-        let mut vectors = loop {
-            let (window_lo, window_hi) = if newest_first { (edge, hi) } else { (lo, edge) };
-            let Ok(vectors) = vectors_within(window_lo, window_hi, pool, eligible) else { return Ok(None) };
-            vector_searches += 1;
-            let farthest = config::hybrid::EMAIL_VECTOR_WEIGHT * crate::fts::hybrid::adjusted_vector_score(farthest_score(&vectors));
-            let complete = (vectors.len() as i64) < pool || farthest < config::hybrid::MIN_SCORE;
-            if complete {
-                break vectors;
-            }
-            if edge == start {
-                log::warn!("Date-sorted search: {pool} vector matches or more at one date ({start}), sorting the nearest {pool}");
-                break vectors;
-            }
-            let mut dates: Vec<i64> = fetch_dates(conn, "message_meta", vectors.iter().map(|&(rowid, _)| rowid))?.into_values().collect();
-            dates.sort_unstable_by(|a, b| if newest_first { b.cmp(a) } else { a.cmp(b) });
-            let narrowed = dates[(config::hybrid::DATE_WINDOW_NARROW_TO - 1).min(dates.len() - 1)];
-            // Narrower by one date at least.
-            edge = if newest_first { narrowed.max(edge + 1) } else { narrowed.min(edge - 1) };
-        };
-
-        // --- Merge this window's candidates, after the windows before it ---
+        // --- Vector: the window's nearest pool, holding every match by meaning alone in it unless it is full of them ---
+        let edge = keyword_edge.expect("set above");
+        let (window_lo, window_hi) = if newest_first { (edge, hi) } else { (lo, edge) };
         let mut in_window = Vec::new();
         while keyword.front().is_some_and(|c| !past(c.date_ms, edge)) {
             in_window.extend(keyword.pop_front());
         }
-        // A full pool leaves out vectors scoring up to its farthest: a keyword match among them
-        // still counts its meaning, so read its own distance (at most a pool of rows).
-        if vectors.len() as i64 >= pool && farthest_score(&vectors) > config::hybrid::VECTOR_SCORE_THRESHOLD {
+        let Ok(mut vectors) = vectors_within(window_lo, window_hi, pool, eligible) else { return Ok(None) };
+        vector_searches += 1;
+        let farthest = vectors.iter().map(|&(_, distance)| crate::fts::hybrid::cosine_distance_to_score(distance)).fold(f64::INFINITY, f64::min);
+        // Fewer than the pool answered: every vector within the window.
+        let full = vectors.len() as i64 >= pool;
+        if full && config::hybrid::EMAIL_VECTOR_WEIGHT * crate::fts::hybrid::adjusted_vector_score(farthest) >= config::hybrid::MIN_SCORE {
+            // Every one of them is a match, and more may be past them: every vector's own distance
+            // within the window, in one pass over its rows.
+            let Ok(every) = every_vector_within(window_lo, window_hi) else { return Ok(None) };
+            vector_searches += 1;
+            vectors = every;
+        } else if full && farthest > config::hybrid::VECTOR_SCORE_THRESHOLD {
+            // The pool holds every match by meaning alone, but leaves out vectors scoring up to its
+            // farthest: a keyword match among them still counts its meaning, so read its own distance
+            // (at most a pool of rows).
             let pooled: HashSet<i64> = vectors.iter().map(|&(rowid, _)| rowid).collect();
             let missing: HashSet<i64> = in_window.iter().map(|c| c.rowid).filter(|rowid| !pooled.contains(rowid)).collect();
             if !missing.is_empty() {
@@ -1369,6 +1364,8 @@ fn date_window_candidates(
                 vectors.extend(own);
             }
         }
+
+        // --- Merge this window's candidates, after the windows before it ---
         let text_pairs: Vec<(i64, f64)> = in_window.iter().map(|c| (c.rowid, c.rank)).collect();
         let mut dates: HashMap<i64, i64> = in_window.iter().map(|c| (c.rowid, c.date_ms)).collect();
         let vector_only = vectors.iter().map(|&(rowid, _)| rowid).filter(|rowid| !dates.contains_key(rowid));
@@ -1648,6 +1645,28 @@ pub(crate) fn search_vec_candidates(
     let rows = stmt.query_map(
         params![query_blob, k, from_ts.unwrap_or(i64::MIN), to_ts.unwrap_or(i64::MAX), eligible_json],
         read,
+    )?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Every email vector's cosine distance to the query within the dates (and among `eligible`), in one
+/// pass over their rows: where a date-sorted search needs more than sqlite-vec's k nearest (#47).
+fn vec_distances_within(
+    conn: &Connection,
+    query_blob: &[u8],
+    from_ts: Option<i64>,
+    to_ts: Option<i64>,
+    eligible: Option<&HashSet<i64>>,
+) -> anyhow::Result<Vec<(i64, f64)>> {
+    let eligible_json = eligible.map(|e| serde_json::to_string(&e.iter().collect::<Vec<_>>())).transpose()?;
+    let mut stmt = conn.prepare(
+        "SELECT rowid, vec_distance_cosine(embedding, ?1) FROM messages_vec WHERE rowid IN \
+         (SELECT rowid FROM message_meta WHERE dateMs >= ?2 AND dateMs <= ?3 \
+          AND (?4 IS NULL OR rowid IN (SELECT value FROM json_each(?4))))",
+    )?;
+    let rows = stmt.query_map(
+        params![query_blob, from_ts.unwrap_or(i64::MIN), to_ts.unwrap_or(i64::MAX), eligible_json],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)),
     )?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
@@ -5389,6 +5408,23 @@ pub(crate) mod tests {
         denied: usize,
     }
 
+    /// Refuses calls of the SQL function named in the `DeniedTable`.
+    extern "C" fn deny_calls_of_function(
+        context: *mut c_void,
+        action: c_int,
+        _arg1: *const std::os::raw::c_char,
+        function: *const std::os::raw::c_char,
+        _db: *const std::os::raw::c_char,
+        _trigger: *const std::os::raw::c_char,
+    ) -> c_int {
+        let state = unsafe { &mut *(context as *mut DeniedTable) };
+        if action == ffi::SQLITE_FUNCTION && !function.is_null() && unsafe { CStr::from_ptr(function) }.to_bytes() == state.name {
+            state.denied += 1;
+            return ffi::SQLITE_DENY;
+        }
+        ffi::SQLITE_OK
+    }
+
     extern "C" fn deny_reads_of_table(
         context: *mut c_void,
         action: c_int,
@@ -6149,9 +6185,9 @@ pub(crate) mod tests {
         f32_vec_to_blob(&q.iter().zip(&o).map(|(a, b)| s * a + (1.0 - s * s).sqrt() * b).collect::<Vec<_>>())
     }
 
-    /// A keyword match's score counts its meaning however weak, past a pool of nearer vectors that
-    /// are no matches themselves (above `VECTOR_SCORE_THRESHOLD`, under `MIN_SCORE`): the same score
-    /// as when the dates hold only it.
+    /// Keyword matches' scores count their meaning however weak, past a pool of nearer vectors that
+    /// are no matches themselves (above `VECTOR_SCORE_THRESHOLD`, under `MIN_SCORE`): each the same
+    /// score as when the dates hold only it.
     #[test]
     fn a_date_sorted_search_scores_a_weak_meaning_past_the_vector_pool() {
         let Some(engine) = embedding_engine() else { return };
@@ -6162,27 +6198,36 @@ pub(crate) mod tests {
         // Between the threshold and a match by meaning alone, and the match farther than the pool.
         let to_score = |s: f64| config::hybrid::EMAIL_VECTOR_WEIGHT * (s - config::hybrid::VECTOR_SCORE_THRESHOLD) / (1.0 - config::hybrid::VECTOR_SCORE_THRESHOLD);
         assert!(match_similarity > config::hybrid::VECTOR_SCORE_THRESHOLD && to_score(pool_similarity) < config::hybrid::MIN_SCORE);
-        for (sort, match_date) in [("date_desc", now + 1000), ("date_asc", now - 5000 * 1000)] {
+        // Two such matches, the second a little farther still: each counts its own meaning.
+        let second_similarity = 0.47;
+        for (sort, step) in [("date_desc", 1000), ("date_asc", -1000)] {
             let (profile, _path, mut conn, mut known_years) = temp_email_db(&format!("weak-meaning-{sort}"));
+            let first_date = if step > 0 { now + 2 * step } else { now - 5001 * 1000 };
+            let match_dates = [first_date, first_date - step];
             let mut rows: Vec<Value> = (0..5000).map(|i| email_row(&format!("acc:/:near-{i}"), "Weather", "rain tomorrow", now - i * 1000)).collect();
-            rows.push(email_row("acc:/:match", "Budget", "the budget", match_date));
+            rows.push(email_row("acc:/:match", "Budget", "the budget", match_dates[0]));
+            rows.push(email_row("acc:/:second", "Budget", "the budget", match_dates[1]));
             index_batch(&mut conn, &rows, None, &mut known_years).unwrap();
-            let (pool_blob, match_blob) = (vector_at_similarity(&query, &away, pool_similarity as f32), vector_at_similarity(&query, &away, match_similarity as f32));
-            insert_vectors(&mut conn, (1..=5001).map(|rowid| (rowid, if rowid == 5001 { match_blob.clone() } else { pool_blob.clone() })));
+            let blob = |similarity: f64| vector_at_similarity(&query, &away, similarity as f32);
+            let (pool_blob, match_blob, second_blob) = (blob(pool_similarity), blob(match_similarity), blob(second_similarity));
+            insert_vectors(&mut conn, (1..=5002).map(|rowid| (rowid, match rowid { 5001 => match_blob.clone(), 5002 => second_blob.clone(), _ => pool_blob.clone() })));
             let search_by = |params: Value| search(&conn, "budget", &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap();
             let all = search_by(serde_json::json!({ "ignoreDate": true, "limit": 10, "sort": sort }));
-            assert_eq!(result_ids(&all), ["acc:/:match"], "{sort}: the nearer vectors are no matches");
-            let alone = search_by(serde_json::json!({ "from": match_date, "to": match_date, "limit": 1, "sort": sort }));
-            assert_eq!(alone[0]["rank"], all[0]["rank"], "{sort}");
-            let text_score = -all[0]["rank"].as_f64().unwrap() - to_score(match_similarity);
-            assert!(text_score > 0.0 && text_score < config::hybrid::EMAIL_TEXT_WEIGHT, "{sort}: the meaning counts ({text_score})");
+            assert_eq!(result_ids(&all), ["acc:/:match", "acc:/:second"], "{sort}: the nearer vectors are no matches");
+            for (i, (date, similarity)) in match_dates.into_iter().zip([match_similarity, second_similarity]).enumerate() {
+                let alone = search_by(serde_json::json!({ "from": date, "to": date, "limit": 1, "sort": sort }));
+                assert_eq!(alone[0]["rank"], all[i]["rank"], "{sort}: {i}");
+                let text_score = -all[i]["rank"].as_f64().unwrap() - to_score(similarity);
+                assert!(text_score > 0.0 && text_score < config::hybrid::EMAIL_TEXT_WEIGHT, "{sort}: {i}: the meaning counts ({text_score})");
+            }
             drop(conn);
             let _ = std::fs::remove_dir_all(profile);
         }
     }
 
     /// More matches by meaning alone than the pool, each only just a match (`MIN_SCORE`): a date sort
-    /// still answers the true newest (oldest) of them, in order.
+    /// still answers the true newest (oldest) of them within its dates, in order; if reading them
+    /// fails, it answers by keyword.
     #[test]
     fn a_date_sorted_search_is_exact_past_a_pool_of_weak_matches_by_meaning() {
         let Some(engine) = embedding_engine() else { return };
@@ -6197,17 +6242,35 @@ pub(crate) mod tests {
         index_batch(&mut conn, &rows, None, &mut known_years).unwrap();
         let blob = vector_at_similarity(&query, &away, similarity as f32);
         insert_vectors(&mut conn, (1..=5000).map(|rowid| (rowid, blob.clone())));
-        for (sort, expected) in [("date_desc", (0..10).collect::<Vec<_>>()), ("date_asc", (4990..5000).rev().collect())] {
-            let params = serde_json::json!({ "ignoreDate": true, "limit": 10, "sort": sort });
+        // Without dates, and with dates leaving out the 100 the sort would come to first.
+        for (sort, params, expected) in [
+            ("date_desc", serde_json::json!({ "ignoreDate": true }), (0..10).collect::<Vec<_>>()),
+            ("date_asc", serde_json::json!({ "ignoreDate": true }), (4990..5000).rev().collect()),
+            ("date_desc", serde_json::json!({ "to": now - 100 * 1000 }), (100..110).collect()),
+            ("date_asc", serde_json::json!({ "from": now - 4899 * 1000 }), (4890..4900).rev().collect()),
+        ] {
+            let mut params = params;
+            params["limit"] = 10.into();
+            params["sort"] = sort.into();
             let ids = result_ids(&search(&conn, "budget", &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap());
-            assert_eq!(ids, expected.iter().map(|i| format!("acc:/:weak-{i}")).collect::<Vec<_>>(), "{sort}");
+            assert_eq!(ids, expected.iter().map(|i| format!("acc:/:weak-{i}")).collect::<Vec<_>>(), "{sort} {params}");
+        }
+        // The read of every vector in the window failing: the keyword-only answer, as when the vector
+        // search fails.
+        for sort in ["date_desc", "date_asc"] {
+            let params = serde_json::json!({ "ignoreDate": true, "limit": 10, "sort": sort });
+            let mut state = DeniedTable { name: b"vec_distance_cosine", denied: 0 };
+            unsafe { ffi::sqlite3_set_authorizer(conn.handle(), Some(deny_calls_of_function), &mut state as *mut DeniedTable as *mut c_void) };
+            let results = search(&conn, "budget", &params, &SynonymLookup::new(), Some(&engine), &known_years);
+            unsafe { ffi::sqlite3_set_authorizer(conn.handle(), None, std::ptr::null_mut()) };
+            assert!(state.denied > 0, "{sort}: the read was refused");
+            assert_eq!(results.unwrap(), search(&conn, "budget", &params, &SynonymLookup::new(), None, &known_years).unwrap(), "{sort}");
         }
         drop(conn);
         let _ = std::fs::remove_dir_all(profile);
     }
 
-    /// More matches by meaning than the pool at one date: the window cannot narrow, so the search
-    /// sorts the nearest pool of them, and answers.
+    /// More matches by meaning than the pool at one date: the search answers.
     #[test]
     fn a_date_sort_with_a_pool_of_matches_at_one_date_answers() {
         let Some(engine) = embedding_engine() else { return };
@@ -6245,6 +6308,137 @@ pub(crate) mod tests {
             assert_eq!(older, (0..older.len()).rev().map(|i| format!("acc:/:older-{i}")).collect::<Vec<_>>(), "{sort}");
             assert!(same.iter().all(|id| id.starts_with("acc:/:same-")), "{sort}: {ids:?}");
         }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    /// Statements a connection runs that read the email vectors, counted (not sqlite-vec's own
+    /// statements on its shadow tables, which a read runs per chunk or row).
+    unsafe extern "C" fn count_vector_reads(_event: std::os::raw::c_uint, context: *mut c_void, _stmt: *mut c_void, sql: *mut c_void) -> c_int {
+        let sql = unsafe { CStr::from_ptr(sql as *const c_char) }.to_string_lossy();
+        if sql.contains("FROM messages_vec WHERE") {
+            unsafe { &*(context as *const AtomicUsize) }.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+        0
+    }
+
+    /// More matches by meaning than several pools, the nearer the farther from the end the sort starts
+    /// at: a date sort answers the true newest (oldest) of them in order, each with its own score,
+    /// reading the vectors twice however many match.
+    #[test]
+    fn a_date_sort_reads_the_vectors_a_bounded_number_of_times_however_many_match_by_meaning() {
+        let Some(engine) = embedding_engine() else { return };
+        let now = mid_year_ms();
+        let query = engine.embed("budget").unwrap();
+        let away = engine.embed("rain tomorrow").unwrap();
+        let count = 13_000;
+        for sort in ["date_desc", "date_asc"] {
+            let (profile, _path, mut conn, mut known_years) = temp_email_db(&format!("nearness-against-{sort}-sort"));
+            // Message i is i seconds old; every one is a match by meaning, the nearest at the end the
+            // sort comes to last.
+            let rows: Vec<Value> = (0..count).map(|i| email_row(&format!("acc:/:m-{i}"), "Weather", "rain tomorrow", now - i * 1000)).collect();
+            index_batch(&mut conn, &rows, None, &mut known_years).unwrap();
+            let similarity = |i: i64| {
+                let toward_the_end = if sort == "date_desc" { i } else { count - 1 - i };
+                0.60 + 0.35 * toward_the_end as f32 / count as f32
+            };
+            insert_vectors(&mut conn, (0..count).map(|i| (i + 1, vector_at_similarity(&query, &away, similarity(i)))));
+            let search_by = |params: Value| search(&conn, "budget", &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap();
+            let reads = AtomicUsize::new(0);
+            unsafe { ffi::sqlite3_trace_v2(conn.handle(), ffi::SQLITE_TRACE_STMT as std::os::raw::c_uint, Some(count_vector_reads), &reads as *const AtomicUsize as *mut c_void) };
+            let results = search_by(serde_json::json!({ "ignoreDate": true, "limit": 10, "sort": sort }));
+            unsafe { ffi::sqlite3_trace_v2(conn.handle(), 0, None, std::ptr::null_mut()) };
+            let expected: Vec<i64> = if sort == "date_desc" { (0..10).collect() } else { (count - 10..count).rev().collect() };
+            assert_eq!(result_ids(&results), expected.iter().map(|i| format!("acc:/:m-{i}")).collect::<Vec<_>>(), "{sort}");
+            let reads = reads.load(AtomicOrdering::SeqCst);
+            assert!(reads <= 2, "{sort}: {reads} reads of the vectors");
+            for i in [0, 9] {
+                let date = results[i]["dateMs"].as_i64().unwrap();
+                let alone = search_by(serde_json::json!({ "from": date, "to": date, "limit": 1, "sort": sort }));
+                assert_eq!(alone[0]["rank"], results[i]["rank"], "{sort}: the score does not depend on the window");
+            }
+            drop(conn);
+            let _ = std::fs::remove_dir_all(profile);
+        }
+    }
+
+    /// A field-scoped date sort past a pool of matches by meaning in the field answers the true newest
+    /// (oldest) of them, none outside the field however near.
+    #[test]
+    fn a_field_scoped_date_sort_past_a_pool_of_matches_by_meaning_answers_only_the_field() {
+        let Some(engine) = embedding_engine() else { return };
+        let now = mid_year_ms();
+        let q = "subject:weather rain";
+        let query = engine.embed(q).unwrap();
+        let away = engine.embed("budget").unwrap();
+        let (profile, _path, mut conn, mut known_years) = temp_email_db("field-past-vector-pool");
+        // 5,000 in the field, none a keyword match (no "rain"), every one a match by meaning; 100
+        // nearer still outside the field, newer and older than all of them.
+        let mut rows: Vec<Value> = (0..5000).map(|i| email_row(&format!("acc:/:in-{i}"), "Weather", "sunny", now - i * 1000)).collect();
+        rows.extend((0..100).map(|i| email_row(&format!("acc:/:out-{i}"), "Other", "sunny", if i % 2 == 0 { now + (i + 1) * 1000 } else { now - (5000 + i) * 1000 })));
+        index_batch(&mut conn, &rows, None, &mut known_years).unwrap();
+        let (in_blob, out_blob) = (vector_at_similarity(&query, &away, 0.7), vector_at_similarity(&query, &away, 0.95));
+        insert_vectors(&mut conn, (1..=5100).map(|rowid| (rowid, if rowid <= 5000 { in_blob.clone() } else { out_blob.clone() })));
+        for (sort, expected) in [("date_desc", (0..10).collect::<Vec<_>>()), ("date_asc", (4990..5000).rev().collect())] {
+            let params = serde_json::json!({ "ignoreDate": true, "limit": 10, "sort": sort });
+            let ids = result_ids(&search(&conn, q, &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap());
+            assert_eq!(ids, expected.iter().map(|i| format!("acc:/:in-{i}")).collect::<Vec<_>>(), "{sort}");
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    /// A date sort from the last instant or to the first answers nothing outside its dates.
+    #[test]
+    fn a_date_sort_at_the_ends_of_time_answers_nothing_outside_its_dates() {
+        let Some(engine) = embedding_engine() else { return };
+        let now = mid_year_ms();
+        let (profile, _path, mut conn, mut known_years) = temp_email_db("ends-of-time");
+        let rows: Vec<Value> = (0..5).map(|i| email_row(&format!("acc:/:budget-{i}"), "Budget", "budget", now - i * 1000)).collect();
+        index_batch(&mut conn, &rows, None, &mut known_years).unwrap();
+        let blob = f32_vec_to_blob(&engine.embed("budget").unwrap());
+        insert_vectors(&mut conn, (1..=5).map(|rowid| (rowid, blob.clone())));
+        for (sort, dates) in [
+            ("date_asc", serde_json::json!({ "from": i64::MAX })),
+            ("date_desc", serde_json::json!({ "from": i64::MAX })),
+            ("date_asc", serde_json::json!({ "to": i64::MIN })),
+            ("date_desc", serde_json::json!({ "to": i64::MIN })),
+        ] {
+            let mut params = dates.clone();
+            params["limit"] = 10.into();
+            params["sort"] = sort.into();
+            let results = search(&conn, "budget", &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap();
+            assert_eq!(result_ids(&results), Vec::<String>::new(), "{sort} {dates}");
+        }
+        // The same dates with room for the messages hold them all.
+        let params = serde_json::json!({ "from": i64::MIN, "to": i64::MAX, "limit": 10, "sort": "date_desc" });
+        assert_eq!(search(&conn, "budget", &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap().len(), 5);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    /// A field-scoped date sort with no vector among the field's matches (one outside it) answers by
+    /// keyword only, scores and all, as a relevance search does.
+    #[test]
+    fn a_field_scoped_date_sort_with_no_vector_in_the_field_answers_by_keyword() {
+        let Some(engine) = embedding_engine() else { return };
+        let now = mid_year_ms();
+        let (profile, _path, mut conn, mut known_years) = temp_email_db("no-vector-in-field");
+        let mut rows: Vec<Value> = (0..5000).map(|i| email_row(&format!("acc:/:budget-{i}"), "Budget", "notes", now - i * 1000)).collect();
+        rows.push(email_row("acc:/:outside", "Weather", "budget notes", now - 2000 * 1000));
+        index_batch(&mut conn, &rows, None, &mut known_years).unwrap();
+        insert_vectors(&mut conn, std::iter::once((5001, f32_vec_to_blob(&engine.embed("budget notes").unwrap()))));
+        // A free word with the field, so the search is hybrid (a field alone answers by keyword).
+        for sort in ["date_desc", "date_asc"] {
+            let params = serde_json::json!({ "ignoreDate": true, "limit": 10, "sort": sort });
+            let hybrid = search(&conn, "subject:budget notes", &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap();
+            assert_eq!(hybrid.len(), 10, "{sort}");
+            assert_eq!(hybrid, search(&conn, "subject:budget notes", &params, &SynonymLookup::new(), None, &known_years).unwrap(), "{sort}");
+        }
+        // The vector outside the field is within the dates: without the field the search is hybrid.
+        let params = serde_json::json!({ "ignoreDate": true, "limit": 10, "sort": "date_desc" });
+        let unscoped = search(&conn, "budget notes", &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap();
+        assert_ne!(unscoped, search(&conn, "budget notes", &params, &SynonymLookup::new(), None, &known_years).unwrap());
         drop(conn);
         let _ = std::fs::remove_dir_all(profile);
     }

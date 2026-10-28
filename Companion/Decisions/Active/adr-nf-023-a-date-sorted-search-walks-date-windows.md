@@ -24,20 +24,21 @@ narrow such searches by dates.
      window, since they may go on past the pool. So a window never splits a date.
    - Vector: sqlite-vec's `DATE_SORT_POOL` nearest within the window (`rowid IN`, ADR-NF-016) hold every
      match by meaning alone in it: fewer were answered, or the farthest answered scores under
-     `MIN_SCORE` by meaning alone. Otherwise every one of them is a match, and the window narrows to
-     the dates of the first `DATE_WINDOW_NARROW_TO` (1,024, at least the largest limit) of them in sort
-     order and is searched again. The narrowed window holds at least the limit, so the walk ends there.
+     `MIN_SCORE` by meaning alone. Otherwise every one of them is a match, and every vector's distance
+     within the window is read in one pass over its rows (`vec_distance_cosine` by rowid, ADR-NF-016's
+     method D: slower than a search past tens of thousands of rows, but not bounded by its k). More
+     than the limit match, so the walk ends there.
 3. Scores do not depend on the window. bm25 uses its year shard's statistics whatever dates the query
    names. A vector-only candidate counts only at `MIN_SCORE`, and the pool holds every such one. A
    keyword match counts its meaning however weak: when a full pool's farthest scores above
    `VECTOR_SCORE_THRESHOLD`, the window's keyword matches missing from the pool are read for their own
-   vector distances (one `rowid IN` search over at most a pool of rows). So every candidate's score is
-   its own.
+   vector distances (one `rowid IN` search over at most a pool of rows); a window read in one pass
+   holds every vector's own distance. So every candidate's score is its own.
 4. Fallbacks as before: no vector within the dates (or the field) answers by keyword only. When the
    windows walked hold no vector, one k = 1 vector search over the whole dates decides it. A failed
    vector search also answers by keyword only.
-5. More than a pool of matches at one millisecond (keyword or vector) cannot be split: the search sorts
-   that pool and logs a warning. Not seen in real mail.
+5. More than a pool of keyword matches at one millisecond cannot be split: the search sorts that pool
+   and logs a warning. Not seen in real mail. (A pool of vectors at one millisecond is read whole.)
 
 Windows are not year shards: the keyword pool and the vector pool choose them, so a window holds about a
 pool of matches whatever the year. Typically one window: the newest 4,096 keyword matches, and a vector
@@ -84,10 +85,12 @@ relevance search is unchanged.
 - A date-sorted search answers the true newest (oldest) matches, in order, however many there are. The
   `email_search` tool's advice to narrow a common-word date sort by dates is no longer needed for
   correctness (still useful to the agent for scope).
-- A date sort reads at least one keyword query and one vector search, as before. A window costs one
-  more vector search when its pool is full and reaches above the threshold (its keyword matches'
-  own distances), and more only when its nearest 4,096 are all matches by meaning, which ends the
-  walk. Weak neighbours that are no matches cost nothing more however many there are.
+- A date sort reads at least one keyword query and one vector search, as before. A window whose
+  pool is full reads the vectors once more: its keyword matches' own distances when the pool
+  reaches above the threshold, or every vector in the window in one pass when the whole pool matches
+  by meaning, which ends the walk. So no window reads the vectors more than twice, and only the
+  last is ever read whole (linear in its rows, at most the archive). Weak neighbours that are no
+  matches cost nothing more however many there are, nor do strong ones however their dates lie.
 - Wire and tools unchanged; no capability (a client cannot tell an exact sort from a pooled one, and needs
   no different request).
 
@@ -102,6 +105,13 @@ relevance search is unchanged.
   each 4,096 of them, each with a full vector search or several. Quadratic in the archive: on a
   synthetic 160,000-message fixture with every vector in that band, 18 s against 0.23 s for the single
   pool (found in review). This decision answers it in 0.25 s: one window, two vector searches.
+- Narrowing a window full of matches by meaning to the dates of the first 1,024 of them and
+  searching again (the second version): when the nearer matches lie farther from the sort's start,
+  each search drops only about 3,072 of them, so the walk costs a full vector search per 3,072
+  matches. On a synthetic 160,000-message fixture with every vector a match and the older nearer,
+  `date_desc` took 52 searches and about 5.8 s against 0.22 s for the single pool (found in
+  review). Narrowing by halves would bound it at about log2 of the window over 1,024 searches,
+  still several; one pass over the window reads every distance exactly and deletes the narrowing.
 - A separate interactive single-query path: the walk measured no slower, and no interactive caller sorts.
 
 ## Evidence
