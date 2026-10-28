@@ -11,7 +11,7 @@ A hybrid search (email `search`, `memorySearch`) gives each candidate
 clamps the IDF of a word in at least half the rows to about 0 (ADR-NF-014), so such a word scores
 about 0 by keyword in every row, and only the rows the vector leg lifted over `MIN_SCORE` were kept.
 ADR-NF-014 answered by keyword when the merge kept NOTHING; when it kept one row, that one row was the
-answer. The release smoke test (PLAN_RELEASE_1_10): 8 messages, each "we talked about <topic> and the
+answer. The 1.10 release smoke test: 8 messages, each "we talked about <topic> and the
 meeting notes"; `meeting` returned 1 by hybrid and 8 by keyword only, and the same for memory.
 
 Owner invariant (2026-10-24): if hybrid search gives fewer results than keyword-only search,
@@ -68,6 +68,6 @@ may still rank above a keyword match, as before.
   msgId / memId (columns weighted 0, rank exactly 0) is a result with the model loaded.
 - `memory_search_keeps_the_best_keyword_match_over_newer_weaker_ones_at_a_small_limit`: 13 matches,
   the best one older, limit 1: the pool takes rank before date, so the best match is answered.
-- Mutants (ledger `PLAN_NF_COMMON_WORD/reviews/mutation-ledger.jsonl`): keyword gated by `MIN_SCORE`,
+- Mutants: keyword gated by `MIN_SCORE`,
   vector-only ungated, the vector leg clearing the flag, a vector-only candidate counted as keyword,
   each pool without the date tie-break: all detected.
