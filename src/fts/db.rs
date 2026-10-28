@@ -1285,8 +1285,6 @@ fn date_window_candidates(
     // Date bounds for SQL: none at the end of time on their side.
     let lower = |d: i64| (d != i64::MIN).then_some(d);
     let upper = |d: i64| (d != i64::MAX).then_some(d);
-    // Whether a date is farther from the end the sort starts at than `edge`.
-    let past = |date: i64, edge: i64| if newest_first { date < edge } else { date > edge };
     let vectors_within = |lo: i64, hi: i64, k: i64, among: Option<&HashSet<i64>>| {
         search_vec_candidates(conn, "messages_vec", "message_meta", query_blob, k, lower(lo), upper(hi), among).map_err(|e| {
             log::warn!("Vector search failed, searching by keyword only: {e}");
@@ -1300,47 +1298,34 @@ fn date_window_candidates(
 
     // The dates not walked yet, inclusive.
     let (mut lo, mut hi) = (from_ts.unwrap_or(i64::MIN), to_ts.unwrap_or(i64::MAX));
-    // Every keyword match from the start of the dates left to `keyword_edge`, in sort order.
-    let mut keyword: std::collections::VecDeque<FtsCandidate> = std::collections::VecDeque::new();
-    let mut keyword_edge: Option<i64> = None;
     let mut found = HybridFound { merged: vec![], keyword: vec![], vector_count: 0 };
     let (mut windows, mut vector_searches) = (0, 0);
     let mut walked_all = false;
     while found.merged.len() < limit {
-        let start = if newest_first { hi } else { lo };
         let end = if newest_first { lo } else { hi };
 
-        // --- Keyword: the next pool of matches, once the held ones are used up ---
-        if keyword_edge.is_none_or(|edge| past(start, edge)) {
-            let rows = if fts_query.is_empty() {
-                vec![]
-            } else {
-                search_fts_candidates(conn, fts_query, lower(lo), upper(hi), pool, sort, known_years)?
-            };
-            let (first, last) = (rows.first().map(|c| c.date_ms), rows.last().map(|c| c.date_ms));
-            let (edge, rows) = match (first, last) {
-                (Some(first), Some(last)) if rows.len() as i64 >= pool => {
-                    if first == last {
-                        log::warn!("Date-sorted search: {pool} keyword matches or more at one date ({last}), sorting {pool} of them");
-                        (last, rows)
-                    } else {
-                        let edge = if newest_first { last + 1 } else { last - 1 };
-                        (edge, rows.into_iter().filter(|c| c.date_ms != last).collect())
-                    }
+        // --- Keyword: the next pool of matches; the window ends where they end ---
+        let rows = if fts_query.is_empty() {
+            vec![]
+        } else {
+            search_fts_candidates(conn, fts_query, lower(lo), upper(hi), pool, sort, known_years)?
+        };
+        let (first, last) = (rows.first().map(|c| c.date_ms), rows.last().map(|c| c.date_ms));
+        let (edge, in_window) = match (first, last) {
+            (Some(first), Some(last)) if rows.len() as i64 >= pool => {
+                if first == last {
+                    log::warn!("Date-sorted search: {pool} keyword matches or more at one date ({last}), sorting {pool} of them");
+                    (last, rows)
+                } else {
+                    let edge = if newest_first { last + 1 } else { last - 1 };
+                    (edge, rows.into_iter().filter(|c| c.date_ms != last).collect())
                 }
-                _ => (end, rows),
-            };
-            keyword = rows.into();
-            keyword_edge = Some(edge);
-        }
+            }
+            _ => (end, rows),
+        };
 
         // --- Vector: the window's nearest pool, holding every match by meaning alone in it unless it is full of them ---
-        let edge = keyword_edge.expect("set above");
         let (window_lo, window_hi) = if newest_first { (edge, hi) } else { (lo, edge) };
-        let mut in_window = Vec::new();
-        while keyword.front().is_some_and(|c| !past(c.date_ms, edge)) {
-            in_window.extend(keyword.pop_front());
-        }
         let Ok(mut vectors) = vectors_within(window_lo, window_hi, pool, eligible) else { return Ok(None) };
         vector_searches += 1;
         let farthest = vectors.iter().map(|&(_, distance)| crate::fts::hybrid::cosine_distance_to_score(distance)).fold(f64::INFINITY, f64::min);
