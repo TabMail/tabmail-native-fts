@@ -5393,6 +5393,52 @@ pub(crate) mod tests {
         denied: usize,
     }
 
+    /// Whether a search of the email vectors has run, and how many later reads of them were refused.
+    struct VectorReadsAfterTheFirst {
+        armed: bool,
+        denied: usize,
+    }
+
+    unsafe extern "C" fn arm_after_a_vector_search(_event: std::os::raw::c_uint, context: *mut c_void, _stmt: *mut c_void, sql: *mut c_void) -> c_int {
+        if unsafe { CStr::from_ptr(sql as *const c_char) }.to_string_lossy().contains("FROM messages_vec WHERE") {
+            unsafe { &mut *(context as *mut VectorReadsAfterTheFirst) }.armed = true;
+        }
+        0
+    }
+
+    extern "C" fn deny_vector_reads_once_armed(
+        context: *mut c_void,
+        action: c_int,
+        table: *const std::os::raw::c_char,
+        _column: *const std::os::raw::c_char,
+        _db: *const std::os::raw::c_char,
+        _trigger: *const std::os::raw::c_char,
+    ) -> c_int {
+        let state = unsafe { &mut *(context as *mut VectorReadsAfterTheFirst) };
+        if state.armed && action == ffi::SQLITE_READ && !table.is_null() && unsafe { CStr::from_ptr(table) }.to_bytes() == b"messages_vec" {
+            state.denied += 1;
+            return ffi::SQLITE_DENY;
+        }
+        ffi::SQLITE_OK
+    }
+
+    /// Runs `run` with the first search of the email vectors answered and every later read of them
+    /// refused; returns its result and how many reads were refused.
+    fn with_vector_reads_failing_after_the_first<T>(conn: &Connection, run: impl FnOnce() -> T) -> (T, usize) {
+        let mut state = VectorReadsAfterTheFirst { armed: false, denied: 0 };
+        let context = &mut state as *mut VectorReadsAfterTheFirst as *mut c_void;
+        unsafe {
+            ffi::sqlite3_trace_v2(conn.handle(), ffi::SQLITE_TRACE_STMT as std::os::raw::c_uint, Some(arm_after_a_vector_search), context);
+            ffi::sqlite3_set_authorizer(conn.handle(), Some(deny_vector_reads_once_armed), context);
+        }
+        let result = run();
+        unsafe {
+            ffi::sqlite3_set_authorizer(conn.handle(), None, std::ptr::null_mut());
+            ffi::sqlite3_trace_v2(conn.handle(), 0, None, std::ptr::null_mut());
+        }
+        (result, state.denied)
+    }
+
     /// Refuses calls of the SQL function named in the `DeniedTable`.
     extern "C" fn deny_calls_of_function(
         context: *mut c_void,
@@ -5972,8 +6018,8 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(profile);
     }
 
-    /// A date sort reads 4,096 keyword candidates: with exactly that many matches, the newest
-    /// (oldest) one is found although it is the worst by keyword, so any smaller pool misses it.
+    /// A date sort with exactly a pool (4,096) of keyword matches finds the newest (oldest) one,
+    /// although it is the worst by keyword.
     /// One vector keeps the search hybrid (an index part way through its embedding rebuild).
     #[test]
     fn a_date_sort_reads_4096_keyword_candidates() {
@@ -6002,8 +6048,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// A date sort reads 4,096 vector candidates: with exactly that many, the newest (oldest) match
-    /// by meaning alone is found although it is the farthest, so any smaller pool misses it.
+    /// A date sort with exactly a pool (4,096) of matches by meaning finds the newest (oldest) one,
+    /// although it is the farthest.
     #[test]
     fn a_date_sort_reads_4096_vector_candidates() {
         let Some(engine) = embedding_engine() else { return };
@@ -6205,6 +6251,12 @@ pub(crate) mod tests {
                 let text_score = -all[i]["rank"].as_f64().unwrap() - to_score(similarity);
                 assert!(text_score > 0.0 && text_score < config::hybrid::EMAIL_TEXT_WEIGHT, "{sort}: {i}: the meaning counts ({text_score})");
             }
+            // The read of their own distances failing: the keyword-only answer, as when the vector
+            // search fails.
+            let params = serde_json::json!({ "ignoreDate": true, "limit": 10, "sort": sort });
+            let (results, denied) = with_vector_reads_failing_after_the_first(&conn, || search(&conn, "budget", &params, &SynonymLookup::new(), Some(&engine), &known_years));
+            assert!(denied > 0, "{sort}: the read was refused");
+            assert_eq!(results.unwrap(), search(&conn, "budget", &params, &SynonymLookup::new(), None, &known_years).unwrap(), "{sort}");
             drop(conn);
             let _ = std::fs::remove_dir_all(profile);
         }
@@ -6444,6 +6496,10 @@ pub(crate) mod tests {
             let hybrid = search(&conn, "budget", &params, &SynonymLookup::new(), Some(&engine), &known_years).unwrap();
             assert_eq!(hybrid.len(), 10, "{sort}");
             assert_eq!(hybrid, search(&conn, "budget", &params, &SynonymLookup::new(), None, &known_years).unwrap(), "{sort}");
+            // The check over the dates failing, after the window's search answered: the same.
+            let (results, denied) = with_vector_reads_failing_after_the_first(&conn, || search(&conn, "budget", &params, &SynonymLookup::new(), Some(&engine), &known_years));
+            assert!(denied > 0, "{sort}: the check was refused");
+            assert_eq!(results.unwrap(), hybrid, "{sort}");
         }
         drop(conn);
         let _ = std::fs::remove_dir_all(profile);

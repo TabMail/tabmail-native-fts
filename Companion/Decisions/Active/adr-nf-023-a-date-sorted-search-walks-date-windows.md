@@ -96,7 +96,8 @@ narrowing it replaces.
   pool is full reads the vectors once more: its keyword matches' own distances when the pool
   reaches above the threshold, or every vector in the window in one pass when the whole pool matches
   by meaning, which ends the walk. So no window reads the vectors more than twice, and only the
-  last is ever read whole (linear in its rows, at most the archive). Weak neighbours that are no
+  last is ever read whole (a scan of every vector's rowid, distances computed for the window's
+  rows: linear in the archive, once per search). Weak neighbours that are no
   matches cost nothing more however many there are, nor do strong ones however their dates lie.
 - Wire and tools unchanged; no capability (a client cannot tell an exact sort from a pooled one, and needs
   no different request).
@@ -123,7 +124,9 @@ narrowing it replaces.
 
 ## Evidence
 
-Unit tests, model loaded (red on 0.12.1 except the termination guard):
+Unit tests, model loaded. The exactness tests are red on 0.12.1; the termination, ends-of-time,
+stop-early, field-without-vector and one-date tests are green there too (they guard the walk's own
+failure modes):
 
 - `a_date_sorted_search_is_exact_past_the_keyword_pool`: 5,000 strong matches and a weak one newest
   (oldest), past the best 4,096 by keyword: the same list as a search by keyword only, and hybrid scores
@@ -134,7 +137,8 @@ Unit tests, model loaded (red on 0.12.1 except the termination guard):
   across two windows, the edge date's best match by keyword and meaning together first, found by keyword.
 - `a_date_sorted_search_scores_a_weak_meaning_past_the_vector_pool`: synthetic vectors at similarity 0.50
   (above the threshold, under `MIN_SCORE`) and two keyword matches at 0.48 and 0.47 past them: each
-  score counts its meaning, as when the dates hold only it.
+  score counts its meaning, as when the dates hold only it; with the read of their own distances
+  refused, the keyword-only answer.
 - `a_date_sorted_search_is_exact_past_a_pool_of_weak_matches_by_meaning`: 5,000 matches by meaning alone,
   each only just at `MIN_SCORE`: the true newest (oldest) 10, in order, without dates and within dates
   that leave out the first 100; with the one-pass read refused, the keyword-only answer.
@@ -142,7 +146,7 @@ Unit tests, model loaded (red on 0.12.1 except the termination guard):
 - `a_date_sort_with_a_pool_of_keyword_matches_at_one_date_answers`: 4,100 keyword matches at one
   millisecond; terminates, the older matches first in `date_asc`.
 - `a_date_sort_stopping_before_the_end_with_no_vector_within_the_dates_answers_by_keyword`: the k = 1
-  check over the dates finds no vector; the keyword-only answer.
+  check over the dates finds no vector, or fails; the keyword-only answer.
 - `search_whose_vector_leg_fails_answers_by_keyword` and
   `a_search_whose_date_lookup_fails_fails_and_the_next_is_answered`: with date sorts too.
 - `search_with_no_vector_within_the_dates_answers_by_keyword`: a date sort with no vector within the dates
