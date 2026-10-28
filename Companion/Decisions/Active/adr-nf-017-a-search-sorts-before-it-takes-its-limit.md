@@ -1,7 +1,8 @@
 # ADR-NF-017: A Search Sorts Before It Takes Its Limit
 
 **Status:** Accepted (2026-10-22, issue #46). Amends ADR-NF-013 (Thunderbird's own date sort) and
-ADR-NF-014 (the email keyword-only answer's order). The iOS app makes the same change in its own
+ADR-NF-014 (the email keyword-only answer's order). **Amended by ADR-NF-023 (2026-10-28, #47):** a date sort no longer
+sorts one pool per leg; it walks date windows, each with a full pool, so it is exact past 4,096 matches. The iOS app makes the same change in its own
 index (tabmail-ios#265); the callers then pass `sort` instead of sorting (tabmail-thunderbird#150,
 tabmail-ios#264).
 

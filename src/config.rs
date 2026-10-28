@@ -171,11 +171,19 @@ pub mod hybrid {
     pub const SEARCH_LIMIT_MAX: i64 = 512;
     const _: () = assert!(SEARCH_LIMIT_MAX * CANDIDATE_MULTIPLIER <= VEC_K_MAX);
 
-    // Candidates each leg of a date-sorted email search takes (ADR-NF-017): its matches are sorted
-    // by date from these, so a match outside the best `limit` x CANDIDATE_MULTIPLIER is still found.
-    // sqlite-vec's maximum, chosen by a study on a 300,000-message archive (2026-10-22): the first
-    // result was the truly newest match in every dated query set, at about the median cost of 2,048.
+    // Candidates each leg of a date-sorted email search takes per date window (ADR-NF-017, #47): its
+    // matches are sorted by date from these, so a match outside the best `limit` x
+    // CANDIDATE_MULTIPLIER is still found. sqlite-vec's maximum, chosen by a study on a
+    // 300,000-message archive (2026-10-22): the first result was the truly newest match in every
+    // dated query set, at about the median cost of 2,048.
     pub const DATE_SORT_POOL: i64 = VEC_K_MAX;
+
+    // When a date window's DATE_SORT_POOL nearest vectors are all matches by meaning, a date-sorted
+    // search narrows the window to the dates of the first this many of them in sort order, and
+    // searches it again (#47). At least the largest limit, so the narrowed window holds the limit
+    // and the walk ends there.
+    pub const DATE_WINDOW_NARROW_TO: usize = 1024;
+    const _: () = assert!(DATE_WINDOW_NARROW_TO as i64 >= SEARCH_LIMIT_MAX && DATE_WINDOW_NARROW_TO as i64 <= DATE_SORT_POOL);
 
     // Minimum combined score of a candidate found by meaning alone (filters noise). A keyword match
     // is a result whatever its score (#51).
