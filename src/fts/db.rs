@@ -2074,7 +2074,7 @@ pub fn find_by_header_message_id(conn: &Connection, account_id: &str, header_mes
 /// Count msgIds in the half-open key range [start_key, end_key).
 /// PK index range scan on the unsharded `message_ids` table — the caller
 /// (addon) computes the bounds; this function does NO msgId parsing.
-/// Used by the per-folder count-invariant reconcile (PLAN_FOLDER_SET_RECONCILE.md):
+/// Used by the addon's per-folder count-invariant reconcile (tabmail-thunderbird ADR-021):
 /// for a folder prefix `P = "<accountId>:<folderPath>:"`, the addon passes
 /// `start_key = P` and `end_key = P[..len-1] + ";"` (';' = ':'+1), which
 /// covers exactly that folder's keys — subfolder keys (".../INBOX/sub:...")
@@ -5683,7 +5683,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(profile);
     }
 
-    /// The topics of the release smoke test's rows (PLAN_RELEASE_1_10): every row says "we talked
+    /// The topics of the 1.10 release smoke test's rows: every row says "we talked
     /// about <topic> and the meeting notes".
     pub(crate) const COMMON_WORD_TOPICS: [&str; 8] = [
         "the quarterly budget review with finance", "a dentist appointment next week", "planning the team offsite in the mountains",

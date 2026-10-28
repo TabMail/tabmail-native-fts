@@ -1807,8 +1807,8 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Dispatch-layer tests for the msgId key-range RPCs (ADR-021 /
-    // PLAN_FOLDER_SET_RECONCILE.md). The db-layer semantics are covered in
+    // Dispatch-layer tests for the msgId key-range RPCs (tabmail-thunderbird
+    // ADR-021). The db-layer semantics are covered in
     // fts::db::tests; these pin the JSON-RPC surface the addon actually
     // talks to: method routing, param validation, envelope shape, and the
     // unknown-method error the addon's feature-detection relies on.
