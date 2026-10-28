@@ -52,33 +52,40 @@ deleted. The #46 query sets (24 generic phrases; 15 index words in 2-20% and 15 
 and 15 words each in 0.02-0.2% and 0.003-0.03% (a median of 120 and 28 matches without dates: fewer
 matches than the limit), no dates and the last 365 days, limit 100. The truth is every keyword match
 and every vector within the dates, merged and sorted. Base is main before this change (0.12.1), run
-once; the walk ran twice. Each search was warmed once, then timed. The machine was shared (load average
-5 to 15), so p95 over 15 or 24 queries (about the slowest query) is noisy.
+once; the walk (this decision) ran twice on the same copy. Each search was warmed once, then timed.
+The machine was shared (load average 6 to 13), so p95 over 15 or 24 queries (about the slowest query)
+is noisy.
 
 | Dates | Queries | first right, base / walk | all 100 exact, base / walk | p50 ms, base / walk | p95 ms, base / walk |
 |---|---|---|---|---|---|
-| no dates | generic phrases | 62-88% / 100% | 46-50% / 100% | 1,405-1,413 / 1,345-1,418 | 3,418-3,442 / 3,233-3,421 |
-| no dates | words in 2-20% | 40-60% / 100% | 0-7% / 100% | 2,360-2,367 / 2,130-2,191 | 6,876-6,897 / 5,438-8,895 |
-| no dates | words in 0.2-2% | 93-100% / 100% | 87% / 100% | 720-812 / 718-747 | 1,444-1,457 / 1,443-1,474 |
-| no dates | words in 0.02-0.2% | 100% / 100% | 100% / 100% | 589-594 / 590-597 | 676 / 678-719 |
-| no dates | words in 0.003-0.03% | 100% / 100% | 100% / 100% | 582-583 / 579-592 | 690-691 / 690-700 |
-| last 365 days | generic phrases | 100% / 100% | 96% / 100% | 315-318 / 314-337 | 557-558 / 563-576 |
-| last 365 days | words in 2-20% | 93-100% / 100% | 80% / 100% | 368-389 / 361-371 | 846-885 / 745-892 |
-| last 365 days | words in 0.2-2% | 100% / 100% | 100% / 100% | 265-268 / 263-273 | 337-339 / 335-345 |
-| last 365 days | words in 0.02-0.2% | 100% / 100% | 100% / 100% | 257-258 / 258-260 | 267-285 / 265-289 |
-| last 365 days | words in 0.003-0.03% | 100% / 100% | 100% / 100% | 255 / 256-260 | 270-278 / 267-338 |
+| no dates | generic phrases | 62-88% / 100% | 46-50% / 100% | 1,392-1,395 / 1,337-1,462 | 3,356-3,377 / 3,174-3,270 |
+| no dates | words in 2-20% | 40-60% / 100% | 0-7% / 100% | 2,330-2,371 / 2,127-2,158 | 6,761-6,802 / 5,450-7,343 |
+| no dates | words in 0.2-2% | 93-100% / 100% | 87% / 100% | 716-724 / 723-739 | 1,424-1,427 / 1,447-1,478 |
+| no dates | words in 0.02-0.2% | 100% / 100% | 100% / 100% | 576-577 / 601-605 | 670-695 / 680-689 |
+| no dates | words in 0.003-0.03% | 100% / 100% | 100% / 100% | 568-570 / 585-605 | 672-676 / 693-745 |
+| last 365 days | generic phrases | 100% / 100% | 96% / 100% | 313 / 316-322 | 550-555 / 561-580 |
+| last 365 days | words in 2-20% | 93-100% / 100% | 80% / 100% | 362 / 368-381 | 830-838 / 731-874 |
+| last 365 days | words in 0.2-2% | 100% / 100% | 100% / 100% | 262-266 / 270-273 | 335-336 / 341-371 |
+| last 365 days | words in 0.02-0.2% | 100% / 100% | 100% / 100% | 256 / 259-262 | 265-270 / 268-324 |
+| last 365 days | words in 0.003-0.03% | 100% / 100% | 100% / 100% | 257 / 257-265 | 279-283 / 264-592 |
 
-Ranges are over `date_desc` and `date_asc` (and the walk's two runs). The 8,895 ms p95 is one query in
-the first walk run, at a load average of 14; the second run's was 7,355. Relevance, unchanged, for
-scale: no dates 1.2 to 1.5 s median. The first version of the walk (completeness at the threshold, see
-Rejected) measured the same on this archive: its weak-neighbour band is not dense enough here to cost
-it more windows.
+Ranges are over `date_desc` and `date_asc` (and the walk's two runs). The 592 ms p95 is one query in
+one run; the other run's was 273. Relevance, unchanged, for scale: no dates 1.2 to 1.5 s median. The
+one-pass read of a window (decision 2) fired in none of these searches: no window's nearest 4,096
+were all matches by meaning. Each earlier version of the walk measured the same on this archive
+(completeness at the threshold, and narrowing a window full of matches; see Rejected): neither's
+costly case is dense in this mail.
 
 The walk is exact in every set and costs about what today's single date-sorted query costs: medians
-within about 10% either way (lower for common words without dates), p95 within the noise between
-runs. So every date sort walks; there is no separate interactive path. No interactive caller sends
-`sort` (Thunderbird's only caller is the agent's `email_search`; Voice does not search email), and
-relevance search is unchanged.
+within about 6% either way (lower for common words without dates, up to 35 ms higher for the rarest
+words without dates), p95 within the noise between runs. So every date sort walks; there is no
+separate interactive path. No interactive caller sends `sort` (Thunderbird's only caller is the
+agent's `email_search`; Voice does not search email), and relevance search is unchanged.
+
+On synthetic mail where every vector is a match by meaning and the nearer lie farther from the sort's
+start (160,000 messages, no keyword match, limit 100), the walk reads the whole archive once: about
+1.0 s for either sort, against 0.22 s for base's single pool (inexact there) and about 5.8 s for the
+narrowing it replaces.
 
 ## Consequences
 
@@ -110,7 +117,7 @@ relevance search is unchanged.
   each search drops only about 3,072 of them, so the walk costs a full vector search per 3,072
   matches. On a synthetic 160,000-message fixture with every vector a match and the older nearer,
   `date_desc` took 52 searches and about 5.8 s against 0.22 s for the single pool (found in
-  review). Narrowing by halves would bound it at about log2 of the window over 1,024 searches,
+  review); this decision answers it in about 1.0 s, one pass. Narrowing by halves would bound it at about log2 of the window over 1,024 searches,
   still several; one pass over the window reads every distance exactly and deletes the narrowing.
 - A separate interactive single-query path: the walk measured no slower, and no interactive caller sorts.
 
@@ -126,10 +133,11 @@ Unit tests, model loaded (red on 0.12.1 except the termination guard):
 - `a_date_window_holds_every_match_at_its_edge_date`: 10 matches, 4,091 at one date, 100 after; the limit
   across two windows, the edge date's best match by keyword and meaning together first, found by keyword.
 - `a_date_sorted_search_scores_a_weak_meaning_past_the_vector_pool`: synthetic vectors at similarity 0.50
-  (above the threshold, under `MIN_SCORE`) and a keyword match at 0.48 past them: its score counts its
-  meaning, as when the dates hold only it.
+  (above the threshold, under `MIN_SCORE`) and two keyword matches at 0.48 and 0.47 past them: each
+  score counts its meaning, as when the dates hold only it.
 - `a_date_sorted_search_is_exact_past_a_pool_of_weak_matches_by_meaning`: 5,000 matches by meaning alone,
-  each only just at `MIN_SCORE`: the true newest (oldest) 10, in order.
+  each only just at `MIN_SCORE`: the true newest (oldest) 10, in order, without dates and within dates
+  that leave out the first 100; with the one-pass read refused, the keyword-only answer.
 - `a_date_sort_with_a_pool_of_matches_at_one_date_answers`: 4,100 vectors at one millisecond; terminates.
 - `a_date_sort_with_a_pool_of_keyword_matches_at_one_date_answers`: 4,100 keyword matches at one
   millisecond; terminates, the older matches first in `date_asc`.
@@ -139,11 +147,19 @@ Unit tests, model loaded (red on 0.12.1 except the termination guard):
   `a_search_whose_date_lookup_fails_fails_and_the_next_is_answered`: with date sorts too.
 - `search_with_no_vector_within_the_dates_answers_by_keyword`: a date sort with no vector within the dates
   is the keyword-only answer, scores and all.
-- Mutants (the review's mutation ledger), on the final code: 19 detected (keyword pool by rank, the edge
-  date kept partial or its rows not kept, a full keyword pool counted strictly, the keyword pool never
-  fetched again, a millisecond skipped between windows, completeness always or loosened, no own-distance
-  read, no existence check either way or its empty answer kept hybrid, merge limit per window, one
-  window only, no break or no forced progress at one date, a keyword pool at one date not kept, a
-  vector search failure or a date lookup failure handled otherwise); 2 equivalent (completeness at the
-  threshold, the first version: the same answers at the cost under Rejected; narrowing to the pool's
-  farthest date: more vector searches, the same answers).
+- `a_date_sort_reads_the_vectors_a_bounded_number_of_times_however_many_match_by_meaning`: 13,000
+  matches by meaning, the nearer the farther from the sort's start: the true newest (oldest) 10, each
+  score its own, and the vectors read at most twice (four times with the narrowing).
+- `a_date_sort_at_the_ends_of_time_answers_nothing_outside_its_dates`: from the last instant or to the
+  first, nothing.
+- `a_field_scoped_date_sort_past_a_pool_of_matches_by_meaning_answers_only_the_field` and
+  `a_field_scoped_date_sort_with_no_vector_in_the_field_answers_by_keyword`.
+- Mutants (the review's mutation ledger), on the final code: 26 detected (among them the keyword pool
+  by rank, the edge date kept partial or its rows not kept, a full keyword pool counted strictly, a
+  millisecond skipped between windows, the edge at the pool's last date, no one-pass read or a
+  loosened one, the read without the dates or the field, the own-distance read for one row, no
+  existence check either way or without the field or the dates, its empty answer kept hybrid, merge
+  limit per window, one window only, no progress at one date, either date bound open at both ends, a
+  failed read, vector search or date lookup handled otherwise); 3 equivalent, costing more for the
+  same answers (the one-pass read already at the threshold, the farthest taken as the nearest, a short
+  keyword pool's window ending at its last match).
