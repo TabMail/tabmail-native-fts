@@ -143,7 +143,7 @@ cd tabmail-native-fts && cargo test
 **Default action: run the release end-to-end from this skill.** Request scoped escalated execution for operations that need host keychain access or network access: commit signing, push, macOS notarization, GitHub release creation, and GitHub Actions triggers. There is no manual step unless approval is denied or the required signing key is unavailable.
 
 ```bash
-cd /Users/kwang/Work/GitData/tabmail/tabmail-release-helpers/tb-native-fts
+cd tabmail-release-helpers/tb-native-fts
 ./maintenance.sh --release
 ```
 Run with scoped escalated execution after obtaining approval. This script is the single source of truth — don't hand-roll any of its steps.
