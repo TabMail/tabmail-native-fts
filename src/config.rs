@@ -171,10 +171,10 @@ pub mod hybrid {
     pub const SEARCH_LIMIT_MAX: i64 = 512;
     const _: () = assert!(SEARCH_LIMIT_MAX * CANDIDATE_MULTIPLIER <= VEC_K_MAX);
 
-    // Candidates each leg of a date-sorted email search takes (ADR-NF-017): its matches are sorted
-    // by date from these, so a match outside the best `limit` x CANDIDATE_MULTIPLIER is still found.
-    // sqlite-vec's maximum, chosen by a study on a 300,000-message archive (2026-10-22): the first
-    // result was the truly newest match in every dated query set, at about the median cost of 2,048.
+    // Candidates each leg of a date-sorted email search takes per date window (ADR-NF-017,
+    // ADR-NF-023): a window holds about this many matches, so a larger pool walks fewer windows.
+    // sqlite-vec's maximum; a single pool of it cost about what one of 2,048 did on a
+    // 300,000-message archive (2026-10-22).
     pub const DATE_SORT_POOL: i64 = VEC_K_MAX;
 
     // Minimum combined score of a candidate found by meaning alone (filters noise). A keyword match

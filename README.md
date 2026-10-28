@@ -134,9 +134,10 @@ listing (no query) returns the page asked for. See ADR-NF-013.
 `search` takes an optional `sort`: `relevance` (the default), `date_desc` or `date_asc`; any
 other value is refused. The helper sorts the matches, then takes `limit`: the best matches first
 (equal ones newer first), or the newest or oldest matches (equal dates the better match first). A
-date sort picks its matches from 4,096 candidates per leg, so narrow a common word by dates. A query
-of only fields (`from:"alice@example.com"`) is answered by keyword over every match, newest first
-by default. Memory search orders equal matches newer first. See ADR-NF-017. Helpers with `sort` advertise `capabilities.searchSortV1` in `hello`.
+date sort walks the dates in windows from the end it starts at, so it is exact however many matches
+there are (ADR-NF-023). A query of only fields (`from:"alice@example.com"`) is answered by keyword
+over every match, newest first by default. Memory search orders equal matches newer first. See
+ADR-NF-017. Helpers with `sort` advertise `capabilities.searchSortV1` in `hello`.
 
 Each Thunderbird profile gets its own isolated FTS and memory databases.
 
