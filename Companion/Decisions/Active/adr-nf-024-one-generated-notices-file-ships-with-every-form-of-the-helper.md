@@ -34,9 +34,12 @@ It also downloads the all-MiniLM-L6-v2 model. No distributed form carried their 
   - the Rust standard library;
   - the model, its MIT base model (Microsoft MiniLM) and BERT's vocabulary;
   - the source offer for the helper itself (MPL-2.0 §3.2).
-- **Check.** `scripts/check-third-party-notices.py` (stdlib; `cargo tree --offline --locked` over about.toml's targets) fails when the file:
+- **Check.** `scripts/check-third-party-notices.py` (stdlib; `cargo tree --locked` over all of about.toml's targets at once) fails when the file:
   - misses a shipped crate at its exact version;
-  - holds cargo-about's generic MIT/BSD placeholders.
+  - holds cargo-about's generic MIT/BSD placeholders;
+  - has a license section with no text.
+
+  The query is not `--offline`: a release builder has cached only its own platform's crates, so an offline query over all six targets fails on a fresh cache. Cargo fetches the rest.
 
   It runs in the tests, and the release scripts run it before building.
 - **Shipping.** The file ships next to the helper in every installer and is uploaded next to every update binary. Voice ships it from its pinned checkout as-is.

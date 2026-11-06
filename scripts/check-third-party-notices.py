@@ -10,8 +10,9 @@ graph (Cargo.lock, no build or dev dependencies) must appear in the notices file
 lists at its exact version. The file must also hold no unfilled license template, which is what
 cargo-about writes when it cannot find a crate's own license file.
 
-Run it after any Cargo.lock change, and before a release. It needs the crates already fetched
-(it runs `cargo tree --offline --locked`); it does not need cargo-about.
+Run it after any Cargo.lock change, and before a release. It runs `cargo tree --locked` for all
+the targets at once, so Cargo fetches any crate a target needs that is not yet in the local cache
+(a build for one platform caches only that platform's crates). It does not need cargo-about.
 """
 
 from __future__ import annotations
@@ -47,7 +48,7 @@ def targets(root: Path) -> list[str]:
 def shipped_crates(root: Path, target_list: list[str]) -> set[str]:
     cargo = os.environ.get("CARGO", "cargo")
     command = [cargo, "tree", "--edges", "normal", "--prefix", "none", "--format", "{p}",
-               "--locked", "--offline", "--manifest-path", str(root / "Cargo.toml")]
+               "--locked", "--manifest-path", str(root / "Cargo.toml")]
     for target in target_list:
         command += ["--target", target]
     result = subprocess.run(command, capture_output=True, text=True)
@@ -63,6 +64,24 @@ def shipped_crates(root: Path, target_list: list[str]) -> set[str]:
     return crates
 
 
+# Each license section in part 2 of the notices (about.hbs): a rule, the license name, the "Used by"
+# list, a second rule, then the license's full text.
+PART_2 = "PART 2. RUST CRATES"
+SECTION_RULE = "=" * 80
+TEXT_RULE = "-" * 80
+
+
+def sections_without_text(notices: str) -> list[str]:
+    """The names of the license sections whose text is empty."""
+    empty = []
+    for section in notices.partition(PART_2)[2].split(SECTION_RULE)[1:]:
+        name = section.strip().splitlines()[0] if section.strip() else "?"
+        head, rule, text = section.partition(TEXT_RULE)
+        if not rule or not text.strip():
+            empty.append(name)
+    return empty
+
+
 def credited_crates(notices: str) -> set[str]:
     return {f"{m.group(1)} {m.group(2)}" for m in re.finditer(r"^- (\S+) (\d\S*)", notices, re.M)}
 
@@ -74,6 +93,9 @@ def problems(notices: str, shipped: set[str]) -> list[str]:
     if found:
         result.append(f"it holds an unfilled license template ({', '.join(found)}); add a "
                       "clarification for that crate to about.toml and generate the file again")
+    empty = sections_without_text(notices)
+    if empty:
+        result.append(f"these licenses have no text: {', '.join(empty)}; generate the file again")
     missing = sorted(shipped - credited_crates(notices))
     if missing:
         result.append(f"it does not credit: {', '.join(missing)}; run "
