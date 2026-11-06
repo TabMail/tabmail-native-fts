@@ -18,6 +18,8 @@ Changes, and nothing else:
 - `src/layout.rs`, `src/quantized/mod.rs`, `src/safetensors.rs`, `src/tensor.rs`: the elided
   lifetimes are written out (`'_`) so the crate builds without warnings on current Rust. Signatures
   only.
+- `LICENSE-MIT`: added, a copy of candle's own MIT file (`LICENSE-MIT` at the same upstream commit),
+  so the third-party notices reproduce candle's MIT text.
 - The crate's own `Cargo.lock` and Cargo's extraction marker were left out; Cargo does not read
   them for a dependency.
 

@@ -1,0 +1,206 @@
+# cargo-about configuration for THIRD_PARTY_NOTICES.txt (generate with scripts/generate-third-party-notices.sh).
+# Licenses in order of preference: for a crate offered under a choice of licenses, the first accepted one
+# is the one whose text is reproduced.
+accepted = [
+    "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause",
+    "ISC", "Zlib", "BSL-1.0", "Unicode-3.0", "CDLA-Permissive-2.0", "MPL-2.0",
+    "Unlicense", "0BSD", "BSD-1-Clause", "LGPL-2.1", "blessing",
+]
+# Every target the helper is released for: Thunderbird (macOS universal, Windows x64, Linux x64) and
+# TabMail Voice's voice-memory (macOS, Windows and Linux, x64 and arm64).
+targets = [
+    "aarch64-apple-darwin", "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
+]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Clarifications: crates that ship no license file, or one the scanner cannot read, so that the notice
+# reproduces the real file (with its copyright line) instead of a generic license template. Each file is
+# pinned by its SHA-256; a changed file makes the generator fail rather than fall back.
+
+# ring: ISC for its own code, Apache-2.0 for code from BoringSSL, MIT for code from once_cell.
+[ring.clarify]
+license = "Apache-2.0 AND ISC AND MIT"
+[[ring.clarify.files]]
+path = "LICENSE-other-bits"
+license = "ISC"
+checksum = "f025ccfb7dfb6bdfedc75ca0f67acc69e6fb4998143d834f7c2f38a29989680f"
+[[ring.clarify.files]]
+path = "LICENSE-BoringSSL"
+license = "Apache-2.0"
+checksum = "005fc765ddc5115da796cca915baa9557abae13ff35e0a47c47affc56f6c414d"
+[[ring.clarify.files]]
+path = "src/polyfill/once_cell/LICENSE-MIT"
+license = "MIT"
+checksum = "6ee2ed6c77710de911761acd5fc1ad1da00f476beb1a7ef27e78c2d1858deafc"
+
+# onig_sys compiles the bundled Oniguruma C library (BSD-2-Clause) next to its own MIT bindings.
+[onig_sys.clarify]
+license = "MIT AND BSD-2-Clause"
+[[onig_sys.clarify.files]]
+path = "LICENSE.md"
+license = "MIT"
+checksum = "71f321038b088358004bee991635ac09e4c703bec467d3c30c06992c0595f189"
+[[onig_sys.clarify.files]]
+path = "oniguruma/COPYING"
+license = "BSD-2-Clause"
+checksum = "70ba5469ea0bab6e18a32d7009068f996503168d27be57747e08da34337ff26f"
+
+# libsqlite3-sys compiles the bundled SQLite amalgamation, which is in the public domain (the SQLite blessing).
+[libsqlite3-sys.clarify]
+license = "MIT AND blessing"
+[[libsqlite3-sys.clarify.files]]
+path = "LICENSE"
+license = "MIT"
+checksum = "f59ba65550f2a5adff98ec6478d783402c8e0a3eb515025c0b3438f3d30dc39e"
+[[libsqlite3-sys.clarify.files]]
+path = "sqlite3/sqlite3.c"
+license = "blessing"
+checksum = "ad89cf5f9a0ca133418eae187ae954f2805fd3261aa00716642ed93fc7f3892d"
+start = "** The author disclaims copyright to this source code."
+end = "**    May you share freely, never taking more than you give.\n"
+
+# sqlite-vec compiles its C extension; the crate ships no license file (and no commit record), so the
+# MIT file comes from its repository at the release tag.
+[sqlite-vec.clarify]
+license = "MIT OR Apache-2.0"
+override-git-commit = "v0.1.9"
+[[sqlite-vec.clarify.git]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "6ce72bbe12d975bd5286e5ab0a064c069693300c47bccbc57bec18485f1621ea"
+
+# candle and ug ship no license file; their MIT files come from their repositories.
+[candle-nn.clarify]
+license = "MIT OR Apache-2.0"
+[[candle-nn.clarify.git]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+
+[candle-transformers.clarify]
+license = "MIT OR Apache-2.0"
+[[candle-transformers.clarify.git]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+
+[ug.clarify]
+license = "MIT OR Apache-2.0"
+[[ug.clarify.git]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+
+# The vendored candle-core (vendor/candle-core) carries a copy of candle's LICENSE-MIT from the commit
+# it was published from (vendor/candle-core/TABMAIL-PATCHES.md).
+[candle-core.clarify]
+license = "MIT OR Apache-2.0"
+[[candle-core.clarify.files]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+
+[chrono.clarify]
+license = "MIT OR Apache-2.0"
+[[chrono.clarify.files]]
+path = "LICENSE.txt"
+license = "MIT"
+checksum = "35c9cd46d70a8683aff27bde25523d90156d8779823eb2c303b996b5a0091931"
+start = "Rust-chrono is dual-licensed"
+end = "THE SOFTWARE.\n"
+
+[libm.clarify]
+license = "MIT"
+[[libm.clarify.files]]
+path = "LICENSE.txt"
+license = "MIT"
+checksum = "3823dda7cf046602f4b4e77ec8e227863dc4736037cc85bb33d9f19febe16bb7"
+
+[curve25519-dalek.clarify]
+license = "BSD-3-Clause"
+[[curve25519-dalek.clarify.files]]
+path = "LICENSE"
+license = "BSD-3-Clause"
+checksum = "cca0bd3c4fcdba74145ef9d49c62337e2c9fbf9368288f11d0547f1b0273219f"
+
+# The windows crates indent their license-mit file, which the scanner does not recognise.
+
+[windows-core.clarify]
+license = "MIT OR Apache-2.0"
+[[windows-core.clarify.files]]
+path = "license-mit"
+license = "MIT"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows-implement.clarify]
+license = "MIT OR Apache-2.0"
+[[windows-implement.clarify.files]]
+path = "license-mit"
+license = "MIT"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows-interface.clarify]
+license = "MIT OR Apache-2.0"
+[[windows-interface.clarify.files]]
+path = "license-mit"
+license = "MIT"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows-link.clarify]
+license = "MIT OR Apache-2.0"
+[[windows-link.clarify.files]]
+path = "license-mit"
+license = "MIT"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows-result.clarify]
+license = "MIT OR Apache-2.0"
+[[windows-result.clarify.files]]
+path = "license-mit"
+license = "MIT"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows-strings.clarify]
+license = "MIT OR Apache-2.0"
+[[windows-strings.clarify.files]]
+path = "license-mit"
+license = "MIT"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows-sys.clarify]
+license = "MIT OR Apache-2.0"
+[[windows-sys.clarify.files]]
+path = "license-mit"
+license = "MIT"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows-targets.clarify]
+license = "MIT OR Apache-2.0"
+[[windows-targets.clarify.files]]
+path = "license-mit"
+license = "MIT"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows_aarch64_msvc.clarify]
+license = "MIT OR Apache-2.0"
+[[windows_aarch64_msvc.clarify.files]]
+path = "license-mit"
+license = "MIT"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows_x86_64_gnu.clarify]
+license = "MIT OR Apache-2.0"
+[[windows_x86_64_gnu.clarify.files]]
+path = "license-mit"
+license = "MIT"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows_x86_64_msvc.clarify]
+license = "MIT OR Apache-2.0"
+[[windows_x86_64_msvc.clarify.files]]
+path = "license-mit"
+license = "MIT"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"

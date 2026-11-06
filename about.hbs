@@ -1,0 +1,122 @@
+THIRD-PARTY SOFTWARE NOTICES
+TabMail Native FTS helper (fts_helper; in TabMail Voice it is named voice-memory)
+================================================================================
+
+The TabMail Native FTS helper is open source under the Mozilla Public License 2.0. Its source code
+is at https://github.com/TabMail/tabmail-native-fts.
+
+It is built with the open-source software listed below. This file gives each component's
+copyright notice and the full text of its license, as those licenses require. It covers every
+platform the helper is released for (macOS, Windows and Linux, x64 and arm64), so a given build may
+contain only part of it.
+
+This file is generated from Cargo.lock by scripts/generate-third-party-notices.sh. Do not edit it
+by hand; change about.hbs or about.toml and generate it again.
+
+
+PART 1. COMPONENTS NOT LISTED BY CRATE
+--------------------------------------
+
+The Rust standard library
+    Compiled into the helper. Licensed under the MIT License or the Apache License 2.0, at your
+    choice. Source: https://github.com/rust-lang/rust
+
+    Copyright (c) The Rust Project Contributors
+
+    Permission is hereby granted, free of charge, to any
+    person obtaining a copy of this software and associated
+    documentation files (the "Software"), to deal in the
+    Software without restriction, including without
+    limitation the rights to use, copy, modify, merge,
+    publish, distribute, sublicense, and/or sell copies of
+    the Software, and to permit persons to whom the Software
+    is furnished to do so, subject to the following
+    conditions:
+
+    The above copyright notice and this permission notice
+    shall be included in all copies or substantial portions
+    of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+    ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+    TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+    PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+    SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+    CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+    OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+    IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+
+all-MiniLM-L6-v2 (sentence embedding model and its tokenizer)
+    Not included in the helper or its installers: the helper downloads model.safetensors,
+    tokenizer.json and config.json from https://cdn.tabmail.ai/releases/models/all-MiniLM-L6-v2/
+    the first time semantic search is used. The files are not modified.
+    Source: https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+    Authors: Nils Reimers and the Sentence Transformers team (https://www.sbert.net).
+    License: Apache License 2.0 (the full text is in Part 2, under "Apache License 2.0").
+    Reference: Nils Reimers and Iryna Gurevych, "Sentence-BERT: Sentence Embeddings using
+    Siamese BERT-Networks", EMNLP 2019, https://arxiv.org/abs/1908.10084
+
+    Base model: nreimers/MiniLM-L6-H384-uncased, a 6-layer version of Microsoft's MiniLM
+    (https://huggingface.co/microsoft/MiniLM-L12-H384-uncased,
+    https://github.com/microsoft/unilm), under the MIT License:
+
+    The MIT License (MIT)
+
+    Copyright (c) Microsoft Corporation
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+    The tokenizer's vocabulary is BERT's uncased WordPiece vocabulary
+    (https://github.com/google-research/bert), under the Apache License 2.0 (text in Part 2).
+
+Compiled-in C code
+    These are listed in Part 2 under the Rust crate that compiles them:
+    - SQLite (public domain; libsqlite3-sys, under "SQLite Blessing");
+    - sqlite-vec by Alex Garcia (MIT; the sqlite-vec crate);
+    - Oniguruma by K.Kosako (BSD 2-Clause; onig_sys);
+    - code from BoringSSL and OpenSSL in ring (Apache License 2.0 and ISC; ring).
+
+Mozilla's root certificates
+    The webpki-roots crate carries Mozilla's list of trusted root certificates, under the
+    Community Data License Agreement Permissive 2.0 (text in Part 2).
+
+
+PART 2. RUST CRATES
+-------------------
+
+Licenses used, with the number of crates under each:
+{{#each overview}}
+- {{{name}}} ({{count}})
+{{/each}}
+
+Where a crate is offered under a choice of licenses, the text below is the license chosen for this
+distribution.
+{{#each licenses}}
+
+================================================================================
+{{{name}}}
+Used by:
+{{#each used_by}}
+- {{{crate.name}}} {{crate.version}}{{#if crate.repository}} ({{{crate.repository}}}){{/if}}
+{{/each}}
+--------------------------------------------------------------------------------
+
+{{{text}}}
+{{/each}}
