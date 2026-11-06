@@ -39,6 +39,25 @@ pub mod update {
     pub const STAGED_SUFFIX: &str = ".new";
 
     pub const DOWNLOAD_TIMEOUT_SECS: u64 = 30;
+
+    /// The third-party notices file every installer puts next to the helper (ADR-NF-024).
+    pub const NOTICES_FILE_NAME: &str = "fts_helper-THIRD_PARTY_NOTICES.txt";
+
+    /// The line start under which the notices credit the helper itself at its version.
+    pub const NOTICES_HELPER_CREDIT_PREFIX: &str = "- tabmail-native-fts ";
+
+    /// Run with this as its only argument, the helper writes its compiled-in notices to
+    /// stdout and exits. The updater reads a downloaded helper's notices this way.
+    pub const PRINT_NOTICES_ARG: &str = "--print-third-party-notices";
+
+    /// How long the updater waits for a downloaded helper to print its notices.
+    pub const NOTICES_READ_TIMEOUT_SECS: u64 = 30;
+
+    /// How often the updater checks whether that helper has exited.
+    pub const NOTICES_READ_POLL_MS: u64 = 20;
+
+    /// The installed notices are kept under this suffix while an update replaces them.
+    pub const NOTICES_BACKUP_SUFFIX: &str = ".backup";
 }
 
 pub mod sqlite {
