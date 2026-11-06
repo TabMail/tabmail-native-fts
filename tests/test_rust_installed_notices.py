@@ -331,9 +331,14 @@ class TestUpdateRequestInstallsTheNotices(_HelperFolder):
 
     def test_an_update_whose_build_credits_another_version_leaves_the_pair_alone(self):
         installed = self.exe.read_bytes()
-        # Pins the installed pair only: whether the helper answers or exits on a refused update
-        # is #64's to settle.
-        self._update(VERSION + ".1", after_init=False, answered=False)
+        # The served build is a copy of the installed one, so bytes alone cannot show a swap.
+        before = os.stat(self.exe)
+        # Whether the helper answers with an error or exits on a refused update is #64's to
+        # settle; it must never report success.
+        resp, _ = self._update(VERSION + ".1", after_init=False, answered=False)
+        self.assertFalse(resp is not None and resp.get("result", {}).get("success") is True, resp)
+        after = os.stat(self.exe)
+        self.assertEqual((after.st_ino, after.st_mtime_ns), (before.st_ino, before.st_mtime_ns))
         self.assertEqual(self.exe.read_bytes(), installed)
         self.assertEqual(self._notices(), self.old_notices)
         self.assertEqual([p.name for p in self.bin.iterdir() if p.name.endswith(".new")], [])
