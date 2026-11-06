@@ -72,7 +72,7 @@ fn real_main() -> anyhow::Result<()> {
     // Special mode used by Windows self-update: run as a short-lived helper that swaps files.
     // This must happen BEFORE we start native-messaging framing.
     if let Some(apply) = self_update::parse_apply_update_args(&args)? {
-        return self_update::apply_update_mode(&apply.target, &apply.staged, apply.staged_notices.as_deref());
+        return self_update::apply_update_mode(&apply.target, &apply.staged, &apply.staged_notices);
     }
 
     // Register sqlite-vec as an auto-extension before any DB connections are opened.

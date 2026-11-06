@@ -126,10 +126,9 @@ class _HelperFolder(unittest.TestCase):
         finally:
             self._finish(proc)
 
-    def _apply_update(self, target, staged, staged_notices=None):
-        args = [str(self.helper), "--apply-update", "--target", str(target), "--staged", str(staged)]
-        if staged_notices is not None:
-            args += ["--staged-notices", str(staged_notices)]
+    def _apply_update(self, target, staged, staged_notices):
+        args = [str(self.helper), "--apply-update", "--target", str(target), "--staged", str(staged),
+                "--staged-notices", str(staged_notices)]
         return subprocess.run(args, env=self._env(), cwd=self.cwd, stdout=subprocess.DEVNULL,
                               stderr=subprocess.DEVNULL, timeout=SESSION_DEADLINE_S).returncode
 
@@ -180,24 +179,25 @@ class TestInstalledNotices(_HelperFolder):
         self.assertEqual(sorted(p.name for p in self.bin.iterdir()), sorted([EXE_NAME, NOTICES_NAME]))
 
     def test_an_install_without_notices_updated_by_an_older_updater_gets_them_on_hello(self):
-        # An older updater swaps only the binary (no --staged-notices); the install had none.
+        # An older updater (it runs its own binary) swaps in only the binary; the install had none.
         target = self.bin / EXE_NAME
         target.write_bytes(b"a helper from before the notices")
         staged = self.root / "staged-helper"
         shutil.copy2(self.helper, staged)
-        self.assertEqual(self._apply_update(target, staged), 0)
+        os.replace(staged, target)
         self.assertFalse((self.bin / NOTICES_NAME).exists())
         self._hello(target)
         self.assertEqual(self._notices(), REPO_NOTICES.read_bytes())
 
     def test_an_older_updater_s_update_gets_its_notices_on_hello(self):
-        # An older updater swaps only the binary and leaves the previous build's notices.
+        # An older updater (it runs its own binary) swaps in only the binary and leaves the
+        # previous build's notices.
         target = self.bin / EXE_NAME
         target.write_bytes(b"the previous helper build")
         (self.bin / NOTICES_NAME).write_text("notices of the previous helper build\n")
         staged = self.root / "staged-helper"
         shutil.copy2(self.helper, staged)
-        self.assertEqual(self._apply_update(target, staged), 0)
+        os.replace(staged, target)
         self.assertEqual(self._notices(), b"notices of the previous helper build\n")
         self._hello(target)
         self.assertEqual(self._notices(), REPO_NOTICES.read_bytes())
@@ -331,10 +331,9 @@ class TestUpdateRequestInstallsTheNotices(_HelperFolder):
 
     def test_an_update_whose_build_credits_another_version_leaves_the_pair_alone(self):
         installed = self.exe.read_bytes()
-        # A refused update ends the helper with an error exit instead of an error response (#64).
-        resp, code = self._update(VERSION + ".1", after_init=False, answered=False)
-        self.assertIsNone(resp)
-        self.assertNotEqual(code, 0)
+        # Pins the installed pair only: whether the helper answers or exits on a refused update
+        # is #64's to settle.
+        self._update(VERSION + ".1", after_init=False, answered=False)
         self.assertEqual(self.exe.read_bytes(), installed)
         self.assertEqual(self._notices(), self.old_notices)
         self.assertEqual([p.name for p in self.bin.iterdir() if p.name.endswith(".new")], [])

@@ -285,11 +285,20 @@ fn commit_pair(
     Ok(())
 }
 
-/// Stages the downloaded helper's notices next to `target` and installs them with the binary.
-/// On Unix the pair is committed here; on Windows the apply-update process does it once this
-/// process has exited. A failure before the commit removes both staged files and leaves the
-/// installed pair as it was. Returns whether the helper must restart to finish the update.
-fn install_downloaded(target: &Path, staged: &Path, version: &str) -> anyhow::Result<bool> {
+/// Where a downloaded update is swapped in.
+enum Apply<'a> {
+    /// In this process (Unix: a running binary can be replaced).
+    Here,
+    /// In an apply-update process started from a copy of `current`, this helper's own binary,
+    /// once this process has exited (Windows: a running binary cannot be replaced).
+    AfterExit { current: &'a Path },
+}
+
+/// Stages the downloaded helper's notices next to `target` and installs them with the binary,
+/// here or in the apply-update process (`apply`). A failure before the commit removes both
+/// staged files and leaves the installed pair as it was. Returns whether the helper must
+/// restart to finish the update.
+fn install_downloaded(target: &Path, staged: &Path, version: &str, apply: Apply<'_>) -> anyhow::Result<bool> {
     let notices = notices_beside(target)?;
     let staged_notices = with_suffix(&notices, config::update::STAGED_SUFFIX);
     let timeout = std::time::Duration::from_secs(config::update::NOTICES_READ_TIMEOUT_SECS);
@@ -298,16 +307,14 @@ fn install_downloaded(target: &Path, staged: &Path, version: &str) -> anyhow::Re
             std::fs::write(&staged_notices, bytes)
                 .with_context(|| format!("failed writing {}", staged_notices.display()))
         })
-        .and_then(|_| {
-            if std::env::consts::OS == "windows" {
-                spawn_apply_update_helper(&install_paths::current_exe_path(), target, staged, &staged_notices).map(|_| true)
-            } else {
-                commit_pair(&notices, &staged_notices, || {
-                    std::fs::rename(staged, target)
-                        .with_context(|| format!("failed replacing {}", target.display()))
-                })
-                .map(|_| false)
+        .and_then(|_| match apply {
+            Apply::AfterExit { current } => {
+                spawn_apply_update_helper(current, target, staged, &staged_notices).map(|_| true)
             }
+            Apply::Here => commit_pair(&notices, &staged_notices, || {
+                std::fs::rename(staged, target).with_context(|| format!("failed replacing {}", target.display()))
+            })
+            .map(|_| false),
         });
     if installed.is_err() {
         let _ = std::fs::remove_file(staged);
@@ -413,7 +420,12 @@ pub fn update_request(p: UpdateParams<'_>) -> anyhow::Result<UpdateResult> {
 
     // Apply: on unix we can atomically replace even if current is running; on windows we need a helper.
     // Either way the new build's notices are installed with it (#62).
-    let requires_restart = install_downloaded(&target_path, &staged_path, p.target_version)?;
+    let apply = if std::env::consts::OS == "windows" {
+        Apply::AfterExit { current: &current_path }
+    } else {
+        Apply::Here
+    };
+    let requires_restart = install_downloaded(&target_path, &staged_path, p.target_version, apply)?;
     if requires_restart {
         Ok(UpdateResult {
             success: true,
@@ -580,8 +592,7 @@ const STAGED_NOTICES_ARG: &str = "--staged-notices";
 pub struct ApplyUpdateArgs {
     pub target: PathBuf,
     pub staged: PathBuf,
-    /// Absent when the process was started by an updater from before #62.
-    pub staged_notices: Option<PathBuf>,
+    pub staged_notices: PathBuf,
 }
 
 /// The apply-update process the updater starts: `helper` with the arguments
@@ -614,7 +625,7 @@ pub fn parse_apply_update_args(args: &[String]) -> anyhow::Result<Option<ApplyUp
     Ok(Some(ApplyUpdateArgs {
         target: value(TARGET_ARG).with_context(|| format!("missing {}", TARGET_ARG))?,
         staged: value(STAGED_ARG).with_context(|| format!("missing {}", STAGED_ARG))?,
-        staged_notices: value(STAGED_NOTICES_ARG),
+        staged_notices: value(STAGED_NOTICES_ARG).with_context(|| format!("missing {}", STAGED_NOTICES_ARG))?,
     }))
 }
 
@@ -634,11 +645,10 @@ fn spawn_apply_update_helper(current: &Path, target: &Path, staged: &Path, stage
     Ok(())
 }
 
-/// The Windows apply-update process: swaps in the staged binary once the old one has exited.
-/// With `staged_notices` (every updater since #62 passes them) the new build's notices are
-/// installed with it as a pair; an apply-update process started by an older updater passes
-/// none.
-pub fn apply_update_mode(target: &Path, staged: &Path, staged_notices: Option<&Path>) -> anyhow::Result<()> {
+/// The Windows apply-update process: once the old helper has exited, installs the staged
+/// binary and its staged notices as a pair. It always runs the binary of the updater that
+/// started it, so it always gets both.
+pub fn apply_update_mode(target: &Path, staged: &Path, staged_notices: &Path) -> anyhow::Result<()> {
     log::info!("Apply-update mode: target={}, staged={}", target.display(), staged.display());
 
     // Give parent time to exit.
@@ -665,10 +675,7 @@ pub fn apply_update_mode(target: &Path, staged: &Path, staged_notices: Option<&P
 
         bail!("failed applying update after {} attempts", retries);
     };
-    match staged_notices {
-        Some(staged_notices) => commit_pair(&notices_beside(target)?, staged_notices, swap),
-        None => swap(),
-    }
+    commit_pair(&notices_beside(target)?, staged_notices, swap)
 }
 
 #[cfg(test)]
@@ -696,6 +703,9 @@ mod tests {
         names.sort();
         names
     }
+
+    /// The apply-update copy goes to one fixed temporary path, so tests that start it run one at a time.
+    static LAUNCHER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn notices_crediting(version: &str) -> String {
         format!("notices\n{}{}\nend\n", config::update::NOTICES_HELPER_CREDIT_PREFIX, version)
@@ -759,7 +769,9 @@ mod tests {
         let (exe, started) = installed_helper(&dir);
         let newer = notices_crediting("999.0.0");
         let staged = dir.join("staged");
-        std::fs::write(&staged, b"the newer helper").unwrap();
+        // As long as the installed one: only the file's identity tells them apart.
+        std::fs::write(&staged, b"the replaced helper!").unwrap();
+        assert_eq!(std::fs::metadata(&staged).unwrap().len(), std::fs::metadata(&exe).unwrap().len());
         std::fs::rename(&staged, &exe).unwrap();
         std::fs::write(notices_in(&dir), &newer).unwrap();
         assert!(!reconcile_notices(&exe, Some(&started)).unwrap());
@@ -826,7 +838,7 @@ mod tests {
         args.extend(command.get_args().map(|a| a.to_str().unwrap().to_string()));
         assert_eq!(
             parse_apply_update_args(&args).unwrap(),
-            Some(ApplyUpdateArgs { target: target.into(), staged: staged.into(), staged_notices: Some(notices.into()) })
+            Some(ApplyUpdateArgs { target: target.into(), staged: staged.into(), staged_notices: notices.into() })
         );
     }
 
@@ -834,6 +846,7 @@ mod tests {
     #[test]
     fn the_windows_updater_starts_a_copy_of_itself_told_to_install_the_staged_pair() {
         // A stand-in for the helper that records how it was started, one argument per line.
+        let _one_at_a_time = LAUNCHER.lock().unwrap_or_else(|e| e.into_inner());
         let dir = test_dir("launcher");
         let record = dir.join("started-with");
         let current = dir.join("helper");
@@ -850,18 +863,16 @@ mod tests {
         assert_ne!(Path::new(&args[0]), current.as_path(), "it must run a copy, not the installed binary");
         assert_eq!(
             parse_apply_update_args(&args).unwrap(),
-            Some(ApplyUpdateArgs { target, staged, staged_notices: Some(notices) })
+            Some(ApplyUpdateArgs { target, staged, staged_notices: notices })
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn an_apply_update_process_from_an_older_updater_has_no_staged_notices() {
+    fn an_apply_update_process_without_its_staged_notices_is_refused() {
+        // Every updater that starts this binary in apply-update mode is this binary, and passes them.
         let args: Vec<String> = ["h", "--apply-update", "--target", "/i/t", "--staged", "/i/s"].iter().map(|a| a.to_string()).collect();
-        assert_eq!(
-            parse_apply_update_args(&args).unwrap(),
-            Some(ApplyUpdateArgs { target: "/i/t".into(), staged: "/i/s".into(), staged_notices: None })
-        );
+        assert!(parse_apply_update_args(&args).is_err());
         assert!(parse_apply_update_args(&["h".to_string(), "--apply-update".to_string()]).is_err());
         assert_eq!(parse_apply_update_args(&["h".to_string()]).unwrap(), None);
     }
@@ -1026,9 +1037,12 @@ mod tests {
         std::fs::write(&target, b"installed helper").unwrap();
         let staged = dir.join("staged");
         std::fs::write(&staged, b"new helper").unwrap();
-        apply_update_mode(&target, &staged, None).unwrap();
+        let staged_notices = dir.join("staged-notices");
+        std::fs::write(&staged_notices, notices_crediting("1.2.3")).unwrap();
+        apply_update_mode(&target, &staged, &staged_notices).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"new helper");
-        assert_eq!(names_in(&dir), vec!["fts_helper.exe".to_string()]);
+        assert_eq!(std::fs::read_to_string(notices_in(&dir)).unwrap(), notices_crediting("1.2.3"));
+        assert_eq!(names_in(&dir), vec![config::update::NOTICES_FILE_NAME.to_string(), "fts_helper.exe".to_string()]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1108,7 +1122,7 @@ mod tests {
         std::fs::write(notices_in(&dir), "old notices").unwrap();
         let staged = fake_helper(&dir, "staged", &format!("printf '{}'", notices_crediting("1.2.3").replace('\n', "\\n")));
         let staged_bytes = std::fs::read(&staged).unwrap();
-        assert!(!install_downloaded(&target, &staged, "1.2.3").unwrap());
+        assert!(!install_downloaded(&target, &staged, "1.2.3", Apply::Here).unwrap());
         assert_eq!(std::fs::read(&target).unwrap(), staged_bytes);
         assert_eq!(std::fs::read_to_string(notices_in(&dir)).unwrap(), notices_crediting("1.2.3"));
         let mut expected = vec![install_paths::exe_file_name().to_string(), config::update::NOTICES_FILE_NAME.to_string()];
@@ -1125,12 +1139,59 @@ mod tests {
         std::fs::write(&target, b"old helper").unwrap();
         std::fs::write(notices_in(&dir), "old notices").unwrap();
         let staged = fake_helper(&dir, "staged", &format!("printf '{}'", notices_crediting("1.2.2").replace('\n', "\\n")));
-        assert!(install_downloaded(&target, &staged, "1.2.3").is_err());
+        assert!(install_downloaded(&target, &staged, "1.2.3", Apply::Here).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"old helper");
         assert_eq!(std::fs::read_to_string(notices_in(&dir)).unwrap(), "old notices");
         let mut expected = vec![install_paths::exe_file_name().to_string(), config::update::NOTICES_FILE_NAME.to_string()];
         expected.sort();
         assert_eq!(names_in(&dir), expected);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_windows_update_hands_the_new_build_s_notices_to_the_apply_update_process() {
+        // `current` stands in for this helper: it records how the apply-update copy is started.
+        let _one_at_a_time = LAUNCHER.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = test_dir("install-after-exit");
+        let target = dir.join(install_paths::exe_file_name());
+        std::fs::write(&target, b"old helper").unwrap();
+        std::fs::write(notices_in(&dir), "old notices").unwrap();
+        let staged = fake_helper(&dir, "staged", &format!("printf '{}'", notices_crediting("1.2.3").replace('\n', "\\n")));
+        let record = dir.join("started-with");
+        let current = dir.join("current");
+        std::fs::write(&current, format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$0\" \"$@\" > '{0}.tmp' && mv '{0}.tmp' '{0}'\n", record.display())).unwrap();
+        make_executable(&current).unwrap();
+        assert!(install_downloaded(&target, &staged, "1.2.3", Apply::AfterExit { current: &current }).unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(config::update::NOTICES_READ_TIMEOUT_SECS);
+        while !record.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(config::update::NOTICES_READ_POLL_MS));
+        }
+        let args: Vec<String> = std::fs::read_to_string(&record).unwrap().lines().map(str::to_string).collect();
+        let handed = parse_apply_update_args(&args).unwrap().unwrap();
+        assert_eq!((handed.target.as_path(), handed.staged.as_path()), (target.as_path(), staged.as_path()));
+        assert_eq!(std::fs::read_to_string(&handed.staged_notices).unwrap(), notices_crediting("1.2.3"));
+        // Nothing is installed until the apply-update process runs.
+        assert_eq!(std::fs::read(&target).unwrap(), b"old helper");
+        assert_eq!(std::fs::read_to_string(notices_in(&dir)).unwrap(), "old notices");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_update_whose_pair_cannot_be_committed_leaves_nothing_staged() {
+        // The notices path is a folder with something in it, so the staged notices cannot be
+        // renamed into place after they were written.
+        let dir = test_dir("install-commit-fails");
+        let target = dir.join(install_paths::exe_file_name());
+        std::fs::write(&target, b"old helper").unwrap();
+        std::fs::create_dir(notices_in(&dir)).unwrap();
+        std::fs::write(notices_in(&dir).join("keep"), b"x").unwrap();
+        let staged = fake_helper(&dir, "staged", &format!("printf '{}'", notices_crediting("1.2.3").replace('\n', "\\n")));
+        assert!(install_downloaded(&target, &staged, "1.2.3", Apply::Here).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"old helper");
+        assert_eq!(names_in(&dir), vec![install_paths::exe_file_name().to_string(), config::update::NOTICES_FILE_NAME.to_string()]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
