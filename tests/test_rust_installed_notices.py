@@ -201,6 +201,7 @@ class TestInstalledNotices(_HelperFolder):
         self.assertEqual(self._notices(), b"notices of the previous helper build\n")
         self._hello(target)
         self.assertEqual(self._notices(), REPO_NOTICES.read_bytes())
+        self.assertEqual(sorted(p.name for p in self.bin.iterdir()), sorted([EXE_NAME, NOTICES_NAME]))
 
     def test_hello_finishes_an_update_whose_rollback_did_not(self):
         # The new build's notices went in, the binary swap failed and the old notices could not

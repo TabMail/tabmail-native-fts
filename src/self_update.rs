@@ -584,18 +584,19 @@ pub struct ApplyUpdateArgs {
     pub staged_notices: Option<PathBuf>,
 }
 
-/// The arguments the updater starts the apply-update process with; `parse_apply_update_args`
-/// reads them back.
-fn apply_update_args(target: &Path, staged: &Path, staged_notices: &Path) -> Vec<std::ffi::OsString> {
-    vec![
-        APPLY_UPDATE_ARG.into(),
-        TARGET_ARG.into(),
-        target.into(),
-        STAGED_ARG.into(),
-        staged.into(),
-        STAGED_NOTICES_ARG.into(),
-        staged_notices.into(),
-    ]
+/// The apply-update process the updater starts: `helper` with the arguments
+/// `parse_apply_update_args` reads back.
+fn apply_update_command(helper: &Path, target: &Path, staged: &Path, staged_notices: &Path) -> Command {
+    let mut command = Command::new(helper);
+    command
+        .arg(APPLY_UPDATE_ARG)
+        .arg(TARGET_ARG)
+        .arg(target)
+        .arg(STAGED_ARG)
+        .arg(staged)
+        .arg(STAGED_NOTICES_ARG)
+        .arg(staged_notices);
+    command
 }
 
 /// The apply-update process's arguments (`args` as `std::env::args` gives them), or `None` when
@@ -626,8 +627,7 @@ fn spawn_apply_update_helper(target: &Path, staged: &Path, staged_notices: &Path
     std::fs::copy(&current, &helper).with_context(|| format!("failed copying helper to {}", helper.display()))?;
 
     log::info!("Spawning apply-update helper: {}", helper.display());
-    Command::new(&helper)
-        .args(apply_update_args(target, staged, staged_notices))
+    apply_update_command(&helper, target, staged, staged_notices)
         .spawn()
         .context("failed spawning apply-update helper")?;
     Ok(())
@@ -643,15 +643,14 @@ pub fn apply_update_mode(target: &Path, staged: &Path, staged_notices: Option<&P
     // Give parent time to exit.
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    // Move current to backup, then staged -> target.
-    let backup = target.with_extension("exe.backup");
-
     let swap = || -> anyhow::Result<()> {
         // Best-effort retries.
         let retries: usize = 20;
         let delay = std::time::Duration::from_millis(250);
         for attempt in 1..=retries {
-            match try_swap_files(target, staged, &backup) {
+            // The staged binary replaces the installed one in a single rename, so the installed
+            // path always holds a runnable helper, whichever attempt fails.
+            match std::fs::rename(staged, target) {
                 Ok(_) => {
                     log::info!("✅ Update applied successfully");
                     return Ok(());
@@ -670,28 +669,6 @@ pub fn apply_update_mode(target: &Path, staged: &Path, staged_notices: Option<&P
         None => swap(),
     }
 }
-
-/// Moves the installed binary to `backup` and the staged one into its place. If the staged one
-/// cannot be moved in, the installed binary is put back, so a failed attempt never leaves the
-/// install without a helper.
-fn try_swap_files(target: &Path, staged: &Path, backup: &Path) -> anyhow::Result<()> {
-    let moved_aside = target.exists();
-    if moved_aside {
-        let _ = std::fs::remove_file(backup);
-        std::fs::rename(target, backup).with_context(|| format!("failed renaming target to {}", backup.display()))?;
-    }
-    if let Err(e) = std::fs::rename(staged, target) {
-        if moved_aside {
-            if let Err(r) = std::fs::rename(backup, target) {
-                log::error!("Could not put the installed helper back at {}: {}", target.display(), r);
-            }
-        }
-        return Err(e).with_context(|| format!("failed renaming staged to {}", target.display()));
-    }
-    Ok(())
-}
-
-
 
 #[cfg(test)]
 mod tests {
@@ -841,10 +818,11 @@ mod tests {
     // ---- the Windows apply-update handoff ----
 
     #[test]
-    fn the_apply_update_process_reads_back_exactly_what_the_updater_passes() {
+    fn the_apply_update_process_reads_back_exactly_what_the_updater_starts_it_with() {
         let (target, staged, notices) = (Path::new("/i/fts_helper.exe"), Path::new("/i/fts_helper.exe.new"), Path::new("/i/n.new"));
-        let mut args = vec!["fts_helper_apply_update.exe".to_string()];
-        args.extend(apply_update_args(target, staged, notices).into_iter().map(|a| a.into_string().unwrap()));
+        let command = apply_update_command(Path::new("/t/fts_helper_apply_update.exe"), target, staged, notices);
+        let mut args = vec![command.get_program().to_str().unwrap().to_string()];
+        args.extend(command.get_args().map(|a| a.to_str().unwrap().to_string()));
         assert_eq!(
             parse_apply_update_args(&args).unwrap(),
             Some(ApplyUpdateArgs { target: target.into(), staged: staged.into(), staged_notices: Some(notices.into()) })
@@ -926,6 +904,24 @@ mod tests {
     }
 
     #[test]
+    fn a_migration_leaves_an_existing_user_local_install_alone() {
+        // An earlier migration or a later update put a (newer) pair and manifests there.
+        let m = migration("migrate-existing");
+        std::fs::create_dir_all(&m.user).unwrap();
+        std::fs::create_dir_all(&m.manifests).unwrap();
+        let user_exe = m.user.join(install_paths::exe_file_name());
+        std::fs::write(&user_exe, b"newer helper bytes").unwrap();
+        std::fs::write(notices_in(&m.user), notices_crediting("999.0.0")).unwrap();
+        std::fs::write(m.manifests.join("tabmail_fts.json"), b"existing manifest").unwrap();
+        assert!(m.run(true).unwrap());
+        assert_eq!(std::fs::read(&user_exe).unwrap(), b"newer helper bytes");
+        assert_eq!(std::fs::read_to_string(notices_in(&m.user)).unwrap(), notices_crediting("999.0.0"));
+        assert_eq!(std::fs::read(m.manifests.join("tabmail_fts.json")).unwrap(), b"existing manifest");
+        assert_eq!(names_in(&m.user), vec![install_paths::exe_file_name().to_string(), config::update::NOTICES_FILE_NAME.to_string()]);
+        std::fs::remove_dir_all(&m.dir).unwrap();
+    }
+
+    #[test]
     fn a_helper_outside_a_system_install_does_not_migrate() {
         let m = migration("migrate-not-system");
         assert!(!m.run(false).unwrap());
@@ -998,28 +994,15 @@ mod tests {
     }
 
     #[test]
-    fn a_swap_whose_staged_binary_cannot_move_in_puts_the_installed_one_back() {
-        let dir = test_dir("swap-fails");
-        let target = dir.join("fts_helper.exe");
-        std::fs::write(&target, b"installed helper").unwrap();
-        let backup = target.with_extension("exe.backup");
-        assert!(try_swap_files(&target, &dir.join("missing-staged"), &backup).is_err());
-        assert_eq!(std::fs::read(&target).unwrap(), b"installed helper");
-        assert!(!backup.exists());
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_swap_moves_the_staged_binary_in_and_keeps_a_backup() {
-        let dir = test_dir("swap");
+    fn an_applied_update_replaces_the_installed_binary_and_leaves_nothing_else() {
+        let dir = test_dir("apply");
         let target = dir.join("fts_helper.exe");
         std::fs::write(&target, b"installed helper").unwrap();
         let staged = dir.join("staged");
         std::fs::write(&staged, b"new helper").unwrap();
-        let backup = target.with_extension("exe.backup");
-        try_swap_files(&target, &staged, &backup).unwrap();
+        apply_update_mode(&target, &staged, None).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"new helper");
-        assert_eq!(std::fs::read(&backup).unwrap(), b"installed helper");
+        assert_eq!(names_in(&dir), vec!["fts_helper.exe".to_string()]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
