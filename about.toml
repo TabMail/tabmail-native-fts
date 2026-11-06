@@ -38,6 +38,63 @@ checksum = "005fc765ddc5115da796cca915baa9557abae13ff35e0a47c47affc56f6c414d"
 path = "src/polyfill/once_cell/LICENSE-MIT"
 license = "MIT"
 checksum = "6ee2ed6c77710de911761acd5fc1ad1da00f476beb1a7ef27e78c2d1858deafc"
+# ring's files from BoringSSL and other contributors carry their own ISC notice at the top of the file,
+# with a copyright holder other than LICENSE-other-bits' (ISC asks that each notice appear in all
+# copies): one entry per distinct notice.
+[[ring.clarify.files]]
+path = "crypto/poly1305/poly1305.c"
+license = "ISC"
+checksum = "401dc8e6d4fc7266284717fcd1da34f0a6b53c83ed86c6c3e5390390af13febf"
+start = "/* Copyright (c) 2014, Google Inc."
+end = "PERFORMANCE OF THIS SOFTWARE."
+[[ring.clarify.files]]
+path = "src/aead/poly1305/ffi_fallback.rs"
+license = "ISC"
+checksum = "5948185a79502435589a3fd57dfbcabfb83583fabd0b3f5d00e46db113c0d700"
+start = "// Portions Copyright (c) 2014, 2015, Google Inc."
+end = "PERFORMANCE OF THIS SOFTWARE."
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/ec/ecp_nistz.h"
+license = "ISC"
+checksum = "c43f251f9bad00fec6eab9789dc4df54a48f5ea5f87f298b03dbb4f4347cad80"
+start = "/* Copyright (c) 2015, Google Inc."
+end = "PERFORMANCE OF THIS SOFTWARE."
+[[ring.clarify.files]]
+path = "src/aead/chacha.rs"
+license = "ISC"
+checksum = "53fe8cb167d342ead525ce02fd4021e1923d1c9e4e3f1f18fb1088883be1558e"
+start = "// Portions Copyright (c) 2016, Google Inc."
+end = "PERFORMANCE OF THIS SOFTWARE."
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/aes/aes_nohw.c"
+license = "ISC"
+checksum = "3a8b4e47166452a79d0534a6b41a92fd89763626877678958e15cd14dc3ef05f"
+start = "/* Copyright (c) 2019, Google Inc."
+end = "PERFORMANCE OF THIS SOFTWARE."
+[[ring.clarify.files]]
+path = "crypto/fipsmodule/ec/ecp_nistz.c"
+license = "ISC"
+checksum = "450f7a2bb2f799ce4f1ded1117d574fb5c38683c5b986b56d4c7b776349fc1b1"
+start = "/* Copyright (c) 2014, Intel Corporation."
+end = "PERFORMANCE OF THIS SOFTWARE."
+[[ring.clarify.files]]
+path = "src/digest/sha1.rs"
+license = "ISC"
+checksum = "f7612ff888577f9c708e1a2974fcde02de359cd6d5a34b6bf7f51757d02af46f"
+start = "// Copyright 2016 Simon Sapin."
+end = "PERFORMANCE OF THIS SOFTWARE."
+[[ring.clarify.files]]
+path = "src/debug.rs"
+license = "ISC"
+checksum = "8f124a95cebfb8dbd3bbfe25c9a31218c948c5c9f0865be107777823fcc545e0"
+start = "// Copyright 2018 Trent Clarke."
+end = "PERFORMANCE OF THIS SOFTWARE."
+[[ring.clarify.files]]
+path = "src/limb.rs"
+license = "ISC"
+checksum = "22e2692e264302a992ec1511f78e2e29fb2eadc8df82c75364f85ab679a6af85"
+start = "// Copyright 2016 David Judd."
+end = "PERFORMANCE OF THIS SOFTWARE."
 # Code from fiat-crypto, compiled into ring's curve25519.c and p256.c.
 [[ring.clarify.files]]
 path = "third_party/fiat/LICENSE"
@@ -225,3 +282,23 @@ checksum = "6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb"
 path = "src/unicode_tables/LICENSE-UNICODE"
 license = "Unicode-DFS-2016"
 checksum = "74db5baf44a41b1000312c673544b3374e4198af5605c7f9080a402cec42cfa3"
+
+# rustls-webpki: ISC "except as otherwise noted"; two files carry their own ISC notice.
+[rustls-webpki.clarify]
+license = "ISC"
+[[rustls-webpki.clarify.files]]
+path = "LICENSE"
+license = "ISC"
+checksum = "5b698ca13897be3afdb7174256fa1574f8c6892b8bea1a66dd6469d3fe27885a"
+[[rustls-webpki.clarify.files]]
+path = "src/crl/mod.rs"
+license = "ISC"
+checksum = "7341e27dcff580913fa9a1a82ccf0c8f0d5d740336904df8a5e16a1e0727f2c3"
+start = "// Copyright 2023 Daniel McCarney."
+end = "PERFORMANCE OF THIS SOFTWARE."
+[[rustls-webpki.clarify.files]]
+path = "src/subject_name/mod.rs"
+license = "ISC"
+checksum = "9698b908a59aeaa69315449e459289c2cdb677f1418f179f9388300ceb46419c"
+start = "// Copyright 2022 Rafael Fernández López."
+end = "PERFORMANCE OF THIS SOFTWARE."

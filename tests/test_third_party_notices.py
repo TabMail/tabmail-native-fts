@@ -77,6 +77,12 @@ class TestThirdPartyNotices(unittest.TestCase):
             "Community Data License Agreement - Permissive - Version 2.0",  # webpki-roots
             "Copyright 2015-2020 the fiat-crypto authors",  # fiat-crypto code compiled into ring
             "Copyright © 1991-2018 Unicode, Inc.",  # regex-syntax's Unicode tables
+            # ring and rustls-webpki files that carry their own ISC notice
+            "Copyright (c) 2014, Google Inc.", "Portions Copyright (c) 2014, 2015, Google Inc.",
+            "Copyright (c) 2015, Google Inc.", "Portions Copyright (c) 2016, Google Inc.",
+            "Copyright (c) 2019, Google Inc.", "Copyright (c) 2014, Intel Corporation.",
+            "Copyright 2016 Simon Sapin.", "Copyright 2018 Trent Clarke.", "Copyright 2016 David Judd.",
+            "Copyright 2023 Daniel McCarney.", "Copyright 2022 Rafael Fernández López.",
         ):
             self.assertIn(needle, text)
 
@@ -95,7 +101,7 @@ class TestThirdPartyNotices(unittest.TestCase):
     def test_a_crate_missing_from_a_license_its_clarification_names_is_reported(self):
         # cargo-about ignores a clarification whose pinned file changed and falls back to the
         # crate's own files: onig_sys then appears under MIT only, without Oniguruma's BSD notice.
-        clarified = {"onig_sys": {"MIT", "BSD-2-Clause"}, "absent-crate": {"ISC"}}
+        clarified = {"onig_sys": ["MIT", "BSD-2-Clause"], "absent-crate": ["ISC"]}
         notices = sample_notices("onig_sys 69.9.1")
         found = checker.problems(notices, {"onig_sys 69.9.1"}, clarified)
         self.assertEqual(len(found), 1)
@@ -107,10 +113,24 @@ class TestThirdPartyNotices(unittest.TestCase):
 
     def test_every_clarification_names_the_licenses_of_its_files(self):
         clarified = checker.clarified_licenses(ROOT)
-        self.assertEqual(clarified["onig_sys"], {"MIT", "BSD-2-Clause"})
-        self.assertEqual(clarified["libsqlite3-sys"], {"MIT", "blessing"})
-        self.assertEqual(clarified["ring"], {"ISC", "Apache-2.0", "MIT"})
-        self.assertEqual(clarified["regex-syntax"], {"MIT", "Unicode-DFS-2016"})
+        self.assertEqual(sorted(clarified["onig_sys"]), ["BSD-2-Clause", "MIT"])
+        self.assertEqual(sorted(clarified["libsqlite3-sys"]), ["MIT", "blessing"])
+        self.assertEqual(set(clarified["ring"]), {"ISC", "Apache-2.0", "MIT"})
+        self.assertEqual(clarified["rustls-webpki"], ["ISC", "ISC", "ISC"])
+        self.assertEqual(sorted(clarified["regex-syntax"]), ["MIT", "Unicode-DFS-2016"])
+
+    def test_a_crate_credited_in_fewer_sections_than_its_pinned_files_is_reported(self):
+        # rustls-webpki's own LICENSE is ISC too, so after a fallback it is still credited under ISC,
+        # but without the two files that carry other copyright holders.
+        clarified = {"rustls-webpki": ["ISC", "ISC", "ISC"]}
+        one = ("\n" + "=" * 80 + "\nISC License (ISC)\nUsed by:\n- rustls-webpki 0.103.16\n" + "-" * 80
+               + "\n\nCopyright 2015 Brian Smith.\n")
+        notices = sample_notices().replace("- serde 1.0.217", "- rustls-webpki 0.103.16") + one
+        found = checker.problems(notices, {"rustls-webpki 0.103.16"}, clarified)
+        self.assertEqual(len(found), 1)
+        self.assertIn("rustls-webpki in all 3 of its pinned license files (found 2)", found[0])
+        three = notices + one.replace("2015 Brian Smith", "2023 Fixture Author")
+        self.assertEqual(checker.problems(three, {"rustls-webpki 0.103.16"}, clarified), [])
 
 
 MIT_TEXT = "Copyright (c) 2014 The Serde Authors\n\nPermission is hereby granted, free of charge, ...\n"
@@ -246,6 +266,14 @@ class TestNoticeScripts(unittest.TestCase):
         result = self.run_checker()
         self.assertEqual(result.returncode, 1)
         self.assertIn("does not credit serde under ISC", result.stderr)
+
+    def test_a_clarification_file_without_a_license_fails(self):
+        with open(self.root / "about.toml", "a") as about:
+            about.write('[serde.clarify]\nlicense = "MIT"\n[[serde.clarify.files]]\npath = "LICENSE-MIT"\nchecksum = "00"\n')
+        self.write_notices("tabmail-native-fts 0.12.2", "serde 1.0.217")
+        result = self.run_checker()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("a clarification file of serde names no license", result.stderr)
 
     def test_the_generator_writes_the_file_and_checks_it(self):
         self.generated.write_text(sample_notices("tabmail-native-fts 0.12.2", "serde 1.0.217"))

@@ -48,15 +48,15 @@ def targets(root: Path) -> list[str]:
     return names
 
 
-def clarified_licenses(root: Path) -> dict[str, set[str]]:
-    """For each crate with a clarification in about.toml, the licenses its pinned files name."""
+def clarified_licenses(root: Path) -> dict[str, list[str]]:
+    """For each crate with a clarification in about.toml, the license of each of its pinned files."""
     text = (root / "about.toml").read_text(encoding="utf-8")
-    result: dict[str, set[str]] = {}
+    result: dict[str, list[str]] = {}
     for entry in re.finditer(r"^\[\[([\w-]+)\.clarify\.(?:files|git)\]\]\n(.*?)(?=^\[|\Z)", text, re.M | re.S):
         license_id = re.search(r'^license\s*=\s*"([^"]+)"', entry.group(2), re.M)
         if not license_id:
             fail(f"about.toml: a clarification file of {entry.group(1)} names no license")
-        result.setdefault(entry.group(1), set()).add(license_id.group(1))
+        result.setdefault(entry.group(1), []).append(license_id.group(1))
     return result
 
 
@@ -86,15 +86,15 @@ SECTION_RULE = "=" * 80
 TEXT_RULE = "-" * 80
 
 
-def credited_by_license(notices: str) -> dict[str, set[str]]:
-    """For each license id in part 2, the names of the crates credited under it."""
-    result: dict[str, set[str]] = {}
+def credited_sections(notices: str) -> list[tuple[str, set[str]]]:
+    """For each license section in part 2: its license id and the names of the crates it credits."""
+    result = []
     for section in notices.partition(PART_2)[2].split(SECTION_RULE)[1:]:
         lines = section.strip().splitlines()
         heading = re.fullmatch(r".* \(([^()]+)\)", lines[0]) if lines else None
         if heading:
             names = {m.group(1) for m in re.finditer(r"^- (\S+) \d", section.partition(TEXT_RULE)[0], re.M)}
-            result.setdefault(heading.group(1), set()).update(names)
+            result.append((heading.group(1), names))
     return result
 
 
@@ -113,7 +113,7 @@ def credited_crates(notices: str) -> set[str]:
     return {f"{m.group(1)} {m.group(2)}" for m in re.finditer(r"^- (\S+) (\d\S*)", notices, re.M)}
 
 
-def problems(notices: str, shipped: set[str], clarified: dict[str, set[str]] | None = None) -> list[str]:
+def problems(notices: str, shipped: set[str], clarified: dict[str, list[str]] | None = None) -> list[str]:
     """What is wrong with a notices file, given the crates the helper is built from and the licenses
     about.toml's clarifications name."""
     found = [p for p in PLACEHOLDERS if p in notices]
@@ -124,11 +124,19 @@ def problems(notices: str, shipped: set[str], clarified: dict[str, set[str]] | N
     empty = sections_without_text(notices)
     if empty:
         result.append(f"these licenses have no text: {', '.join(empty)}; generate the file again")
-    by_license = credited_by_license(notices)
+    sections = credited_sections(notices)
     shipped_names = {crate.split()[0] for crate in shipped}
-    dropped = sorted(f"{name} under {license_id}" for name, ids in (clarified or {}).items()
-                     if name in shipped_names for license_id in ids
-                     if name not in by_license.get(license_id, set()))
+    dropped = []
+    for name, ids in sorted((clarified or {}).items()):
+        if name not in shipped_names:
+            continue
+        crediting = [license_id for license_id, names in sections if name in names]
+        dropped += [f"{name} under {license_id}" for license_id in sorted(set(ids)) if license_id not in crediting]
+        # Each pinned file has its own text (its own copyright line), so it has its own section. A
+        # crate whose own license matches the clarification's is still credited after a fallback,
+        # in fewer sections.
+        if len(crediting) < len(ids):
+            dropped.append(f"{name} in all {len(ids)} of its pinned license files (found {len(crediting)})")
     if dropped:
         result.append(f"it does not credit {', '.join(dropped)}, which about.toml's clarification names; "
                       "cargo-about ignored the clarification, so update its checksum to the crate's file "
