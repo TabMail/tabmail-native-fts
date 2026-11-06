@@ -300,7 +300,7 @@ fn install_downloaded(target: &Path, staged: &Path, version: &str) -> anyhow::Re
         })
         .and_then(|_| {
             if std::env::consts::OS == "windows" {
-                spawn_apply_update_helper(target, staged, &staged_notices).map(|_| true)
+                spawn_apply_update_helper(&install_paths::current_exe_path(), target, staged, &staged_notices).map(|_| true)
             } else {
                 commit_pair(&notices, &staged_notices, || {
                     std::fs::rename(staged, target)
@@ -618,13 +618,14 @@ pub fn parse_apply_update_args(args: &[String]) -> anyhow::Result<Option<ApplyUp
     }))
 }
 
-fn spawn_apply_update_helper(target: &Path, staged: &Path, staged_notices: &Path) -> anyhow::Result<()> {
+/// Starts the apply-update process: a temporary copy of `current` (this helper's own binary)
+/// run with `apply_update_command`'s arguments.
+fn spawn_apply_update_helper(current: &Path, target: &Path, staged: &Path, staged_notices: &Path) -> anyhow::Result<()> {
     // On Windows, we can't overwrite a running exe. We spawn a TEMP COPY of ourselves to perform the swap.
-    let current = install_paths::current_exe_path();
     let tmp_dir = std::env::temp_dir().join("tabmail-native-fts-update");
     std::fs::create_dir_all(&tmp_dir)?;
     let helper = tmp_dir.join("fts_helper_apply_update.exe");
-    std::fs::copy(&current, &helper).with_context(|| format!("failed copying helper to {}", helper.display()))?;
+    std::fs::copy(current, &helper).with_context(|| format!("failed copying helper to {}", helper.display()))?;
 
     log::info!("Spawning apply-update helper: {}", helper.display());
     apply_update_command(&helper, target, staged, staged_notices)
@@ -827,6 +828,31 @@ mod tests {
             parse_apply_update_args(&args).unwrap(),
             Some(ApplyUpdateArgs { target: target.into(), staged: staged.into(), staged_notices: Some(notices.into()) })
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_windows_updater_starts_a_copy_of_itself_told_to_install_the_staged_pair() {
+        // A stand-in for the helper that records how it was started, one argument per line.
+        let dir = test_dir("launcher");
+        let record = dir.join("started-with");
+        let current = dir.join("helper");
+        std::fs::write(&current, format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$0\" \"$@\" > '{0}.tmp' && mv '{0}.tmp' '{0}'\n", record.display())).unwrap();
+        make_executable(&current).unwrap();
+        let (target, staged, notices) = (dir.join("fts_helper.exe"), dir.join("fts_helper.exe.new"), dir.join("n.new"));
+        spawn_apply_update_helper(&current, &target, &staged, &notices).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(config::update::NOTICES_READ_TIMEOUT_SECS);
+        while !record.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(config::update::NOTICES_READ_POLL_MS));
+        }
+        let args: Vec<String> = std::fs::read_to_string(&record).unwrap().lines().map(str::to_string).collect();
+        assert_ne!(Path::new(&args[0]), current.as_path(), "it must run a copy, not the installed binary");
+        assert_eq!(
+            parse_apply_update_args(&args).unwrap(),
+            Some(ApplyUpdateArgs { target, staged, staged_notices: Some(notices) })
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
