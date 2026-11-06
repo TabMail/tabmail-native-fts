@@ -238,5 +238,56 @@ class TestNoticeScripts(unittest.TestCase):
         self.assertEqual([c[:2] for c in self.cargo_calls()], [["about", "--version"]])
 
 
+FIXTURE_LICENSE = """MIT License
+
+Copyright (c) 2099 Fixture Authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+
+
+class TestTemplate(unittest.TestCase):
+    """about.hbs, rendered by the pinned cargo-about, reproduces each crate's own license in full."""
+
+    def test_the_template_reproduces_a_crates_license_text_and_credit(self):
+        version = subprocess.run(["cargo", "about", "--version"], capture_output=True, text=True)
+        self.assertEqual(version.stdout.strip(), "cargo-about 0.9.3",
+                         "needs cargo-about 0.9.3: cargo install cargo-about --version 0.9.3 --locked --features cli")
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        (tmp / "src").mkdir()
+        (tmp / "src" / "lib.rs").write_text("")
+        (tmp / "Cargo.toml").write_text(
+            '[package]\nname = "fixture-crate"\nversion = "1.2.3"\nedition = "2021"\nlicense = "MIT"\n'
+            'repository = "https://example.com/fixture-crate"\n\n[workspace]\n')
+        (tmp / "LICENSE").write_text(FIXTURE_LICENSE)
+        (tmp / "about.toml").write_text('accepted = ["MIT"]\n')
+        shutil.copy(ROOT / "about.hbs", tmp)
+        subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=tmp, check=True, capture_output=True)
+        result = subprocess.run(["cargo", "about", "generate", "--frozen", "--fail", "about.hbs", "-o", "out.txt"],
+                                cwd=tmp, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rendered = (tmp / "out.txt").read_text(encoding="utf-8")
+        self.assertIn(FIXTURE_LICENSE.strip(), rendered)
+        self.assertIn("- fixture-crate 1.2.3 (https://example.com/fixture-crate)", rendered)
+        self.assertEqual(checker.problems(rendered, {"fixture-crate 1.2.3"}), [])
+
+
 if __name__ == "__main__":
     unittest.main()
