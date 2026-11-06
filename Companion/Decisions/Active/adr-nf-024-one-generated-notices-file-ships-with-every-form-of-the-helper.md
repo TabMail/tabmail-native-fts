@@ -47,11 +47,11 @@ It also downloads the all-MiniLM-L6-v2 model. No distributed form carried their 
   The query is not `--offline`: a release builder has cached only its own platform's crates, so an offline query over all six targets fails on a fresh cache. Cargo fetches the rest.
 
   It runs in the tests and in the generator. Every release flow runs it after building and before it uploads or packages anything, so a stale file stops the release (on macOS, after notarization). Every version bump needs a regeneration, because the file credits the helper itself at its version; `maintenance.sh --bump`/`--release` does it.
-- **Shipping.** The file ships next to the helper in every installer package (the macOS `.pkg`, the Windows `Setup.exe`, the full TabMail macOS and Windows installers) and is uploaded to the CDN next to every update binary, before the update manifest. Voice ships it from its pinned checkout as-is. Two forms follow in later changes, because each needs the file on the CDN first or a helper change:
+- **Shipping.** The file ships next to the helper in every installer package (the macOS `.pkg`, the Windows `Setup.exe`, the full TabMail macOS and Windows installers) and is uploaded to the CDN next to every update binary, before the update manifest. Voice is to ship it from its pinned checkout as-is, in its own change once this one merges. Two forms follow in later changes, because each needs the file on the CDN first or a helper change:
   - `scripts/install.sh` and `scripts/install.ps1` are served live from `main`, so they fetch the notices only once a release has put them on the CDN (#61);
   - self-update replaces only the binary; installing the new version's notices beside it is #62.
 
-  A consumer of the CDN takes the version the update manifest names and fetches that version's binary and notices: the `-latest` copies are replaced one at a time.
+  A consumer of the CDN takes the version the update manifest names and fetches that version's binary and notices: the `-latest` copies are replaced one at a time. Manifests published before the first release with notices name a version that has none, so a consumer that requires the notices (the full Windows TabMail installer build) refuses until that release: release native-fts before the TabMail installers.
 
 ## Rejected
 
