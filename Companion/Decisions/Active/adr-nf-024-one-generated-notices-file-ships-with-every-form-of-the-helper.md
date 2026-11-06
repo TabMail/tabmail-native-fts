@@ -27,7 +27,8 @@ It also downloads the all-MiniLM-L6-v2 model. No distributed form carried their 
 - **Clarifications.** Some crates ship no license file, or one the scanner misreads:
   - none: candle-nn, candle-transformers, ug, sqlite-vec;
   - misread: indented windows `license-mit`, chrono's and libm's combined files, curve25519-dalek;
-  - combined C: ring, onig_sys with Oniguruma's `COPYING`, libsqlite3-sys with SQLite's blessing.
+  - combined C: ring (with fiat-crypto's `third_party/fiat/LICENSE`), onig_sys with Oniguruma's `COPYING`, libsqlite3-sys with SQLite's blessing;
+  - a nested license: regex-syntax's `src/unicode_tables/LICENSE-UNICODE` (Unicode-DFS-2016) for its compiled-in Unicode tables.
 
   Each of these gets an `about.toml` clarification that pins its real file by SHA-256. Files missing from the crate come from the crate's repository at the published commit or tag. The vendored candle-core carries a copy of candle's `LICENSE-MIT`.
 - **Hand-written part.** Part 1 of the template credits what is not a crate:
@@ -37,12 +38,19 @@ It also downloads the all-MiniLM-L6-v2 model. No distributed form carried their 
 - **Check.** `scripts/check-third-party-notices.py` (stdlib; `cargo tree --locked` over all of about.toml's targets at once) fails when the file:
   - misses a shipped crate at its exact version;
   - holds cargo-about's generic MIT/BSD placeholders;
-  - has a license section with no text.
+  - has a license section with no text;
+  - does not credit a clarified crate under every license its pinned files name.
+
+  The last rule exists because cargo-about does not fail on a changed pinned file: it warns, ignores that clarification and falls back to the crate's own files. For onig_sys that drops Oniguruma's BSD-2 notice and for libsqlite3-sys the SQLite blessing, while the crate is still credited (under MIT). Each section heading carries its SPDX id so the checker can map licenses to sections.
 
   The query is not `--offline`: a release builder has cached only its own platform's crates, so an offline query over all six targets fails on a fresh cache. Cargo fetches the rest.
 
   It runs in the tests, and the release scripts run it before building.
-- **Shipping.** The file ships next to the helper in every installer and is uploaded next to every update binary. Voice ships it from its pinned checkout as-is.
+- **Shipping.** The file ships next to the helper in every installer package (the macOS `.pkg`, the Windows `Setup.exe`, the full TabMail macOS and Windows installers) and is uploaded to the CDN next to every update binary, before the update manifest. Voice ships it from its pinned checkout as-is. Two forms follow in later changes, because each needs the file on the CDN first or a helper change:
+  - `scripts/install.sh` and `scripts/install.ps1` are served live from `main`, so they fetch the notices only once a release has put them on the CDN (#61);
+  - self-update replaces only the binary; installing the new version's notices beside it is #62.
+
+  A consumer of the CDN takes the version the update manifest names and fetches that version's binary and notices: the `-latest` copies are replaced one at a time.
 
 ## Rejected
 

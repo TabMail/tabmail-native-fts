@@ -4,7 +4,7 @@
 accepted = [
     "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause",
     "ISC", "Zlib", "BSL-1.0", "Unicode-3.0", "CDLA-Permissive-2.0", "MPL-2.0",
-    "Unlicense", "0BSD", "BSD-1-Clause", "LGPL-2.1", "blessing",
+    "Unlicense", "0BSD", "BSD-1-Clause", "LGPL-2.1", "blessing", "Unicode-DFS-2016",
 ]
 # Every target the helper is released for: Thunderbird (macOS universal, Windows x64, Linux x64) and
 # TabMail Voice's voice-memory (macOS, Windows and Linux, x64 and arm64).
@@ -18,7 +18,10 @@ ignore-dev-dependencies = true
 
 # Clarifications: crates that ship no license file, or one the scanner cannot read, so that the notice
 # reproduces the real file (with its copyright line) instead of a generic license template. Each file is
-# pinned by its SHA-256; a changed file makes the generator fail rather than fall back.
+# pinned by its SHA-256. cargo-about does not fail on a changed file: it ignores that clarification
+# (with a warning) and falls back to the crate's own license files. So the checker requires every crate
+# named here to be credited under every license its `files`/`git` entries name, and a dropped
+# clarification fails the generator and every release flow.
 
 # ring: ISC for its own code, Apache-2.0 for code from BoringSSL, MIT for code from once_cell.
 [ring.clarify]
@@ -35,6 +38,11 @@ checksum = "005fc765ddc5115da796cca915baa9557abae13ff35e0a47c47affc56f6c414d"
 path = "src/polyfill/once_cell/LICENSE-MIT"
 license = "MIT"
 checksum = "6ee2ed6c77710de911761acd5fc1ad1da00f476beb1a7ef27e78c2d1858deafc"
+# Code from fiat-crypto, compiled into ring's curve25519.c and p256.c.
+[[ring.clarify.files]]
+path = "third_party/fiat/LICENSE"
+license = "Apache-2.0"
+checksum = "9eacbcb81be660840c714a560a9d65ba07913db98dd4baf969f78dd499fdd60f"
 
 # onig_sys compiles the bundled Oniguruma C library (BSD-2-Clause) next to its own MIT bindings.
 [onig_sys.clarify]
@@ -204,3 +212,16 @@ license = "MIT OR Apache-2.0"
 path = "license-mit"
 license = "MIT"
 checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+# regex-syntax: its Unicode tables (compiled in through tokenizers' regex use) carry Unicode's data
+# license, which asks that the notice appear with all copies.
+[regex-syntax.clarify]
+license = "(MIT OR Apache-2.0) AND Unicode-DFS-2016"
+[[regex-syntax.clarify.files]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb"
+[[regex-syntax.clarify.files]]
+path = "src/unicode_tables/LICENSE-UNICODE"
+license = "Unicode-DFS-2016"
+checksum = "74db5baf44a41b1000312c673544b3374e4198af5605c7f9080a402cec42cfa3"

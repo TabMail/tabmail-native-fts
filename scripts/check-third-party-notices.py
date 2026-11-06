@@ -8,7 +8,10 @@
 For every release target named in about.toml, every crate in the helper's normal dependency
 graph (Cargo.lock, no build or dev dependencies) must appear in the notices file's "Used by"
 lists at its exact version. The file must also hold no unfilled license template, which is what
-cargo-about writes when it cannot find a crate's own license file.
+cargo-about writes when it cannot find a crate's own license file, and no license section without its
+text. Every crate with an about.toml clarification must be credited under each license its pinned
+files name: cargo-about drops a clarification whose file no longer matches its checksum (it only
+warns) and falls back to the crate's own files, which can lose a required notice.
 
 Run it after any Cargo.lock change, and before a release. It runs `cargo tree --locked` for all
 the targets at once, so Cargo fetches any crate a target needs that is not yet in the local cache
@@ -45,6 +48,18 @@ def targets(root: Path) -> list[str]:
     return names
 
 
+def clarified_licenses(root: Path) -> dict[str, set[str]]:
+    """For each crate with a clarification in about.toml, the licenses its pinned files name."""
+    text = (root / "about.toml").read_text(encoding="utf-8")
+    result: dict[str, set[str]] = {}
+    for entry in re.finditer(r"^\[\[([\w-]+)\.clarify\.(?:files|git)\]\]\n(.*?)(?=^\[|\Z)", text, re.M | re.S):
+        license_id = re.search(r'^license\s*=\s*"([^"]+)"', entry.group(2), re.M)
+        if not license_id:
+            fail(f"about.toml: a clarification file of {entry.group(1)} names no license")
+        result.setdefault(entry.group(1), set()).add(license_id.group(1))
+    return result
+
+
 def shipped_crates(root: Path, target_list: list[str]) -> set[str]:
     cargo = os.environ.get("CARGO", "cargo")
     command = [cargo, "tree", "--edges", "normal", "--prefix", "none", "--format", "{p}",
@@ -71,6 +86,18 @@ SECTION_RULE = "=" * 80
 TEXT_RULE = "-" * 80
 
 
+def credited_by_license(notices: str) -> dict[str, set[str]]:
+    """For each license id in part 2, the names of the crates credited under it."""
+    result: dict[str, set[str]] = {}
+    for section in notices.partition(PART_2)[2].split(SECTION_RULE)[1:]:
+        lines = section.strip().splitlines()
+        heading = re.fullmatch(r".* \(([^()]+)\)", lines[0]) if lines else None
+        if heading:
+            names = {m.group(1) for m in re.finditer(r"^- (\S+) \d", section.partition(TEXT_RULE)[0], re.M)}
+            result.setdefault(heading.group(1), set()).update(names)
+    return result
+
+
 def sections_without_text(notices: str) -> list[str]:
     """The names of the license sections whose text is empty."""
     empty = []
@@ -86,8 +113,9 @@ def credited_crates(notices: str) -> set[str]:
     return {f"{m.group(1)} {m.group(2)}" for m in re.finditer(r"^- (\S+) (\d\S*)", notices, re.M)}
 
 
-def problems(notices: str, shipped: set[str]) -> list[str]:
-    """What is wrong with a notices file, given the crates the helper is built from."""
+def problems(notices: str, shipped: set[str], clarified: dict[str, set[str]] | None = None) -> list[str]:
+    """What is wrong with a notices file, given the crates the helper is built from and the licenses
+    about.toml's clarifications name."""
     found = [p for p in PLACEHOLDERS if p in notices]
     result = []
     if found:
@@ -96,6 +124,15 @@ def problems(notices: str, shipped: set[str]) -> list[str]:
     empty = sections_without_text(notices)
     if empty:
         result.append(f"these licenses have no text: {', '.join(empty)}; generate the file again")
+    by_license = credited_by_license(notices)
+    shipped_names = {crate.split()[0] for crate in shipped}
+    dropped = sorted(f"{name} under {license_id}" for name, ids in (clarified or {}).items()
+                     if name in shipped_names for license_id in ids
+                     if name not in by_license.get(license_id, set()))
+    if dropped:
+        result.append(f"it does not credit {', '.join(dropped)}, which about.toml's clarification names; "
+                      "cargo-about ignored the clarification, so update its checksum to the crate's file "
+                      "(after checking the new text) and generate the file again")
     missing = sorted(shipped - credited_crates(notices))
     if missing:
         result.append(f"it does not credit: {', '.join(missing)}; run "
@@ -108,7 +145,8 @@ def main() -> None:
     path = root / "THIRD_PARTY_NOTICES.txt"
     if not path.is_file():
         fail(f"{path.name} is missing; run scripts/generate-third-party-notices.sh")
-    found = problems(path.read_text(encoding="utf-8"), shipped_crates(root, targets(root)))
+    found = problems(path.read_text(encoding="utf-8"), shipped_crates(root, targets(root)),
+                     clarified_licenses(root))
     if found:
         fail(f"{path.name}: " + "; ".join(found))
     print(f"{path.name} credits every shipped crate.")

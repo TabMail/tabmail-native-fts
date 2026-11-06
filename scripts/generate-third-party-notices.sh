@@ -24,4 +24,7 @@ if [[ "$installed" != "cargo-about $ABOUT_VERSION" ]]; then
 fi
 
 cargo about generate --locked --fail about.hbs -o THIRD_PARTY_NOTICES.txt
+# A few upstream license files have CRLF line endings; store plain LF so a regeneration reproduces the
+# committed file byte for byte.
+perl -pi -e 's/\r$//' THIRD_PARTY_NOTICES.txt
 python3 -I scripts/check-third-party-notices.py "$ROOT"

@@ -117,7 +117,9 @@ scripts/generate-third-party-notices.sh
 `scripts/check-third-party-notices.py` (also run by the tests) fails if a crate the helper is built
 from is missing from the file, or if a crate's entry fell back to a license template with no
 copyright line. A crate that ships no license file, or one the scanner cannot read, gets a
-clarification in `about.toml` that pins its real file by checksum.
+clarification in `about.toml` that pins its real file by checksum. If that file changes, cargo-about
+ignores the clarification (it only warns), and the checker fails because the crate is no longer
+credited under every license the clarification names: read the new file, then update the checksum.
 
 ## Native messaging manifest
 
@@ -356,8 +358,9 @@ See:
 
 - [LICENSE](./LICENSE)
 - [THIRD_PARTY_NOTICES.txt](./THIRD_PARTY_NOTICES.txt): the copyright notices and license texts of
-  the open-source software the helper is built with, and of the embedding model. Every installer
-  and update ships this file next to the helper.
+  the open-source software the helper is built with, and of the embedding model. The installer
+  packages ship this file next to the helper, and each release uploads it next to the update
+  binaries. The install scripts and self-update will install it too (#61, #62).
 
 ## Contributing
 

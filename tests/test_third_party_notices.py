@@ -5,6 +5,7 @@
 
 """THIRD_PARTY_NOTICES.txt credits every crate the helper is built from, with real license texts."""
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -74,6 +75,8 @@ class TestThirdPartyNotices(unittest.TestCase):
             "The author disclaims copyright to this source code.",  # SQLite
             "Copyright (c) 2024 Alex Garcia",  # sqlite-vec
             "Community Data License Agreement - Permissive - Version 2.0",  # webpki-roots
+            "Copyright 2015-2020 the fiat-crypto authors",  # fiat-crypto code compiled into ring
+            "Copyright © 1991-2018 Unicode, Inc.",  # regex-syntax's Unicode tables
         ):
             self.assertIn(needle, text)
 
@@ -86,8 +89,28 @@ class TestThirdPartyNotices(unittest.TestCase):
         notices = sample_notices().replace(MIT_TEXT, "")
         found = checker.problems(notices, {"serde 1.0.217"})
         self.assertEqual(len(found), 1)
-        self.assertIn("no text: MIT License", found[0])
+        self.assertIn("no text: MIT License (MIT)", found[0])
         self.assertEqual(checker.problems(sample_notices(), {"serde 1.0.217"}), [])
+
+    def test_a_crate_missing_from_a_license_its_clarification_names_is_reported(self):
+        # cargo-about ignores a clarification whose pinned file changed and falls back to the
+        # crate's own files: onig_sys then appears under MIT only, without Oniguruma's BSD notice.
+        clarified = {"onig_sys": {"MIT", "BSD-2-Clause"}, "absent-crate": {"ISC"}}
+        notices = sample_notices("onig_sys 69.9.1")
+        found = checker.problems(notices, {"onig_sys 69.9.1"}, clarified)
+        self.assertEqual(len(found), 1)
+        self.assertIn("does not credit onig_sys under BSD-2-Clause", found[0])
+        self.assertNotIn("absent-crate", found[0])  # not shipped, so not required
+        bsd = ("\n" + "=" * 80 + "\nBSD 2-Clause \"Simplified\" License (BSD-2-Clause)\nUsed by:\n- onig_sys 69.9.1\n"
+               + "-" * 80 + "\n\nCopyright (c) 2099 Fixture Authors\n")
+        self.assertEqual(checker.problems(notices + bsd, {"onig_sys 69.9.1"}, clarified), [])
+
+    def test_every_clarification_names_the_licenses_of_its_files(self):
+        clarified = checker.clarified_licenses(ROOT)
+        self.assertEqual(clarified["onig_sys"], {"MIT", "BSD-2-Clause"})
+        self.assertEqual(clarified["libsqlite3-sys"], {"MIT", "blessing"})
+        self.assertEqual(clarified["ring"], {"ISC", "Apache-2.0", "MIT"})
+        self.assertEqual(clarified["regex-syntax"], {"MIT", "Unicode-DFS-2016"})
 
 
 MIT_TEXT = "Copyright (c) 2014 The Serde Authors\n\nPermission is hereby granted, free of charge, ...\n"
@@ -96,7 +119,7 @@ MIT_TEXT = "Copyright (c) 2014 The Serde Authors\n\nPermission is hereby granted
 def sample_notices(*crates):
     used_by = "".join(f"- {c} (https://example.com/{c.split()[0]})\n" for c in crates or ("serde 1.0.217",))
     return ("THIRD-PARTY SOFTWARE NOTICES\n" + "=" * 80 + "\n\nPART 1\n\nPART 2. RUST CRATES\n\n"
-            + "=" * 80 + "\nMIT License\nUsed by:\n" + used_by + "-" * 80 + "\n\n" + MIT_TEXT)
+            + "=" * 80 + "\nMIT License (MIT)\nUsed by:\n" + used_by + "-" * 80 + "\n\n" + MIT_TEXT)
 
 
 FAKE_CARGO = """#!{python}
@@ -214,6 +237,16 @@ class TestNoticeScripts(unittest.TestCase):
         self.assertIn("names no release targets", result.stderr)
         self.assertEqual(self.cargo_calls(), [])
 
+    def test_a_crate_missing_from_a_license_its_clarification_names_fails(self):
+        with open(self.root / "about.toml", "a") as about:
+            about.write('[serde.clarify]\nlicense = "MIT AND ISC"\n'
+                        '[[serde.clarify.files]]\npath = "LICENSE-MIT"\nlicense = "MIT"\nchecksum = "00"\n'
+                        '[[serde.clarify.files]]\npath = "LICENSE-ISC"\nlicense = "ISC"\nchecksum = "00"\n')
+        self.write_notices("tabmail-native-fts 0.12.2", "serde 1.0.217")
+        result = self.run_checker()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("does not credit serde under ISC", result.stderr)
+
     def test_the_generator_writes_the_file_and_checks_it(self):
         self.generated.write_text(sample_notices("tabmail-native-fts 0.12.2", "serde 1.0.217"))
         result = self.run_generator()
@@ -262,10 +295,37 @@ SOFTWARE.
 """
 
 
-class TestTemplate(unittest.TestCase):
-    """about.hbs, rendered by the pinned cargo-about, reproduces each crate's own license in full."""
+FIXTURE_BSD = """Copyright (c) 2099 Fixture Authors
+All rights reserved.
 
-    def test_the_template_reproduces_a_crates_license_text_and_credit(self):
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+"""
+
+
+class TestTemplate(unittest.TestCase):
+    """about.hbs and about.toml, rendered by the pinned cargo-about, reproduce each crate's own
+    licenses in full, and the checker refuses a clarification cargo-about did not apply."""
+
+    def render(self, clarify_checksum=None):
         version = subprocess.run(["cargo", "about", "--version"], capture_output=True, text=True)
         self.assertEqual(version.stdout.strip(), "cargo-about 0.9.3",
                          "needs cargo-about 0.9.3: cargo install cargo-about --version 0.9.3 --locked --features cli")
@@ -277,16 +337,40 @@ class TestTemplate(unittest.TestCase):
             '[package]\nname = "fixture-crate"\nversion = "1.2.3"\nedition = "2021"\nlicense = "MIT"\n'
             'repository = "https://example.com/fixture-crate"\n\n[workspace]\n')
         (tmp / "LICENSE").write_text(FIXTURE_LICENSE)
-        (tmp / "about.toml").write_text('accepted = ["MIT"]\n')
+        about = 'accepted = ["MIT", "BSD-2-Clause"]\n'
+        if clarify_checksum is not None:
+            # Like onig_sys: the crate says MIT, and a second file it bundles is BSD-2-Clause.
+            (tmp / "BUNDLED-COPYING").write_text(FIXTURE_BSD)
+            about += ('[fixture-crate.clarify]\nlicense = "MIT AND BSD-2-Clause"\n'
+                      '[[fixture-crate.clarify.files]]\npath = "LICENSE"\nlicense = "MIT"\n'
+                      f'checksum = "{hashlib.sha256(FIXTURE_LICENSE.encode()).hexdigest()}"\n'
+                      '[[fixture-crate.clarify.files]]\npath = "BUNDLED-COPYING"\nlicense = "BSD-2-Clause"\n'
+                      f'checksum = "{clarify_checksum}"\n')
+        (tmp / "about.toml").write_text(about)
         shutil.copy(ROOT / "about.hbs", tmp)
         subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=tmp, check=True, capture_output=True)
         result = subprocess.run(["cargo", "about", "generate", "--frozen", "--fail", "about.hbs", "-o", "out.txt"],
                                 cwd=tmp, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        rendered = (tmp / "out.txt").read_text(encoding="utf-8")
+        return (tmp / "out.txt").read_text(encoding="utf-8"), checker.clarified_licenses(tmp)
+
+    def test_the_template_reproduces_a_crates_license_text_and_credit(self):
+        rendered, _ = self.render()
         self.assertIn(FIXTURE_LICENSE.strip(), rendered)
         self.assertIn("- fixture-crate 1.2.3 (https://example.com/fixture-crate)", rendered)
         self.assertEqual(checker.problems(rendered, {"fixture-crate 1.2.3"}), [])
+
+    def test_an_applied_clarification_passes_and_an_ignored_one_is_refused(self):
+        applied, clarified = self.render(hashlib.sha256(FIXTURE_BSD.encode()).hexdigest())
+        self.assertIn(FIXTURE_BSD.strip(), applied)
+        self.assertEqual(checker.problems(applied, {"fixture-crate 1.2.3"}, clarified), [])
+        # The bundled file changed since its checksum was pinned: cargo-about still exits 0, without
+        # the bundled file's notice.
+        ignored, clarified = self.render("0" * 64)
+        self.assertNotIn(FIXTURE_BSD.strip(), ignored)
+        found = checker.problems(ignored, {"fixture-crate 1.2.3"}, clarified)
+        self.assertEqual(len(found), 1)
+        self.assertIn("does not credit fixture-crate under BSD-2-Clause", found[0])
 
 
 if __name__ == "__main__":

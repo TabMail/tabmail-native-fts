@@ -104,19 +104,20 @@ PART 2. RUST CRATES
 Licenses used, with the number of crates under each:
 - MIT License (201)
 - Unicode License v3 (21)
-- Apache License 2.0 (7)
+- Apache License 2.0 (8)
 - ISC License (4)
 - BSD 3-Clause "New" or "Revised" License (3)
 - Community Data License Agreement Permissive 2.0 (2)
 - BSD 2-Clause "Simplified" License (1)
 - Mozilla Public License 2.0 (1)
+- Unicode License Agreement - Data Files and Software (2016) (1)
 - SQLite Blessing (1)
 
 Where a crate is offered under a choice of licenses, the text below is the license chosen for this
 distribution.
 
 ================================================================================
-Apache License 2.0
+Apache License 2.0 (Apache-2.0)
 Used by:
 - ring 0.17.14 (https://github.com/briansmith/ring)
 --------------------------------------------------------------------------------
@@ -396,7 +397,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
 ================================================================================
-Apache License 2.0
+Apache License 2.0 (Apache-2.0)
 Used by:
 - esaxx-rs 0.1.10 (https://github.com/Narsil/esaxx-rs)
 - safetensors 0.4.5 (https://github.com/huggingface/safetensors)
@@ -609,7 +610,7 @@ Used by:
 
 
 ================================================================================
-Apache License 2.0
+Apache License 2.0 (Apache-2.0)
 Used by:
 - ryu 1.0.23 (https://github.com/dtolnay/ryu)
 --------------------------------------------------------------------------------
@@ -690,7 +691,30 @@ limitations under the License.
 
 
 ================================================================================
-BSD 2-Clause "Simplified" License
+Apache License 2.0 (Apache-2.0)
+Used by:
+- ring 0.17.14 (https://github.com/briansmith/ring)
+--------------------------------------------------------------------------------
+
+The Apache License, Version 2.0 (Apache-2.0)
+
+Copyright 2015-2020 the fiat-crypto authors (see the AUTHORS file)
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+
+================================================================================
+BSD 2-Clause "Simplified" License (BSD-2-Clause)
 Used by:
 - onig_sys 69.9.3 (https://github.com/rust-onig/rust-onig)
 --------------------------------------------------------------------------------
@@ -724,7 +748,7 @@ SUCH DAMAGE.
 
 
 ================================================================================
-BSD 3-Clause "New" or "Revised" License
+BSD 3-Clause "New" or "Revised" License (BSD-3-Clause)
 Used by:
 - subtle 2.6.1 (https://github.com/dalek-cryptography/subtle)
 --------------------------------------------------------------------------------
@@ -761,7 +785,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
 ================================================================================
-BSD 3-Clause "New" or "Revised" License
+BSD 3-Clause "New" or "Revised" License (BSD-3-Clause)
 Used by:
 - curve25519-dalek 4.1.3 (https://github.com/dalek-cryptography/curve25519-dalek/tree/main/curve25519-dalek)
 --------------------------------------------------------------------------------
@@ -834,7 +858,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
 ================================================================================
-BSD 3-Clause "New" or "Revised" License
+BSD 3-Clause "New" or "Revised" License (BSD-3-Clause)
 Used by:
 - ed25519-dalek 2.2.0 (https://github.com/dalek-cryptography/curve25519-dalek/tree/main/ed25519-dalek)
 --------------------------------------------------------------------------------
@@ -870,7 +894,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
 ================================================================================
-Community Data License Agreement Permissive 2.0
+Community Data License Agreement Permissive 2.0 (CDLA-Permissive-2.0)
 Used by:
 - webpki-roots 0.26.11 (https://github.com/rustls/webpki-roots)
 - webpki-roots 1.0.10 (https://github.com/rustls/webpki-roots)
@@ -940,7 +964,7 @@ insights.
 
 
 ================================================================================
-ISC License
+ISC License (ISC)
 Used by:
 - untrusted 0.9.0 (https://github.com/briansmith/untrusted)
 --------------------------------------------------------------------------------
@@ -961,7 +985,7 @@ Used by:
 
 
 ================================================================================
-ISC License
+ISC License (ISC)
 Used by:
 - ring 0.17.14 (https://github.com/briansmith/ring)
 --------------------------------------------------------------------------------
@@ -982,7 +1006,7 @@ CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 
 ================================================================================
-ISC License
+ISC License (ISC)
 Used by:
 - libloading 0.8.9 (https://github.com/nagisa/rust_libloading/)
 --------------------------------------------------------------------------------
@@ -1002,7 +1026,7 @@ THIS SOFTWARE.
 
 
 ================================================================================
-ISC License
+ISC License (ISC)
 Used by:
 - rustls-webpki 0.103.16 (https://github.com/rustls/webpki)
 --------------------------------------------------------------------------------
@@ -1029,7 +1053,7 @@ third-party/chromium/LICENSE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - windows-core 0.62.2 (https://github.com/microsoft/windows-rs)
 - windows-implement 0.60.2 (https://github.com/microsoft/windows-rs)
@@ -1069,7 +1093,7 @@ Used by:
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - onig_sys 69.9.3 (https://github.com/rust-onig/rust-onig)
 --------------------------------------------------------------------------------
@@ -1107,7 +1131,7 @@ information.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - onig 6.5.3 (https://github.com/iwillspeak/rust-onig)
 --------------------------------------------------------------------------------
@@ -1144,7 +1168,7 @@ under the original license.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - sha2 0.10.9 (https://github.com/RustCrypto/hashes)
 --------------------------------------------------------------------------------
@@ -1179,7 +1203,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - rayon-core 1.13.0 (https://github.com/rayon-rs/rayon)
 - rayon 1.12.0 (https://github.com/rayon-rs/rayon)
@@ -1213,7 +1237,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - core-foundation-sys 0.8.7 (https://github.com/servo/core-foundation-rs)
 --------------------------------------------------------------------------------
@@ -1246,7 +1270,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - hex 0.4.3 (https://github.com/KokaKiwi/rust-hex)
 --------------------------------------------------------------------------------
@@ -1274,7 +1298,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - form_urlencoded 1.2.2 (https://github.com/servo/rust-url)
 --------------------------------------------------------------------------------
@@ -1307,7 +1331,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - idna 1.1.0 (https://github.com/servo/rust-url/)
 - percent-encoding 2.3.2 (https://github.com/servo/rust-url/)
@@ -1342,7 +1366,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - cfg-if 1.0.5 (https://github.com/rust-lang/cfg-if)
 --------------------------------------------------------------------------------
@@ -1375,7 +1399,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - bitflags 1.3.2 (https://github.com/bitflags/bitflags)
 - bitflags 2.13.2 (https://github.com/bitflags/bitflags)
@@ -1421,7 +1445,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - nom 7.1.3 (https://github.com/Geal/nom)
 --------------------------------------------------------------------------------
@@ -1449,7 +1473,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - libsqlite3-sys 0.30.1 (https://github.com/rusqlite/rusqlite)
 - rusqlite 0.32.1 (https://github.com/rusqlite/rusqlite)
@@ -1477,7 +1501,7 @@ THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - flate2 1.1.10 (https://github.com/rust-lang/flate2-rs)
 --------------------------------------------------------------------------------
@@ -1510,7 +1534,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - either 1.18.0 (https://github.com/rayon-rs/either)
 - itertools 0.14.0 (https://github.com/rust-itertools/itertools)
@@ -1544,7 +1568,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - bit-vec 0.6.3 (https://github.com/contain-rs/bit-vec)
 - heck 0.5.0 (https://github.com/withoutboats/heck)
@@ -1580,7 +1604,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - fallible-iterator 0.3.0 (https://github.com/sfackler/rust-fallible-iterator)
 --------------------------------------------------------------------------------
@@ -1607,7 +1631,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - enum-as-inner 0.6.1 (https://github.com/bluejekyll/enum-as-inner)
 --------------------------------------------------------------------------------
@@ -1635,7 +1659,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - unicode_categories 0.1.1 (https://github.com/swgillespie/unicode-categories)
 --------------------------------------------------------------------------------
@@ -1662,7 +1686,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - num_cpus 1.17.0 (https://github.com/seanmonstar/num_cpus)
 --------------------------------------------------------------------------------
@@ -1690,7 +1714,7 @@ THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - hashbrown 0.14.5 (https://github.com/rust-lang/hashbrown)
 - hashbrown 0.17.1 (https://github.com/rust-lang/hashbrown)
@@ -1724,7 +1748,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - rustls 0.23.46 (https://github.com/rustls/rustls)
 --------------------------------------------------------------------------------
@@ -1757,7 +1781,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - bit-set 0.5.3 (https://github.com/contain-rs/bit-set)
 --------------------------------------------------------------------------------
@@ -1790,7 +1814,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - fallible-streaming-iterator 0.1.9 (https://github.com/sfackler/fallible-streaming-iterator)
 --------------------------------------------------------------------------------
@@ -1817,7 +1841,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - indexmap 2.14.2 (https://github.com/indexmap-rs/indexmap)
 --------------------------------------------------------------------------------
@@ -1850,7 +1874,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - equivalent 1.0.2 (https://github.com/indexmap-rs/equivalent)
 --------------------------------------------------------------------------------
@@ -1883,7 +1907,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - digest 0.10.7 (https://github.com/RustCrypto/traits)
 --------------------------------------------------------------------------------
@@ -1916,7 +1940,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - fnv 1.0.7 (https://github.com/servo/rust-fnv)
 --------------------------------------------------------------------------------
@@ -1949,7 +1973,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - stable_deref_trait 1.2.1 (https://github.com/storyyeller/stable_deref_trait)
 --------------------------------------------------------------------------------
@@ -1981,7 +2005,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - rayon-cond 0.4.0 (https://github.com/cuviper/rayon-cond)
 --------------------------------------------------------------------------------
@@ -2014,7 +2038,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - flexi_logger 0.29.8 (https://github.com/emabee/flexi_logger)
 --------------------------------------------------------------------------------
@@ -2047,7 +2071,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - smallvec 1.16.2 (https://github.com/servo/rust-smallvec)
 --------------------------------------------------------------------------------
@@ -2080,7 +2104,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - ahash 0.8.12 (https://github.com/tkaitchuck/ahash)
 --------------------------------------------------------------------------------
@@ -2113,7 +2137,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - block-buffer 0.10.4 (https://github.com/RustCrypto/utils)
 --------------------------------------------------------------------------------
@@ -2146,7 +2170,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - ed25519 2.2.3 (https://github.com/RustCrypto/signatures/tree/master/ed25519)
 - signature 2.2.0 (https://github.com/RustCrypto/traits/tree/master/signature)
@@ -2180,7 +2204,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - getrandom 0.2.17 (https://github.com/rust-random/getrandom)
 --------------------------------------------------------------------------------
@@ -2214,7 +2238,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - getrandom 0.3.4 (https://github.com/rust-random/getrandom)
 --------------------------------------------------------------------------------
@@ -2248,7 +2272,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - zeroize 1.9.0 (https://github.com/RustCrypto/utils)
 --------------------------------------------------------------------------------
@@ -2281,7 +2305,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - ppv-lite86 0.2.21 (https://github.com/cryptocorrosion/cryptocorrosion)
 --------------------------------------------------------------------------------
@@ -2314,7 +2338,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - tracing-attributes 0.1.31 (https://github.com/tokio-rs/tracing)
 - tracing-core 0.1.36 (https://github.com/tokio-rs/tracing)
@@ -2349,7 +2373,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - iana-time-zone 0.1.65 (https://github.com/strawlab/iana-time-zone)
 --------------------------------------------------------------------------------
@@ -2382,7 +2406,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - memmap2 0.9.11 (https://github.com/RazrFalcon/memmap2-rs)
 --------------------------------------------------------------------------------
@@ -2416,7 +2440,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - cpufeatures 0.2.17 (https://github.com/RustCrypto/utils)
 --------------------------------------------------------------------------------
@@ -2449,7 +2473,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - crypto-common 0.1.7 (https://github.com/RustCrypto/traits)
 --------------------------------------------------------------------------------
@@ -2482,7 +2506,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - rustls-pki-types 1.15.1 (https://github.com/rustls/pki-types)
 --------------------------------------------------------------------------------
@@ -2515,7 +2539,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - serde_spanned 0.6.9 (https://github.com/toml-rs/toml)
 - toml 0.8.23 (https://github.com/toml-rs/toml)
@@ -2546,7 +2570,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - libc 0.2.190 (https://github.com/rust-lang/libc)
 --------------------------------------------------------------------------------
@@ -2579,7 +2603,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - idna_adapter 1.2.2 (https://github.com/hsivonen/idna_adapter)
 --------------------------------------------------------------------------------
@@ -2612,7 +2636,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - synstructure 0.13.2 (https://github.com/mystor/synstructure)
 - synstructure 0.14.0 (https://github.com/mystor/synstructure)
@@ -2628,7 +2652,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - rand_distr 0.5.1 (https://github.com/rust-random/rand_distr)
 --------------------------------------------------------------------------------
@@ -2661,7 +2685,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - rand 0.9.5 (https://github.com/rust-random/rand)
 - rand_chacha 0.9.0 (https://github.com/rust-random/rand)
@@ -2697,7 +2721,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - zerocopy-derive 0.8.60 (https://github.com/google/zerocopy)
 - zerocopy 0.8.60 (https://github.com/google/zerocopy)
@@ -2732,7 +2756,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - utf8_iter 1.0.4 (https://github.com/hsivonen/utf8_iter)
 --------------------------------------------------------------------------------
@@ -2765,7 +2789,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - static_assertions 1.1.0 (https://github.com/nvzqz/static-assertions-rs)
 --------------------------------------------------------------------------------
@@ -2794,7 +2818,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - darling 0.20.11 (https://github.com/TedDriggs/darling)
 - darling_core 0.20.11 (https://github.com/TedDriggs/darling)
@@ -2825,7 +2849,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - crc32fast 1.5.2 (https://github.com/srijs/rust-crc32fast)
 --------------------------------------------------------------------------------
@@ -2854,7 +2878,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - bytemuck 1.25.2 (https://github.com/Lokathor/bytemuck)
 - bytemuck_derive 1.12.1 (https://github.com/Lokathor/bytemuck)
@@ -2872,7 +2896,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - macro_rules_attribute-proc_macro 0.2.3 (https://github.com/danielhenrymantilla/macro_rules_attribute-rs)
 - macro_rules_attribute 0.2.3 (https://github.com/danielhenrymantilla/macro_rules_attribute-rs)
@@ -2902,7 +2926,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - ureq 2.12.1 (https://github.com/algesten/ureq)
 --------------------------------------------------------------------------------
@@ -2931,7 +2955,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - compact_str 0.9.1 (https://github.com/ParkMyCar/compact_str)
 --------------------------------------------------------------------------------
@@ -2960,7 +2984,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - castaway 0.2.4 (https://github.com/sagebind/castaway)
 --------------------------------------------------------------------------------
@@ -2989,7 +3013,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - gemm-c32 0.17.1 (https://github.com/sarah-ek/gemm/)
 - gemm-c32 0.18.2 (https://github.com/sarah-ek/gemm/)
@@ -3033,7 +3057,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - dyn-stack 0.10.0 (https://github.com/kitegi/dynstack/)
 - dyn-stack 0.13.2 (https://codeberg.org/sarah-quinones/dyn-stack)
@@ -3064,7 +3088,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - sqlite-vec 0.1.9 (https://github.com/asg017/sqlite-vec)
 --------------------------------------------------------------------------------
@@ -3093,7 +3117,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - dyn-stack-macros 0.1.3 (https://github.com/kitegi/dynstack/)
 --------------------------------------------------------------------------------
@@ -3122,7 +3146,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - simd-adler32 0.3.10 (https://github.com/mcountryman/simd-adler32)
 --------------------------------------------------------------------------------
@@ -3151,7 +3175,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - miniz_oxide 0.9.1 (https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide)
 --------------------------------------------------------------------------------
@@ -3184,7 +3208,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - miniz_oxide 0.9.1 (https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide)
 --------------------------------------------------------------------------------
@@ -3216,7 +3240,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - half 2.7.1 (https://github.com/VoidStarKat/half-rs)
 - ident_case 1.0.1 (https://github.com/TedDriggs/ident_case)
@@ -3244,7 +3268,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - ring 0.17.14 (https://github.com/briansmith/ring)
 --------------------------------------------------------------------------------
@@ -3275,7 +3299,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - candle-core 0.8.4 (https://github.com/huggingface/candle)
 - adler2 2.0.1 (https://github.com/oyvindln/adler2)
@@ -3339,7 +3363,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - winnow 0.7.15 (https://github.com/winnow-rs/winnow)
 --------------------------------------------------------------------------------
@@ -3365,7 +3389,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - chrono 0.4.45 (https://github.com/chronotope/chrono)
 --------------------------------------------------------------------------------
@@ -3404,7 +3428,7 @@ THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - fancy-regex 0.13.0 (https://github.com/fancy-regex/fancy-regex)
 --------------------------------------------------------------------------------
@@ -3433,7 +3457,7 @@ THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - tracing-core 0.1.36 (https://github.com/tokio-rs/tracing)
 - zip 9.0.5 (https://github.com/zip-rs/zip2)
@@ -3463,7 +3487,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - typenum 1.20.1 (https://github.com/paholg/typenum)
 --------------------------------------------------------------------------------
@@ -3492,7 +3516,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - base64 0.13.1 (https://github.com/marshallpierce/rust-base64)
 - base64 0.22.1 (https://github.com/marshallpierce/rust-base64)
@@ -3522,7 +3546,7 @@ THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - aho-corasick 1.1.5 (https://github.com/BurntSushi/aho-corasick)
 - byteorder 1.5.0 (https://github.com/BurntSushi/byteorder)
@@ -3554,7 +3578,7 @@ THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - nix 0.31.3 (https://github.com/nix-rust/nix)
 --------------------------------------------------------------------------------
@@ -3583,7 +3607,7 @@ THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - strsim 0.11.1 (https://github.com/rapidfuzz/strsim-rs)
 --------------------------------------------------------------------------------
@@ -3614,7 +3638,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - raw-cpuid 10.7.0 (https://github.com/gz/rust-cpuid)
 - raw-cpuid 11.6.0 (https://github.com/gz/rust-cpuid)
@@ -3643,7 +3667,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - ureq 2.12.1 (https://github.com/algesten/ureq)
 --------------------------------------------------------------------------------
@@ -3673,7 +3697,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - derive_builder 0.20.2 (https://github.com/colin-kiegel/rust-derive-builder)
 - derive_builder_core 0.20.2 (https://github.com/colin-kiegel/rust-derive-builder)
@@ -3704,7 +3728,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - same-file 1.0.6 (https://github.com/BurntSushi/same-file)
 - winapi-util 0.1.11 (https://github.com/BurntSushi/winapi-util)
@@ -3734,7 +3758,7 @@ THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - sysctl 0.5.5 (https://github.com/johalun/sysctl-rs)
 - sysctl 0.6.0 (https://github.com/johalun/sysctl-rs)
@@ -3763,7 +3787,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - crossbeam-deque 0.8.8 (https://github.com/crossbeam-rs/crossbeam)
 - crossbeam-epoch 0.9.21 (https://github.com/crossbeam-rs/crossbeam)
@@ -3800,7 +3824,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - nu-ansi-term 0.50.3 (https://github.com/nushell/nu-ansi-term)
 --------------------------------------------------------------------------------
@@ -3830,7 +3854,7 @@ SOFTWARE.
 
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - generic-array 0.14.7 (https://github.com/fizyk20/generic-array.git)
 --------------------------------------------------------------------------------
@@ -3858,7 +3882,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - hashlink 0.9.1 (https://github.com/kyren/hashlink)
 --------------------------------------------------------------------------------
@@ -3891,7 +3915,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ================================================================================
-MIT License
+MIT License (MIT)
 Used by:
 - libm 0.2.16 (https://github.com/rust-lang/compiler-builtins)
 --------------------------------------------------------------------------------
@@ -4157,7 +4181,7 @@ Copyright notices are retained in src/* files where relevant.
 
 
 ================================================================================
-Mozilla Public License 2.0
+Mozilla Public License 2.0 (MPL-2.0)
 Used by:
 - tabmail-native-fts 0.12.2
 --------------------------------------------------------------------------------
@@ -4538,7 +4562,7 @@ Exhibit B - "Incompatible With Secondary Licenses" Notice
 
 
 ================================================================================
-Unicode License v3
+Unicode License v3 (Unicode-3.0)
 Used by:
 - unicode-ident 1.0.26 (https://github.com/dtolnay/unicode-ident)
 --------------------------------------------------------------------------------
@@ -4585,7 +4609,7 @@ authorization of the copyright holder.
 
 
 ================================================================================
-Unicode License v3
+Unicode License v3 (Unicode-3.0)
 Used by:
 - icu_collections 2.3.0 (https://github.com/unicode-org/icu4x)
 - icu_locale_core 2.3.0 (https://github.com/unicode-org/icu4x)
@@ -4658,7 +4682,72 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 
 ================================================================================
-SQLite Blessing
+Unicode License Agreement - Data Files and Software (2016) (Unicode-DFS-2016)
+Used by:
+- regex-syntax 0.8.11 (https://github.com/rust-lang/regex)
+--------------------------------------------------------------------------------
+
+UNICODE, INC. LICENSE AGREEMENT - DATA FILES AND SOFTWARE
+
+Unicode Data Files include all data files under the directories
+http://www.unicode.org/Public/, http://www.unicode.org/reports/,
+http://www.unicode.org/cldr/data/, http://source.icu-project.org/repos/icu/, and
+http://www.unicode.org/utility/trac/browser/.
+
+Unicode Data Files do not include PDF online code charts under the
+directory http://www.unicode.org/Public/.
+
+Software includes any source code published in the Unicode Standard
+or under the directories
+http://www.unicode.org/Public/, http://www.unicode.org/reports/,
+http://www.unicode.org/cldr/data/, http://source.icu-project.org/repos/icu/, and
+http://www.unicode.org/utility/trac/browser/.
+
+NOTICE TO USER: Carefully read the following legal agreement.
+BY DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING UNICODE INC.'S
+DATA FILES ("DATA FILES"), AND/OR SOFTWARE ("SOFTWARE"),
+YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
+TERMS AND CONDITIONS OF THIS AGREEMENT.
+IF YOU DO NOT AGREE, DO NOT DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE
+THE DATA FILES OR SOFTWARE.
+
+COPYRIGHT AND PERMISSION NOTICE
+
+Copyright © 1991-2018 Unicode, Inc. All rights reserved.
+Distributed under the Terms of Use in http://www.unicode.org/copyright.html.
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of the Unicode data files and any associated documentation
+(the "Data Files") or Unicode software and any associated documentation
+(the "Software") to deal in the Data Files or Software
+without restriction, including without limitation the rights to use,
+copy, modify, merge, publish, distribute, and/or sell copies of
+the Data Files or Software, and to permit persons to whom the Data Files
+or Software are furnished to do so, provided that either
+(a) this copyright and permission notice appear with all copies
+of the Data Files or Software, or
+(b) this copyright and permission notice appear in associated
+Documentation.
+
+THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT OF THIRD PARTY RIGHTS.
+IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS
+NOTICE BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL
+DAMAGES, OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE,
+DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+PERFORMANCE OF THE DATA FILES OR SOFTWARE.
+
+Except as contained in this notice, the name of a copyright holder
+shall not be used in advertising or otherwise to promote the sale,
+use or other dealings in these Data Files or Software without prior
+written authorization of the copyright holder.
+
+
+================================================================================
+SQLite Blessing (blessing)
 Used by:
 - libsqlite3-sys 0.30.1 (https://github.com/rusqlite/rusqlite)
 --------------------------------------------------------------------------------
