@@ -103,6 +103,24 @@ python3 tests/run_tests.py update
 python3 tests/run_tests.py -v
 ```
 
+## Third-party notices
+
+`THIRD_PARTY_NOTICES.txt` is generated from `Cargo.lock` by
+[cargo-about](https://github.com/EmbarkStudios/cargo-about) (`about.toml`, `about.hbs`). After any
+dependency change, generate it again and commit it:
+
+```bash
+cargo install cargo-about --version 0.9.3 --locked --features cli   # once
+scripts/generate-third-party-notices.sh
+```
+
+`scripts/check-third-party-notices.py` (also run by the tests) fails if a crate the helper is built
+from is missing from the file, or if a crate's entry fell back to a license template with no
+copyright line. A crate that ships no license file, or one the scanner cannot read, gets a
+clarification in `about.toml` that pins its real file by checksum. If that file changes, cargo-about
+ignores the clarification (it only warns), and the checker fails because the crate is no longer
+credited under every license the clarification names: read the new file, then update the checksum.
+
 ## Native messaging manifest
 
 The manifest tells Thunderbird where to find the helper binary. Each platform's installer writes
@@ -339,7 +357,10 @@ Copyright © Lisem AI Ltd.
 See:
 
 - [LICENSE](./LICENSE)
-- [THIRD_PARTY_LICENSES.md](./THIRD_PARTY_LICENSES.md): third-party model and library licenses
+- [THIRD_PARTY_NOTICES.txt](./THIRD_PARTY_NOTICES.txt): the copyright notices and license texts of
+  the open-source software the helper is built with, and of the embedding model. The installer
+  packages ship this file next to the helper, and each release uploads it next to the update
+  binaries. The install scripts and self-update will install it too (#61, #62).
 
 ## Contributing
 

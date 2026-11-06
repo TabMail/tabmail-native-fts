@@ -25,6 +25,12 @@
 tabmail-native-fts/
 ├── Cargo.toml                   # Dependencies: ureq, rusqlite, candle, sqlite-vec
 ├── Cargo.lock
+├── THIRD_PARTY_NOTICES.txt      # Generated notices + license texts; ships with every form (ADR-NF-024)
+├── about.toml / about.hbs       # cargo-about config (targets, clarifications) and template for it
+│
+├── scripts/
+│   ├── generate-third-party-notices.sh  # Regenerate THIRD_PARTY_NOTICES.txt (pinned cargo-about)
+│   └── check-third-party-notices.py     # Fails on a missing crate or a template license text
 │
 ├── src/
 │   ├── main.rs                  # Entry point: native messaging loop, thread dispatch
