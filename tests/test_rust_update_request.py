@@ -20,6 +20,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -146,8 +147,9 @@ class TestRustUpdateRequest(unittest.TestCase):
         sha256_hex = hashlib.sha256(self.download_file.read_bytes()).hexdigest()
         platform_key = _platform_key_macos()
 
-        # targetVersion higher than current; binary bytes can be identical for this integration test.
-        target_version = "0.6.999"
+        # The served build is this build, and an update is refused unless the served build's
+        # notices credit the target version (#62), so the target is this build's version.
+        target_version = re.search(r'^version = "([^"]+)"', (Path(__file__).resolve().parent.parent / "Cargo.toml").read_text(), re.M).group(1)
         msg = _signed_message(target_version, platform_key, sha256_hex, url)
         sig_b64 = _sign_ed25519_base64(self.private_key_pem, msg)
 

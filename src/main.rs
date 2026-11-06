@@ -39,6 +39,9 @@ fn real_main() -> anyhow::Result<()> {
     // `--log-dir <absolute path>`: the caller names the log folder. It is an
     // argument, not an init parameter, because logging starts before the first message.
     let args: Vec<String> = std::env::args().collect();
+    // Which binary file this process runs from, before anything can replace it: `hello` writes
+    // this build's notices only while the file at the helper's path is still this one (#62).
+    self_update::remember_started_binary();
     // An updater reads a downloaded helper's notices this way (#62). It runs before logging and
     // touches no files.
     if args.len() == 2 && args[1] == config::update::PRINT_NOTICES_ARG {
@@ -68,15 +71,8 @@ fn real_main() -> anyhow::Result<()> {
 
     // Special mode used by Windows self-update: run as a short-lived helper that swaps files.
     // This must happen BEFORE we start native-messaging framing.
-    if args.len() >= 2 && args[1] == "--apply-update" {
-        let target = read_arg_value(&args, "--target").context("missing --target")?;
-        let staged = read_arg_value(&args, "--staged").context("missing --staged")?;
-        let staged_notices = read_arg_value(&args, "--staged-notices");
-        return self_update::apply_update_mode(
-            Path::new(&target),
-            Path::new(&staged),
-            staged_notices.as_deref().map(Path::new),
-        );
+    if let Some(apply) = self_update::parse_apply_update_args(&args)? {
+        return self_update::apply_update_mode(&apply.target, &apply.staged, apply.staged_notices.as_deref());
     }
 
     // Register sqlite-vec as an auto-extension before any DB connections are opened.
@@ -1011,10 +1007,10 @@ fn handle_hello(msg_id: &str, params: &Value) -> anyhow::Result<Value> {
 
     let current_path = install_paths::current_exe_path();
 
-    // An install from before the notices existed, updated by an updater from before #62, has
-    // none next to the helper: put this build's there. An existing file is never replaced here
-    // (non-fatal, like the migration above).
-    match self_update::install_missing_notices(&current_path) {
+    // The notices next to the helper are this build's while this process is still the binary
+    // installed there; this repairs any update that left them different (non-fatal, like the
+    // migration above).
+    match self_update::reconcile_notices(&current_path, self_update::started_binary()) {
         Ok(true) => log::info!("Installed this build's third-party notices next to {}", current_path.display()),
         Ok(false) => {}
         Err(e) => log::error!("Installing third-party notices failed (non-fatal): {:?}", e),

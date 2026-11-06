@@ -59,10 +59,10 @@ fn credited_helper_version(notices: &str) -> Option<&str> {
         .map(str::trim)
 }
 
-/// Writes `text` to `dest`: beside it first, then renamed into place, so a reader never sees
-/// a partial file. Replaces what is there.
+/// Writes `text` to `dest`: to a file beside it that only this process uses, then renamed into
+/// place, so a reader never sees a partial file. Replaces what is there.
 fn write_replacing(dest: &Path, text: &[u8]) -> anyhow::Result<()> {
-    let staged = with_suffix(dest, config::update::STAGED_SUFFIX);
+    let staged = with_suffix(dest, &format!(".{}{}", std::process::id(), config::update::STAGED_SUFFIX));
     let written = std::fs::write(&staged, text)
         .with_context(|| format!("failed writing {}", staged.display()))
         .and_then(|_| {
@@ -74,37 +74,72 @@ fn write_replacing(dest: &Path, text: &[u8]) -> anyhow::Result<()> {
     written
 }
 
-/// Publishes `text` at `dest` only if nothing is there, atomically: written to a file only
-/// this process uses, then hard-linked into place, which fails rather than replace a file.
-/// Returns whether it published.
-fn publish_if_absent(dest: &Path, text: &[u8]) -> anyhow::Result<bool> {
-    let own = with_suffix(dest, &format!(".{}{}", std::process::id(), config::update::STAGED_SUFFIX));
-    std::fs::write(&own, text).with_context(|| format!("failed writing {}", own.display()))?;
-    let linked = std::fs::hard_link(&own, dest);
-    let _ = std::fs::remove_file(&own);
-    match linked {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(e) => Err(e).with_context(|| format!("failed publishing {}", dest.display())),
-    }
+/// What tells one binary file at a path from another: an update or an installer replaces the
+/// file, which changes these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryIdentity {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
 }
 
-/// On `hello`: when there are no notices next to the helper at `exe`, puts this build's there.
-/// That is the state an install from before the notices existed is in after an update applied
-/// by an updater from before #62. It never replaces a notices file: every updater since #62
-/// installs the new build's notices together with its binary, and an older process still
-/// running from the folder must not put its own back. Writes nothing when `exe` is not named as
-/// a TabMail FTS install: a client that bundles its own copy (Voice) ships its notices under
-/// its own name, inside a signed app this must not change.
-pub fn install_missing_notices(exe: &Path) -> anyhow::Result<bool> {
+fn identity_of(path: &Path) -> Option<BinaryIdentity> {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    Some(BinaryIdentity {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+        #[cfg(unix)]
+        dev: meta.dev(),
+        #[cfg(unix)]
+        ino: meta.ino(),
+    })
+}
+
+static STARTED_AS: std::sync::OnceLock<Option<BinaryIdentity>> = std::sync::OnceLock::new();
+
+/// Records which binary file this process was started from. Called first thing at startup, so
+/// `hello` can tell whether the file at the helper's path is still this build.
+pub fn remember_started_binary() {
+    STARTED_AS.get_or_init(|| identity_of(&install_paths::current_exe_path()));
+}
+
+pub fn started_binary() -> Option<&'static BinaryIdentity> {
+    STARTED_AS.get().and_then(Option::as_ref)
+}
+
+/// On `hello`: makes the notices next to the helper at `exe` this build's, when this process is
+/// still the binary installed there (`exe` is the file `started_as` identifies). That repairs
+/// every state in which the installed binary and its notices differ: an install from before the
+/// notices existed, an update applied by an updater from before #62 (it swaps only the binary),
+/// and an update whose rollback could not finish. A process whose binary has been replaced since
+/// it started writes nothing, so an older process still running never puts its notices back over
+/// a newer build's. Removes a notices backup left by an update that did not finish. Writes
+/// nothing when `exe` is not named as a TabMail FTS install: a client that bundles its own copy
+/// (Voice) ships its notices under its own name, inside a signed app this must not change.
+/// Returns whether it wrote the notices.
+pub fn reconcile_notices(exe: &Path, started_as: Option<&BinaryIdentity>) -> anyhow::Result<bool> {
     if exe.file_name().and_then(|n| n.to_str()) != Some(install_paths::exe_file_name()) {
         return Ok(false);
     }
-    let notices = notices_beside(exe)?;
-    if std::fs::symlink_metadata(&notices).is_ok() {
-        return Ok(false);
+    match started_as {
+        Some(started) if identity_of(exe).as_ref() == Some(started) => {}
+        _ => return Ok(false),
     }
-    publish_if_absent(&notices, THIRD_PARTY_NOTICES.as_bytes())
+    let notices = notices_beside(exe)?;
+    let wrote = match std::fs::read(&notices) {
+        Ok(installed) if installed == THIRD_PARTY_NOTICES.as_bytes() => false,
+        _ => {
+            write_replacing(&notices, THIRD_PARTY_NOTICES.as_bytes())?;
+            true
+        }
+    };
+    let _ = std::fs::remove_file(with_suffix(&notices, config::update::NOTICES_BACKUP_SUFFIX));
+    Ok(wrote)
 }
 
 pub fn auto_migrate_to_user_local() -> anyhow::Result<bool> {
@@ -535,6 +570,53 @@ fn remove_quarantine(p: &Path) {
     }
 }
 
+const APPLY_UPDATE_ARG: &str = "--apply-update";
+const TARGET_ARG: &str = "--target";
+const STAGED_ARG: &str = "--staged";
+const STAGED_NOTICES_ARG: &str = "--staged-notices";
+
+/// What the Windows apply-update process is told to install.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ApplyUpdateArgs {
+    pub target: PathBuf,
+    pub staged: PathBuf,
+    /// Absent when the process was started by an updater from before #62.
+    pub staged_notices: Option<PathBuf>,
+}
+
+/// The arguments the updater starts the apply-update process with; `parse_apply_update_args`
+/// reads them back.
+fn apply_update_args(target: &Path, staged: &Path, staged_notices: &Path) -> Vec<std::ffi::OsString> {
+    vec![
+        APPLY_UPDATE_ARG.into(),
+        TARGET_ARG.into(),
+        target.into(),
+        STAGED_ARG.into(),
+        staged.into(),
+        STAGED_NOTICES_ARG.into(),
+        staged_notices.into(),
+    ]
+}
+
+/// The apply-update process's arguments (`args` as `std::env::args` gives them), or `None` when
+/// the helper was not started in apply-update mode.
+pub fn parse_apply_update_args(args: &[String]) -> anyhow::Result<Option<ApplyUpdateArgs>> {
+    if args.get(1).map(String::as_str) != Some(APPLY_UPDATE_ARG) {
+        return Ok(None);
+    }
+    let value = |key: &str| {
+        args.iter()
+            .position(|a| a == key)
+            .and_then(|i| args.get(i + 1))
+            .map(PathBuf::from)
+    };
+    Ok(Some(ApplyUpdateArgs {
+        target: value(TARGET_ARG).with_context(|| format!("missing {}", TARGET_ARG))?,
+        staged: value(STAGED_ARG).with_context(|| format!("missing {}", STAGED_ARG))?,
+        staged_notices: value(STAGED_NOTICES_ARG),
+    }))
+}
+
 fn spawn_apply_update_helper(target: &Path, staged: &Path, staged_notices: &Path) -> anyhow::Result<()> {
     // On Windows, we can't overwrite a running exe. We spawn a TEMP COPY of ourselves to perform the swap.
     let current = install_paths::current_exe_path();
@@ -545,13 +627,7 @@ fn spawn_apply_update_helper(target: &Path, staged: &Path, staged_notices: &Path
 
     log::info!("Spawning apply-update helper: {}", helper.display());
     Command::new(&helper)
-        .arg("--apply-update")
-        .arg("--target")
-        .arg(target)
-        .arg("--staged")
-        .arg(staged)
-        .arg("--staged-notices")
-        .arg(staged_notices)
+        .args(apply_update_args(target, staged, staged_notices))
         .spawn()
         .context("failed spawning apply-update helper")?;
     Ok(())
@@ -656,44 +732,95 @@ mod tests {
         assert_eq!(credited_helper_version(THIRD_PARTY_NOTICES), Some(config::HOST_VERSION));
     }
 
-    // ---- hello: create only ----
+    // ---- hello: the installed binary's notices ----
+
+    /// A helper installed in `dir`, and the identity a process started from it records.
+    fn installed_helper(dir: &Path) -> (PathBuf, BinaryIdentity) {
+        let exe = dir.join(install_paths::exe_file_name());
+        std::fs::write(&exe, b"the installed helper").unwrap();
+        let started = identity_of(&exe).unwrap();
+        (exe, started)
+    }
 
     #[test]
     fn hello_puts_notices_beside_a_helper_that_has_none() {
         let dir = test_dir("hello-absent");
-        assert!(install_missing_notices(&dir.join(install_paths::exe_file_name())).unwrap());
+        let (exe, started) = installed_helper(&dir);
+        assert!(reconcile_notices(&exe, Some(&started)).unwrap());
         assert_eq!(std::fs::read_to_string(notices_in(&dir)).unwrap(), THIRD_PARTY_NOTICES);
-        assert_eq!(names_in(&dir), vec![config::update::NOTICES_FILE_NAME.to_string()]);
+        assert_eq!(names_in(&dir), vec![install_paths::exe_file_name().to_string(), config::update::NOTICES_FILE_NAME.to_string()]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn hello_never_replaces_existing_notices() {
-        let dir = test_dir("hello-existing");
-        let other = notices_crediting("999.0.0");
-        std::fs::write(notices_in(&dir), &other).unwrap();
-        assert!(!install_missing_notices(&dir.join(install_paths::exe_file_name())).unwrap());
-        assert_eq!(std::fs::read_to_string(notices_in(&dir)).unwrap(), other);
+    fn hello_replaces_notices_of_another_build_next_to_this_one() {
+        // An older updater swapped in this binary and left the previous build's notices.
+        let dir = test_dir("hello-stale");
+        let (exe, started) = installed_helper(&dir);
+        std::fs::write(notices_in(&dir), notices_crediting("0.0.1")).unwrap();
+        assert!(reconcile_notices(&exe, Some(&started)).unwrap());
+        assert_eq!(std::fs::read_to_string(notices_in(&dir)).unwrap(), THIRD_PARTY_NOTICES);
+        assert_eq!(names_in(&dir), vec![install_paths::exe_file_name().to_string(), config::update::NOTICES_FILE_NAME.to_string()]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn a_file_that_appears_before_the_link_is_not_replaced() {
-        // The race the existence check cannot see: another process publishes first.
-        let dir = test_dir("publish-race");
-        let theirs = notices_crediting("999.0.0");
-        std::fs::write(notices_in(&dir), &theirs).unwrap();
-        assert!(!publish_if_absent(&notices_in(&dir), THIRD_PARTY_NOTICES.as_bytes()).unwrap());
-        assert_eq!(std::fs::read_to_string(notices_in(&dir)).unwrap(), theirs);
-        assert_eq!(names_in(&dir), vec![config::update::NOTICES_FILE_NAME.to_string()]);
+    fn hello_leaves_this_build_s_notices_as_they_are() {
+        let dir = test_dir("hello-current");
+        let (exe, started) = installed_helper(&dir);
+        std::fs::write(notices_in(&dir), THIRD_PARTY_NOTICES).unwrap();
+        assert!(!reconcile_notices(&exe, Some(&started)).unwrap());
+        assert_eq!(std::fs::read_to_string(notices_in(&dir)).unwrap(), THIRD_PARTY_NOTICES);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_process_whose_binary_was_replaced_since_it_started_writes_nothing() {
+        // An older process still running after an update must not put its notices back.
+        let dir = test_dir("hello-replaced");
+        let (exe, started) = installed_helper(&dir);
+        let newer = notices_crediting("999.0.0");
+        let staged = dir.join("staged");
+        std::fs::write(&staged, b"the newer helper").unwrap();
+        std::fs::rename(&staged, &exe).unwrap();
+        std::fs::write(notices_in(&dir), &newer).unwrap();
+        assert!(!reconcile_notices(&exe, Some(&started)).unwrap());
+        assert_eq!(std::fs::read_to_string(notices_in(&dir)).unwrap(), newer);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_process_that_does_not_know_its_binary_writes_nothing() {
+        let dir = test_dir("hello-unknown");
+        let (exe, _) = installed_helper(&dir);
+        assert!(!reconcile_notices(&exe, None).unwrap());
+        assert_eq!(names_in(&dir), vec![install_paths::exe_file_name().to_string()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hello_finishes_an_update_whose_rollback_did_not() {
+        // The new notices went in, the binary swap failed, and putting the old notices back
+        // failed too: the installed binary's next hello makes the pair its own again.
+        let dir = test_dir("hello-unfinished");
+        let (exe, started) = installed_helper(&dir);
+        std::fs::write(notices_in(&dir), notices_crediting("999.0.0")).unwrap();
+        let backup = with_suffix(&notices_in(&dir), config::update::NOTICES_BACKUP_SUFFIX);
+        std::fs::write(&backup, THIRD_PARTY_NOTICES).unwrap();
+        assert!(reconcile_notices(&exe, Some(&started)).unwrap());
+        assert_eq!(std::fs::read_to_string(notices_in(&dir)).unwrap(), THIRD_PARTY_NOTICES);
+        assert_eq!(names_in(&dir), vec![install_paths::exe_file_name().to_string(), config::update::NOTICES_FILE_NAME.to_string()]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn hello_writes_nothing_for_a_helper_under_another_name() {
         let dir = test_dir("hello-bundled");
-        assert!(!install_missing_notices(&dir.join("voice-memory")).unwrap());
-        assert!(names_in(&dir).is_empty());
+        let exe = dir.join("voice-memory");
+        std::fs::write(&exe, b"a bundled helper").unwrap();
+        let started = identity_of(&exe).unwrap();
+        assert!(!reconcile_notices(&exe, Some(&started)).unwrap());
+        assert_eq!(names_in(&dir), vec!["voice-memory".to_string()]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -702,12 +829,37 @@ mod tests {
     fn hello_in_a_folder_it_cannot_write_fails_and_leaves_nothing() {
         use std::os::unix::fs::PermissionsExt;
         let dir = test_dir("hello-readonly");
+        let (exe, started) = installed_helper(&dir);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let result = install_missing_notices(&dir.join(install_paths::exe_file_name()));
+        let result = reconcile_notices(&exe, Some(&started));
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(result.is_err());
-        assert!(names_in(&dir).is_empty());
+        assert_eq!(names_in(&dir), vec![install_paths::exe_file_name().to_string()]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- the Windows apply-update handoff ----
+
+    #[test]
+    fn the_apply_update_process_reads_back_exactly_what_the_updater_passes() {
+        let (target, staged, notices) = (Path::new("/i/fts_helper.exe"), Path::new("/i/fts_helper.exe.new"), Path::new("/i/n.new"));
+        let mut args = vec!["fts_helper_apply_update.exe".to_string()];
+        args.extend(apply_update_args(target, staged, notices).into_iter().map(|a| a.into_string().unwrap()));
+        assert_eq!(
+            parse_apply_update_args(&args).unwrap(),
+            Some(ApplyUpdateArgs { target: target.into(), staged: staged.into(), staged_notices: Some(notices.into()) })
+        );
+    }
+
+    #[test]
+    fn an_apply_update_process_from_an_older_updater_has_no_staged_notices() {
+        let args: Vec<String> = ["h", "--apply-update", "--target", "/i/t", "--staged", "/i/s"].iter().map(|a| a.to_string()).collect();
+        assert_eq!(
+            parse_apply_update_args(&args).unwrap(),
+            Some(ApplyUpdateArgs { target: "/i/t".into(), staged: "/i/s".into(), staged_notices: None })
+        );
+        assert!(parse_apply_update_args(&["h".to_string(), "--apply-update".to_string()]).is_err());
+        assert_eq!(parse_apply_update_args(&["h".to_string()]).unwrap(), None);
     }
 
     // ---- migration ----
@@ -895,11 +1047,15 @@ mod tests {
     #[test]
     fn notices_large_enough_to_fill_a_pipe_are_read_whole() {
         let dir = test_dir("read-large");
-        let helper = fake_helper(&dir, "helper", &format!(
-            "i=0; while [ $i -lt 20000 ]; do echo 'a line of notice text'; i=$((i+1)); done; echo '{}1.2.3'",
-            config::update::NOTICES_HELPER_CREDIT_PREFIX));
+        // This build's own notices, several times what a pipe holds, each line numbered so a
+        // lost or repeated stretch anywhere shows.
+        let payload: String = THIRD_PARTY_NOTICES.lines().enumerate().map(|(i, l)| format!("{} {}\n", i, l)).collect();
+        assert!(payload.len() > 200_000 && credited_helper_version(&payload).is_none());
+        let payload = format!("{}{}1.2.3\n", payload, config::update::NOTICES_HELPER_CREDIT_PREFIX);
+        std::fs::write(dir.join("payload"), &payload).unwrap();
+        let helper = fake_helper(&dir, "helper", &format!("cat '{}'", dir.join("payload").display()));
         let bytes = notices_of(&helper, "1.2.3", std::time::Duration::from_secs(30)).unwrap();
-        assert!(bytes.len() > 400_000);
+        assert_eq!(bytes, payload.as_bytes());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

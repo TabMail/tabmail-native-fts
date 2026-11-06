@@ -279,8 +279,9 @@ The Thunderbird copy of the helper updates itself:
 5. **Notices:** the helper carries its own third-party notices
    (`fts_helper --print-third-party-notices`). An update installs the new build's notices next to
    it as `fts_helper-THIRD_PARTY_NOTICES.txt` together with the binary, and puts the old ones back
-   if the swap fails. The migration copies them too. On `hello`, the helper creates the file if it
-   is missing, but never replaces it.
+   if the swap fails. The migration copies them too. On `hello`, while the file at its path is
+   still the binary it started from, the helper replaces missing or different notices with its
+   own, which repairs an update applied by an older updater.
 
 TabMail Voice's copy never updates itself (it never sends `hello` or the update requests); a new
 helper arrives with a new version of the app.
