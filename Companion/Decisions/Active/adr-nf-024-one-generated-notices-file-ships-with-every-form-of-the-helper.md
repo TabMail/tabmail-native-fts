@@ -49,13 +49,29 @@ It also downloads the all-MiniLM-L6-v2 model. No distributed form carried their 
   It runs in the tests and in the generator. Every release flow runs it after building and before it uploads or packages anything, so a stale file stops the release (on macOS, after notarization). Every version bump needs a regeneration, because the file credits the helper itself at its version; `maintenance.sh --bump`/`--release` does it.
 - **Shipping.** The file ships next to the helper in every installer package (the macOS `.pkg`, the Windows `Setup.exe`, the full TabMail macOS and Windows installers) and is uploaded to the CDN next to every update binary, before the update manifest. Voice is to ship it from its pinned checkout as-is, in its own change once this one merges. Two forms follow in later changes, because each needs the file on the CDN first or a helper change:
   - `scripts/install.sh` and `scripts/install.ps1` are served live from `main`, so they fetch the notices only once a release has put them on the CDN (#61);
-  - self-update replaces only the binary; installing the new version's notices beside it is #62.
+  - self-update replaced only the binary; it now installs the new build's notices with it (#62, see the amendment below).
 
   A consumer of the CDN takes the version the update manifest names and fetches that version's binary and notices: the `-latest` copies are replaced one at a time. Manifests published before the first release with notices name a version that has none, so a consumer that requires the notices (the full Windows TabMail installer build) refuses until that release: release native-fts before the TabMail installers.
 
 ## Rejected
 
-- **Embedding the text in the binary behind a flag.** That changes the helper, and the file next to it is the standard form.
+- **Embedding the text in the binary behind a flag.** That changes the helper, and the file next to it is the standard form. (#62 does compile the text in, so an updater can take a downloaded build's notices from the build itself; the file next to the helper stays the form users get.)
 - **A hand-maintained list.** It drifts with every `cargo update`.
 - **Generating at release time.** That needs cargo-about and the network in each CI job, and makes the text unreviewed. Generating in the repo makes every change reviewable in a diff.
 - **Leaving proc-macros out.** cargo-about has no filter for them, and crediting them too is harmless.
+
+## Amendment 2026-11-06 (#62): an update installs the new build's notices with its binary
+
+Self-update and the user-local migration replaced only the binary, so the notices beside it described an older build. Now the notices beside an installed helper belong to the installed binary.
+
+- **The binary carries its notices.** `self_update::THIRD_PARTY_NOTICES` is the repository's checked `THIRD_PARTY_NOTICES.txt`, compiled in with `include_str!`. `fts_helper --print-third-party-notices` prints them and exits, before logging and without touching any file.
+- **An update installs them as a pair.** After the signature and SHA-256 checks, the updater runs the staged binary with that argument (`notices_of`, bounded by `NOTICES_READ_TIMEOUT_SECS`). The printed notices must credit the target version on their `- tabmail-native-fts <version>` line, which the release check pins to the build. They are staged beside the install. `commit_pair` keeps the installed notices as a backup, renames the staged notices into place, then swaps the binary. If the swap fails, it puts the old notices back (or removes the new ones when there were none). The folder therefore holds the old pair or the new pair. On Windows the apply-update process does the commit after the old helper exits, given `--staged-notices`. A failure before the commit removes both staged files and leaves the installed pair alone, so the update is refused and retried later.
+- **A failed swap keeps the binary.** `try_swap_files` used to move the installed binary aside and leave nothing in its place when the staged one could not be moved in. It now puts the installed binary back.
+- **The migration copies with notices first.** `migrate_from` writes this build's notices beside the user-local copy, then copies the binary, then writes the native-messaging manifests. A failure stops before the later writes, and the next `hello` retries.
+- **`hello` only creates a missing file.** An install from before the notices existed, updated by an updater from before #62, has none next to the helper. On `hello`, `install_missing_notices` publishes this build's notices there: written to a file only this process uses, then hard-linked into place. A hard link fails rather than replace a file. It never replaces a notices file, so an older process still running from the folder after an update cannot put its notices back over the installed build's. It writes nothing when the helper is not named `fts_helper`/`fts_helper.exe`: a client that bundles the helper (Voice's `voice-memory`) ships its notices under its own name inside a signed app, and never sends `hello` (ADR-NF-008). A failure is logged and does not fail `hello`.
+
+Why this and not a download:
+- **Integrity.** The notices are part of the signed, SHA-256-checked binary, so they are exactly as trustworthy as it is.
+- **No release-side change.** A separate download would need a new manifest field and a new signed-message format, with old helpers still verifying the old one. The update manifest is unchanged here, and the release flows already refuse a stale notices file before building anything they ship.
+
+Running the downloaded build before the swap adds one check to the update: a build that cannot print notices crediting its own version is not installed. Cost: the binary grows by the size of the file (about 240 KB).

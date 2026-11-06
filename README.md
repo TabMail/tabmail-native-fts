@@ -276,6 +276,11 @@ The Thunderbird copy of the helper updates itself:
    SHA-256 hash, and swaps the files atomically.
 4. **Auto-migration:** on first run from the system location, the helper copies itself to the
    user-local folder for future updates.
+5. **Notices:** the helper carries its own third-party notices
+   (`fts_helper --print-third-party-notices`). An update installs the new build's notices next to
+   it as `fts_helper-THIRD_PARTY_NOTICES.txt` together with the binary, and puts the old ones back
+   if the swap fails. The migration copies them too. On `hello`, the helper creates the file if it
+   is missing, but never replaces it.
 
 TabMail Voice's copy never updates itself (it never sends `hello` or the update requests); a new
 helper arrives with a new version of the app.
@@ -360,7 +365,8 @@ See:
 - [THIRD_PARTY_NOTICES.txt](./THIRD_PARTY_NOTICES.txt): the copyright notices and license texts of
   the open-source software the helper is built with, and of the embedding model. The installer
   packages ship this file next to the helper, and each release uploads it next to the update
-  binaries. The install scripts and self-update will install it too (#61, #62).
+  binaries, and self-update installs the new build's copy with its binary. The install scripts will
+  install it too (#61).
 
 ## Contributing
 

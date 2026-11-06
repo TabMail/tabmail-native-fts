@@ -13,7 +13,7 @@ mod self_update;
 mod update_signature;
 
 use std::collections::HashSet;
-use std::io::{stdin, stdout, Stdin, Stdout};
+use std::io::{stdin, stdout, Stdin, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
 
@@ -39,6 +39,13 @@ fn real_main() -> anyhow::Result<()> {
     // `--log-dir <absolute path>`: the caller names the log folder. It is an
     // argument, not an init parameter, because logging starts before the first message.
     let args: Vec<String> = std::env::args().collect();
+    // An updater reads a downloaded helper's notices this way (#62). It runs before logging and
+    // touches no files.
+    if args.len() == 2 && args[1] == config::update::PRINT_NOTICES_ARG {
+        stdout().write_all(self_update::THIRD_PARTY_NOTICES.as_bytes())?;
+        stdout().flush()?;
+        return Ok(());
+    }
     // `--log-level <level>`: the file log's level ("off" writes none), so a
     // caller whose policy keeps user content out of logs can turn it off.
     // `--log-dir=<path>` and `--log-level=<level>` are not the documented form;
@@ -64,7 +71,12 @@ fn real_main() -> anyhow::Result<()> {
     if args.len() >= 2 && args[1] == "--apply-update" {
         let target = read_arg_value(&args, "--target").context("missing --target")?;
         let staged = read_arg_value(&args, "--staged").context("missing --staged")?;
-        return self_update::apply_update_mode(Path::new(&target), Path::new(&staged));
+        let staged_notices = read_arg_value(&args, "--staged-notices");
+        return self_update::apply_update_mode(
+            Path::new(&target),
+            Path::new(&staged),
+            staged_notices.as_deref().map(Path::new),
+        );
     }
 
     // Register sqlite-vec as an auto-extension before any DB connections are opened.
@@ -998,6 +1010,16 @@ fn handle_hello(msg_id: &str, params: &Value) -> anyhow::Result<Value> {
     };
 
     let current_path = install_paths::current_exe_path();
+
+    // An install from before the notices existed, updated by an updater from before #62, has
+    // none next to the helper: put this build's there. An existing file is never replaced here
+    // (non-fatal, like the migration above).
+    match self_update::install_missing_notices(&current_path) {
+        Ok(true) => log::info!("Installed this build's third-party notices next to {}", current_path.display()),
+        Ok(false) => {}
+        Err(e) => log::error!("Installing third-party notices failed (non-fatal): {:?}", e),
+    }
+
     let user_dir =
         install_paths::get_user_install_dir().unwrap_or_else(|_| PathBuf::from("unknown"));
     let is_user_install = install_paths::is_relative_to(&current_path, &user_dir);
