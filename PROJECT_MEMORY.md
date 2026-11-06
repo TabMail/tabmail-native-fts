@@ -16,6 +16,7 @@ Native messaging host for full-text search + semantic search. Communicates with 
 
 **Phase A (pre-init, single-threaded):**
 - `hello`, `init`, `updateCheck`, `updateRequest` — handled on main thread
+- A failed `updateCheck`/`updateRequest` (before or after `init`) is answered with `{ id, error }` through `response_or_error` and the session goes on; until #64 a failure ended the helper with no response, which Thunderbird read as an update and reconnected to (tests: `TestAFailedUpdateIsAnswered`)
 
 **Phase B (post-init, multi-threaded):**
 - **Main thread**: reads stdin, dispatches to reader or writer channel via `classify_method()`

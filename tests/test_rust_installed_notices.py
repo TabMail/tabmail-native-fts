@@ -96,11 +96,10 @@ class _HelperFolder(unittest.TestCase):
         return subprocess.Popen([str(exe)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, env=env or self._env(), cwd=self.cwd)
 
-    def _call(self, proc, method, params, answered=True):
+    def _call(self, proc, method, params):
         _send(proc, {"id": method, "method": method, "params": params})
         resp = _read(proc)
-        if answered:
-            self.assertIsNotNone(resp, f"no {method} response")
+        self.assertIsNotNone(resp, f"no {method} response")
         return resp
 
     def _say_hello(self, proc):
@@ -244,9 +243,9 @@ class TestInstalledNotices(_HelperFolder):
         self.assertEqual([p.name for p in self.bin.iterdir()], ["voice-memory"])
 
 
-class TestUpdateRequestInstallsTheNotices(_HelperFolder):
-    """The `updateRequest` a client sends, before and after `init`, ends with the served
-    build's binary and notices installed together, or with the installed pair untouched."""
+class _SignedUpdates(_HelperFolder):
+    """Serves the helper's own build over local HTTP, signed with a throwaway key the helper
+    trusts through `TM_UPDATE_PUBLIC_KEYS_BASE64`; no tests of its own."""
 
     def setUp(self):
         super().setUp()
@@ -294,23 +293,29 @@ class TestUpdateRequestInstallsTheNotices(_HelperFolder):
 
     def _init(self, proc):
         models = self.root / "models"
-        models.mkdir()
+        models.mkdir(exist_ok=True)
         for name in MODEL_FILES:
             (models / name).write_bytes(b"not a model")
         resp = self._call(proc, "init", {"profilePath": str(self.root / "profile"), "modelDir": str(models)})
         self.assertNotIn("error", resp)
 
-    def _update(self, version, after_init, answered=True):
+    def _update(self, version, after_init):
         proc = self._start(self.exe, self._update_env())
         try:
             # No hello: it would make the notices this build's, and the served build is this
             # build, so the old notices would no longer show whether the update installed any.
             if after_init:
                 self._init(proc)
-            resp = self._call(proc, "updateRequest", self._update_params(version), answered)
+            resp = self._call(proc, "updateRequest", self._update_params(version))
         finally:
             code = self._finish(proc)
         return resp, code
+
+
+
+class TestUpdateRequestInstallsTheNotices(_SignedUpdates):
+    """The `updateRequest` a client sends, before and after `init`, ends with the served
+    build's binary and notices installed together, or with the installed pair untouched."""
 
     def _assert_installed_the_served_pair(self, resp, code):
         self.assertNotIn("error", resp)
@@ -333,15 +338,62 @@ class TestUpdateRequestInstallsTheNotices(_HelperFolder):
         installed = self.exe.read_bytes()
         # The served build is a copy of the installed one, so bytes alone cannot show a swap.
         before = os.stat(self.exe)
-        # Whether the helper answers with an error or exits on a refused update is #64's to
-        # settle; it must never report success.
-        resp, _ = self._update(VERSION + ".1", after_init=False, answered=False)
-        self.assertFalse(resp is not None and resp.get("result", {}).get("success") is True, resp)
+        resp, code = self._update(VERSION + ".1", after_init=False)
+        self.assertNotIn("result", resp)
+        self.assertTrue(resp["error"])
+        self.assertEqual(code, 0)
         after = os.stat(self.exe)
         self.assertEqual((after.st_ino, after.st_mtime_ns), (before.st_ino, before.st_mtime_ns))
         self.assertEqual(self.exe.read_bytes(), installed)
         self.assertEqual(self._notices(), self.old_notices)
         self.assertEqual([p.name for p in self.bin.iterdir() if p.name.endswith(".new")], [])
+
+
+class TestAFailedUpdateIsAnswered(_SignedUpdates):
+    """An update method that fails, before or after `init`, is answered with `{ id, error }`
+    and the helper goes on serving the session (#64)."""
+
+    def _failing_update_requests(self):
+        refused = self._update_params(VERSION + ".1")
+        forged = dict(self._update_params(VERSION))
+        forged["signature"] = refused["signature"]
+        missing = dict(self._update_params(VERSION))
+        del missing["sha256"]
+        return {"build crediting another version": refused, "signature over other metadata": forged,
+                "missing parameter": missing}
+
+    def _assert_answered_with_an_error(self, method, params, after_init):
+        proc = self._start(self.exe, self._update_env())
+        try:
+            if after_init:
+                self._init(proc)
+            resp = self._call(proc, method, params)
+            self.assertEqual(resp["id"], method)
+            self.assertNotIn("result", resp)
+            self.assertIsInstance(resp["error"], str)
+            self.assertTrue(resp["error"])
+            # The session goes on: before init it still says hello and initializes; after init
+            # the reader thread still answers.
+            if not after_init:
+                self._say_hello(proc)
+                self._init(proc)
+            stats = self._call(proc, "stats", {})
+            self.assertNotIn("error", stats)
+        finally:
+            code = self._finish(proc)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.exe.read_bytes(), self.helper.read_bytes())
+
+    def test_a_failed_update_request_is_answered_and_the_helper_carries_on(self):
+        for failure, params in self._failing_update_requests().items():
+            for after_init in (False, True):
+                with self.subTest(failure=failure, after_init=after_init):
+                    self._assert_answered_with_an_error("updateRequest", params, after_init)
+
+    def test_a_failed_update_check_is_answered_and_the_helper_carries_on(self):
+        for after_init in (False, True):
+            with self.subTest(after_init=after_init):
+                self._assert_answered_with_an_error("updateCheck", {}, after_init)
 
 
 class _QuietHandler(SimpleHTTPRequestHandler):
