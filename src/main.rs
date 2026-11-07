@@ -228,7 +228,7 @@ fn run_multi_threaded(
     let reader_memory_conn = Arc::new(Mutex::new(reader_memory_conn));
 
     // Shared stdout for writing responses from both threads
-    let shared_stdout: Arc<Mutex<Stdout>> = Arc::new(Mutex::new(out_stream));
+    let shared_stdout: Arc<Mutex<dyn Write + Send>> = Arc::new(Mutex::new(out_stream));
 
     // Channels: main → reader, main → writer
     let (reader_tx, reader_rx) = mpsc::channel::<ThreadMessage>();
@@ -283,6 +283,7 @@ fn run_multi_threaded(
                     memory_path,
                     reader_email_conn,
                     reader_memory_conn,
+                    IdleWork::new(),
                 );
             })?
     };
@@ -417,7 +418,7 @@ fn reader_thread_main(
     memory_conn: Arc<Mutex<Connection>>,
     engine: Option<Arc<EmbeddingEngine>>,
     synonyms: Arc<SynonymLookup>,
-    stdout: Arc<Mutex<Stdout>>,
+    stdout: Arc<Mutex<dyn Write + Send>>,
     email_db_path: PathBuf,
     memory_db_path: PathBuf,
 ) {
@@ -678,29 +679,25 @@ fn handle_read_request(
 // Writer thread
 // ============================================================================
 
+/// The writer thread: answers the requests on `rx` in turn and does `idle` work while none
+/// waits. The caller builds `idle` (`IdleWork::new()`), so a test can drive this loop itself.
 fn writer_thread_main(
     rx: mpsc::Receiver<ThreadMessage>,
     mut email_conn: Connection,
     mut memory_conn: Connection,
     mut known_years: HashSet<i32>,
     engine: Option<Arc<EmbeddingEngine>>,
-    stdout: Arc<Mutex<Stdout>>,
+    stdout: Arc<Mutex<dyn Write + Send>>,
     email_db_path: PathBuf,
     memory_db_path: PathBuf,
     reader_email_conn: Arc<Mutex<Connection>>,
     reader_memory_conn: Arc<Mutex<Connection>>,
+    mut idle: IdleWork,
 ) {
     log::info!("[writer] Thread started");
 
-    let mut attempted_shards: HashSet<i32> = HashSet::new();
-    let mut shards_left = true;
-    let (mut memory_compacting, mut memory_compaction_stopped) = (false, false);
     loop {
-        let next = next_write_request(&rx, || {
-            // Nothing to convert or compact in a failed clear's stand-in; the next request reopens it.
-            (!is_stand_in(&email_conn) && convert_one_shard_when_idle(&mut email_conn, &mut attempted_shards, &mut shards_left))
-                || (!is_stand_in(&memory_conn) && compact_memory_when_idle(&memory_conn, &mut memory_compacting, &mut memory_compaction_stopped))
-        });
+        let next = next_write_request(&rx, || idle.step(&mut email_conn, &mut memory_conn, idle_trim_budget()));
         let Some(msg) = next else { break };
         reopen_stand_in(&mut email_conn, "writer's email", || crate::fts::db::open_writer_connection(&email_db_path));
         reopen_stand_in(&mut memory_conn, "writer's memory", || memory_db::open_memory_writer_connection(&memory_db_path));
@@ -717,6 +714,7 @@ fn writer_thread_main(
             &msg.method,
             &msg.id,
             &msg.params,
+            &mut idle.memory_trim,
         );
 
         write_response(&stdout, &msg.id, resp);
@@ -728,6 +726,48 @@ fn writer_thread_main(
     drop(reader_memory_conn);
     drop(email_conn);
     drop(memory_conn);
+}
+
+/// The writer's memory trim (#12). A request's trim gets `request_budget`; a limited memory write
+/// that ends above its limit leaves that limit `pending`, the latest one winning, and the idle
+/// writer finishes it. One that ends within its limit, a memory write without a limit (the client
+/// keeps none now), or a clear leaves nothing pending; a failed request changes nothing.
+struct MemoryTrimWork {
+    request_budget: std::time::Duration,
+    pending: Option<i64>,
+}
+
+/// The writer's work while no request waits, one step at a time.
+struct IdleWork {
+    attempted_shards: HashSet<i32>,
+    shards_left: bool,
+    /// The writer's memory trim (#12), set by the requests and finished here.
+    memory_trim: MemoryTrimWork,
+    memory_compacting: bool,
+    memory_compaction_stopped: bool,
+}
+
+impl IdleWork {
+    fn new() -> Self {
+        IdleWork {
+            attempted_shards: HashSet::new(),
+            shards_left: true,
+            memory_trim: MemoryTrimWork { request_budget: trim_budget(), pending: None },
+            memory_compacting: false,
+            memory_compaction_stopped: false,
+        }
+    }
+
+    /// One step: a stale shard, else a step of a trim left above its limit, else a step of giving
+    /// the memory's freed space back (the trim first, so the space it frees goes back too). True
+    /// while there is more to do. Nothing to convert, trim or compact in a failed clear's stand-in;
+    /// the next request reopens it.
+    fn step(&mut self, email_conn: &mut Connection, memory_conn: &mut Connection, trim_budget: std::time::Duration) -> bool {
+        (!is_stand_in(email_conn) && convert_one_shard_when_idle(email_conn, &mut self.attempted_shards, &mut self.shards_left))
+            || (!is_stand_in(memory_conn) && trim_memory_when_idle(memory_conn, &mut self.memory_trim.pending, trim_budget))
+            || (!is_stand_in(memory_conn)
+                && compact_memory_when_idle(memory_conn, &mut self.memory_compacting, &mut self.memory_compaction_stopped))
+    }
 }
 
 /// One idle step of the shard migration: converts the next stale shard and
@@ -750,6 +790,34 @@ fn convert_one_shard_when_idle(conn: &mut Connection, attempted: &mut HashSet<i3
             false
         }
     }
+}
+
+/// One idle step of a trim a request left above its limit (#12): true while there is more to do.
+/// It ends within the limit, once no rows are left to remove (a limit below the empty memory's
+/// size), or on an error (logged; the next limited write trims again), so the idle writer can
+/// never spin on it.
+fn trim_memory_when_idle(conn: &mut Connection, pending: &mut Option<i64>, budget: std::time::Duration) -> bool {
+    let Some(max_bytes) = *pending else {
+        return false;
+    };
+    let more = match memory_db::memory_trim_to_bytes(conn, max_bytes, budget) {
+        Ok(trim) if trim.within_limit => false,
+        Ok(_) => match memory_db::memory_db_count(conn) {
+            Ok(rows) => rows > 0,
+            Err(e) => {
+                log::error!("[writer] Idle memory trim stopped: {:?}", e);
+                false
+            }
+        },
+        Err(e) => {
+            log::error!("[writer] Idle memory trim stopped: {:?}", e);
+            false
+        }
+    };
+    if !more {
+        *pending = None;
+    }
+    more
 }
 
 /// One idle step of giving the memory's freed space back (#11): true while there is more to do.
@@ -802,6 +870,7 @@ fn handle_write_request(
     method: &str,
     msg_id: &str,
     params: &Value,
+    trim: &mut MemoryTrimWork,
 ) -> anyhow::Result<Value> {
     match method {
         "indexBatch" => {
@@ -917,8 +986,13 @@ fn handle_write_request(
             };
             let (count, skipped) = memory_db::memory_index_batch(memory_conn, &rows, engine)?;
             let mut result = serde_json::json!({ "ok": true, "count": count, "skippedDuplicates": skipped });
+            // The latest limited write decides what is left to trim while idle; one without a
+            // limit leaves nothing (the client keeps no limit now).
+            trim.pending = None;
             if let Some(max_bytes) = max_bytes {
-                let trim = memory_db::memory_trim_to_bytes(memory_conn, max_bytes, trim_budget())?;
+                let trim_result = memory_db::memory_trim_to_bytes(memory_conn, max_bytes, trim.request_budget)?;
+                trim.pending = (!trim_result.within_limit).then_some(max_bytes);
+                let trim = trim_result;
                 result["trimmed"] = serde_json::json!(trim.removed);
                 result["usedBytes"] = serde_json::json!(trim.used_bytes);
                 result["withinLimit"] = serde_json::json!(trim.within_limit);
@@ -928,7 +1002,9 @@ fn handle_write_request(
         "memoryTrim" => {
             // Sent when the client lowers its limit.
             let max_bytes = parse_memory_max_bytes(params.get("maxBytes").unwrap_or(&Value::Null))?;
-            let trim = memory_db::memory_trim_to_bytes(memory_conn, max_bytes, trim_budget())?;
+            let trim_result = memory_db::memory_trim_to_bytes(memory_conn, max_bytes, trim.request_budget)?;
+            trim.pending = (!trim_result.within_limit).then_some(max_bytes);
+            let trim = trim_result;
             Ok(serde_json::json!({
                 "id": msg_id,
                 "result": {
@@ -956,6 +1032,7 @@ fn handle_write_request(
             *memory_conn = new_conn;
             *reader_conn = memory_db::open_read_only_memory_connection(memory_db_path)?;
             deleted.context("memoryClear")?;
+            trim.pending = None;
             Ok(serde_json::json!({ "id": msg_id, "result": { "ok": true } }))
         }
         _ => Ok(serde_json::json!({ "id": msg_id, "error": format!("Unknown writer method: {method}") })),
@@ -977,7 +1054,7 @@ fn response_or_error(msg_id: &str, result: anyhow::Result<Value>) -> Value {
     }
 }
 
-fn write_response(stdout: &Arc<Mutex<Stdout>>, msg_id: &str, result: anyhow::Result<Value>) {
+fn write_response(stdout: &Arc<Mutex<dyn Write + Send>>, msg_id: &str, result: anyhow::Result<Value>) {
     let value = response_or_error(msg_id, result);
 
     let mut out = stdout.lock().unwrap();
@@ -1063,6 +1140,10 @@ fn hello_capabilities() -> Value {
 
 fn trim_budget() -> std::time::Duration {
     std::time::Duration::from_millis(config::memory::TRIM_TIME_BUDGET_MS)
+}
+
+fn idle_trim_budget() -> std::time::Duration {
+    std::time::Duration::from_millis(config::memory::IDLE_TRIM_STEP_BUDGET_MS)
 }
 
 fn required_nonempty_string<'a>(params: &'a Value, name: &str) -> anyhow::Result<&'a str> {
@@ -1808,6 +1889,7 @@ mod tests {
             method,
             "test-write-1",
             &params,
+            &mut MemoryTrimWork { request_budget: trim_budget(), pending: None },
         )
     }
 
@@ -1915,6 +1997,340 @@ mod tests {
         });
         assert_eq!(next, Some("request"));
         assert_eq!(conversions, 1, "the request must not wait for the next shard");
+    }
+
+    /// A memory in a temporary folder holding `n` text-only exchanges, oldest first.
+    fn memory_with_exchanges(name: &str, n: usize) -> (PathBuf, Connection) {
+        let (dir, _path, conn) = memory_file_with_exchanges(name, n);
+        (dir, conn)
+    }
+
+    /// `memory_with_exchanges`, also giving the memory file's path.
+    fn memory_file_with_exchanges(name: &str, n: usize) -> (PathBuf, PathBuf, Connection) {
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+        let dir = std::env::temp_dir().join(format!("tabmail-idle-trim-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, mut conn) = memory_db::open_or_create_memory_db(&dir).unwrap();
+        let filler = "planning notes for the quarterly review meeting ".repeat(20);
+        let rows: Vec<Value> = (0..n)
+            .map(|i| serde_json::json!({
+                "memId": format!("turn:{i}"), "role": "session", "content": format!("[USER]: {i} {filler}"),
+                "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": i as i64,
+            }))
+            .collect();
+        memory_db::memory_index_batch(&mut conn, &rows, None).unwrap();
+        (dir, path, conn)
+    }
+
+    /// A memory request as the writer serves it, with this writer's memory trim.
+    fn memory_write(memory: &mut Connection, memory_db: &Path, trim: &mut MemoryTrimWork, method: &str, params: Value) -> anyhow::Result<Value> {
+        let mut email = Connection::open_in_memory().unwrap();
+        let reader_email = Mutex::new(Connection::open_in_memory().unwrap());
+        let reader_memory = Mutex::new(Connection::open_in_memory().unwrap());
+        handle_write_request(&mut email, memory, &mut HashSet::new(), Path::new("/nonexistent/email.db"), memory_db, None,
+            &reader_email, &reader_memory, method, "m", &params, trim)
+    }
+
+    fn oldest_and_newest(memory: &Connection) -> (i64, i64) {
+        memory.query_row("SELECT MIN(dateMs), MAX(dateMs) FROM memory_meta", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+    }
+
+    /// A memory request cut short after 1 ms, as the writer serves one whose own trim runs out of time.
+    fn cut_short(memory: &mut Connection, memory_db: &Path, trim: &mut MemoryTrimWork, method: &str, params: Value) {
+        trim.request_budget = std::time::Duration::from_millis(1);
+        let answer = memory_write(memory, memory_db, trim, method, params).unwrap();
+        assert_eq!(answer["result"]["withinLimit"], false, "{method}: the request's own trim must be cut short");
+    }
+
+    #[test]
+    fn test_a_limited_write_cut_short_is_finished_by_the_idle_writer() {
+        // Each limited memory write: its own trim runs out of time, and no request follows.
+        for method in ["memoryTrim", "memoryIndexBatch"] {
+            let (dir, memory_db, mut memory) = memory_file_with_exchanges(&format!("handoff-{method}"), 3000);
+            let limit = memory_db::memory_used_bytes(&memory).unwrap() / 4;
+            let params = match method {
+                "memoryTrim" => serde_json::json!({ "maxBytes": limit }),
+                _ => serde_json::json!({
+                    "rows": [{
+                        "memId": "turn:3000", "role": "session", "content": "[USER]: 3000",
+                        "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": 3000,
+                    }],
+                    "maxBytes": limit,
+                }),
+            };
+            let mut idle = IdleWork::new();
+
+            cut_short(&mut memory, &memory_db, &mut idle.memory_trim, method, params);
+            assert!(memory_db::memory_used_bytes(&memory).unwrap() > limit, "{method}");
+            let mut email = Connection::open_in_memory().unwrap();
+            let mut steps = 0;
+            while idle.step(&mut email, &mut memory, std::time::Duration::from_millis(1)) {
+                steps += 1;
+                assert!(steps < 100_000, "{method}: the idle writer must finish the trim and stop");
+            }
+
+            assert!(memory_db::memory_used_bytes(&memory).unwrap() <= limit, "{method}");
+            assert_eq!(idle.memory_trim.pending, None, "{method}");
+            // The oldest exchanges went, and every newer one stayed.
+            let kept = memory_db::memory_db_count(&memory).unwrap();
+            let newest = if method == "memoryTrim" { 2999 } else { 3000 };
+            assert!(kept > 0, "{method}");
+            assert_eq!(oldest_and_newest(&memory), (newest + 1 - kept, newest), "{method}");
+            // The space it freed went back too: compaction runs once the trim ends.
+            let free: i64 = memory.query_row("PRAGMA freelist_count", [], |r| r.get(0)).unwrap();
+            assert_eq!(free, 0, "{method}");
+            drop(memory);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_the_writer_finishes_a_trim_its_request_left_while_no_request_follows() {
+        // The writer thread itself: a limited request's own trim runs out of time, the client
+        // stays connected and sends nothing more (or only an unrelated write, queued right
+        // behind it), and memory still settles within the limit.
+        let cases = [("memoryTrim", false), ("memoryIndexBatch", false), ("memoryTrim", true), ("memoryIndexBatch", true)];
+        for (method, then_unrelated) in cases {
+            let case = format!("{method}{}", if then_unrelated { " then memoryRemoveBatch" } else { "" });
+            let (dir, memory_db, memory) = memory_file_with_exchanges(&format!("writer-{method}-{then_unrelated}"), 3000);
+            let limit = memory_db::memory_used_bytes(&memory).unwrap() / 4;
+            drop(memory);
+            let (email_db, email, known_years) = crate::fts::db::open_or_create_db(&dir.join("email")).unwrap();
+            let memory = memory_db::open_memory_writer_connection(&memory_db).unwrap();
+            let answers = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let out: Arc<Mutex<dyn Write + Send>> = answers.clone();
+            let mut idle = IdleWork::new();
+            idle.memory_trim.request_budget = std::time::Duration::from_millis(1);
+            let (tx, rx) = mpsc::channel();
+            let writer = {
+                let memory_db = memory_db.clone();
+                std::thread::spawn(move || {
+                    writer_thread_main(rx, email, memory, known_years, None, out, email_db, memory_db,
+                        Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+                        Arc::new(Mutex::new(Connection::open_in_memory().unwrap())), idle)
+                })
+            };
+            let params = match method {
+                "memoryTrim" => serde_json::json!({ "maxBytes": limit }),
+                _ => serde_json::json!({
+                    "rows": [{
+                        "memId": "turn:3000", "role": "session", "content": "[USER]: 3000",
+                        "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": 3000,
+                    }],
+                    "maxBytes": limit,
+                }),
+            };
+            tx.send(ThreadMessage { method: method.to_string(), id: "m".to_string(), params }).unwrap();
+            if then_unrelated {
+                let params = serde_json::json!({ "ids": [] });
+                tx.send(ThreadMessage { method: "memoryRemoveBatch".to_string(), id: "u".to_string(), params }).unwrap();
+            }
+
+            // Generous deadlines: on a loaded machine the writer is slow, not wrong.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            let expected = if then_unrelated { 2 } else { 1 };
+            let answers = loop {
+                let bytes = answers.lock().unwrap().clone();
+                let mut frames = Vec::new();
+                let mut rest = &bytes[..];
+                while rest.len() >= 4 {
+                    let len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+                    if rest.len() < 4 + len {
+                        break;
+                    }
+                    frames.push(serde_json::from_slice::<Value>(&rest[4..4 + len]).unwrap());
+                    rest = &rest[4 + len..];
+                }
+                if frames.len() >= expected {
+                    break frames;
+                }
+                assert!(std::time::Instant::now() < deadline, "{case}: no answer");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            assert_eq!(answers.len(), expected, "{case}");
+            assert_eq!(answers[0]["id"], "m");
+            assert_eq!(answers[0]["result"]["withinLimit"], false, "{case}: the request's own trim must be cut short");
+            if then_unrelated {
+                assert_eq!(answers[1]["id"], "u");
+                assert_eq!(answers[1]["result"]["count"], 0, "{case}: the unrelated write removes nothing");
+            }
+            let reader = memory_db::open_read_only_memory_connection(&memory_db).unwrap();
+            while memory_db::memory_used_bytes(&reader).unwrap() > limit {
+                assert!(std::time::Instant::now() < deadline, "{case}: memory must settle with no further request");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            drop(reader);
+            drop(tx);
+            writer.join().unwrap();
+
+            // Durable: the file, opened again, is within the limit, the oldest exchanges went and
+            // every newer one stayed.
+            let (_path, memory) = memory_db::open_or_create_memory_db(&dir).unwrap();
+            assert!(memory_db::memory_used_bytes(&memory).unwrap() <= limit, "{case}");
+            let kept = memory_db::memory_db_count(&memory).unwrap();
+            let newest = if method == "memoryTrim" { 2999 } else { 3000 };
+            assert!(kept > 0, "{case}");
+            assert_eq!(oldest_and_newest(&memory), (newest + 1 - kept, newest), "{case}");
+            drop(memory);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_the_latest_memory_write_decides_what_is_left_to_trim_while_idle() {
+        let (dir, db, mut memory) = memory_file_with_exchanges("latest", 3000);
+        let used = memory_db::memory_used_bytes(&memory).unwrap();
+        let (low, lower) = (used / 2, used / 4);
+        let mut trim = MemoryTrimWork { request_budget: trim_budget(), pending: None };
+
+        cut_short(&mut memory, &db, &mut trim, "memoryTrim", serde_json::json!({ "maxBytes": low }));
+        assert_eq!(trim.pending, Some(low));
+        // A refused or unrelated request changes nothing.
+        assert!(memory_write(&mut memory, &db, &mut trim, "memoryTrim", serde_json::json!({ "maxBytes": 0 })).is_err());
+        assert!(memory_write(&mut memory, &db, &mut trim, "memoryIndexBatch", serde_json::json!({ "rows": [], "maxBytes": "many" })).is_err());
+        memory_write(&mut memory, &db, &mut trim, "memoryRemoveBatch", serde_json::json!({ "ids": [] })).unwrap();
+        assert_eq!(trim.pending, Some(low));
+        // The latest limit wins.
+        cut_short(&mut memory, &db, &mut trim, "memoryIndexBatch", serde_json::json!({ "rows": [], "maxBytes": lower }));
+        assert_eq!(trim.pending, Some(lower));
+        // A memory write without a limit: the client keeps none now.
+        memory_write(&mut memory, &db, &mut trim, "memoryIndexBatch", serde_json::json!({ "rows": [] })).unwrap();
+        assert_eq!(trim.pending, None);
+        // A trim that ends within its limit: nothing left.
+        cut_short(&mut memory, &db, &mut trim, "memoryTrim", serde_json::json!({ "maxBytes": lower }));
+        let answer = memory_write(&mut memory, &db, &mut trim, "memoryTrim", serde_json::json!({ "maxBytes": used * 2 })).unwrap();
+        assert_eq!(answer["result"]["withinLimit"], true);
+        assert_eq!(trim.pending, None);
+        // A clear: nothing left.
+        cut_short(&mut memory, &db, &mut trim, "memoryTrim", serde_json::json!({ "maxBytes": lower / 2 }));
+        assert_eq!(trim.pending, Some(lower / 2));
+        memory_write(&mut memory, &db, &mut trim, "memoryClear", serde_json::json!({})).unwrap();
+        assert_eq!(trim.pending, None);
+        drop(memory);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_an_idle_trim_that_meets_a_storage_error_stops_and_the_next_limited_write_retries() {
+        let (dir, db, mut memory) = memory_file_with_exchanges("fault", 20);
+        let rowids = |memory: &Connection, table: &str| -> Vec<i64> {
+            memory.prepare(&format!("SELECT rowid FROM {table} ORDER BY rowid")).unwrap()
+                .query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
+        };
+        let before = rowids(&memory, "memory_ids");
+        let limit = memory_db::memory_used_bytes(&memory).unwrap() * 9 / 10;
+        memory.execute_batch("CREATE TRIGGER fail_delete BEFORE DELETE ON memory_ids BEGIN SELECT RAISE(ABORT, 'injected storage failure'); END;").unwrap();
+
+        let mut pending = Some(limit);
+        assert!(!trim_memory_when_idle(&mut memory, &mut pending, trim_budget()), "a storage error must end the idle trim");
+        assert_eq!(pending, None, "and it is not tried again while idle");
+        let changes = memory.total_changes();
+        for _ in 0..3 {
+            assert!(!trim_memory_when_idle(&mut memory, &mut pending, trim_budget()));
+        }
+        assert_eq!(memory.total_changes(), changes, "no further attempt");
+        for table in ["memory_ids", "memory_meta", "memory_fts"] {
+            assert_eq!(rowids(&memory, table), before, "every exchange is whole in {table}");
+        }
+
+        memory.execute_batch("DROP TRIGGER fail_delete;").unwrap();
+        let mut trim = MemoryTrimWork { request_budget: trim_budget(), pending: None };
+        let answer = memory_write(&mut memory, &db, &mut trim, "memoryTrim", serde_json::json!({ "maxBytes": limit })).unwrap();
+        assert_eq!(answer["result"]["withinLimit"], true, "the next limited write trims again");
+        assert!(memory_db::memory_db_count(&memory).unwrap() < before.len() as i64);
+        drop(memory);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_an_idle_trim_whose_row_count_fails_stops_and_the_next_limited_write_retries() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Test-only fault: an SQLite authorizer denies the whole-table read of `memory_fts` (the
+        // row count after a trim step), counting each denial.
+        unsafe extern "C" fn deny_fts_count(
+            denied: *mut std::ffi::c_void, action: i32, table: *const std::ffi::c_char,
+            column: *const std::ffi::c_char, _: *const std::ffi::c_char, _: *const std::ffi::c_char,
+        ) -> i32 {
+            let whole_table = column.is_null() || std::ffi::CStr::from_ptr(column).to_bytes().is_empty();
+            if action == rusqlite::ffi::SQLITE_READ && !table.is_null()
+                && std::ffi::CStr::from_ptr(table).to_bytes() == b"memory_fts" && whole_table
+            {
+                (*(denied as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst);
+                rusqlite::ffi::SQLITE_DENY
+            } else {
+                rusqlite::ffi::SQLITE_OK
+            }
+        }
+        let (dir, db, mut memory) = memory_file_with_exchanges("count-fault", 20);
+        // Within reach: an empty memory's own size is above half of this small one.
+        let limit = memory_db::memory_used_bytes(&memory).unwrap() * 9 / 10;
+        let denied = AtomicUsize::new(0);
+        let status = unsafe {
+            rusqlite::ffi::sqlite3_set_authorizer(memory.handle(), Some(deny_fts_count), &denied as *const AtomicUsize as *mut _)
+        };
+        assert_eq!(status, rusqlite::ffi::SQLITE_OK);
+
+        // A step with no time left removes nothing, so the count decides whether more is left.
+        let mut pending = Some(limit);
+        let more = trim_memory_when_idle(&mut memory, &mut pending, std::time::Duration::ZERO);
+        assert_eq!(denied.load(Ordering::SeqCst), 1, "the fault must hit the count after the step");
+        assert!(!more, "a failed count must end the idle trim");
+        assert_eq!(pending, None, "and it is not tried again while idle");
+        let changes = memory.total_changes();
+        for _ in 0..3 {
+            assert!(!trim_memory_when_idle(&mut memory, &mut pending, trim_budget()));
+        }
+        assert_eq!(memory.total_changes(), changes, "no further attempt");
+        assert_eq!(denied.load(Ordering::SeqCst), 1);
+        unsafe { rusqlite::ffi::sqlite3_set_authorizer(memory.handle(), None, std::ptr::null_mut()) };
+        assert_eq!(memory_db::memory_db_count(&memory).unwrap(), 20, "every exchange stays");
+
+        let mut trim = MemoryTrimWork { request_budget: trim_budget(), pending: None };
+        let answer = memory_write(&mut memory, &db, &mut trim, "memoryTrim", serde_json::json!({ "maxBytes": limit })).unwrap();
+        assert_eq!(answer["result"]["withinLimit"], true, "the next limited write trims again");
+        assert!(memory_db::memory_db_count(&memory).unwrap() < 20);
+        drop(memory);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_an_idle_trim_ends_once_no_rows_are_left_to_remove() {
+        // A limit below the empty memory's own size can never be reached.
+        let (dir, mut memory) = memory_with_exchanges("empty", 20);
+        let mut pending = Some(1);
+        assert!(!trim_memory_when_idle(&mut memory, &mut pending, trim_budget()), "nothing more can be done");
+        assert_eq!(pending, None);
+        assert_eq!(memory_db::memory_db_count(&memory).unwrap(), 0);
+        assert!(!trim_memory_when_idle(&mut memory, &mut pending, trim_budget()));
+        drop(memory);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_no_idle_trim_runs_in_a_stand_in() {
+        let (dir, mut memory) = memory_with_exchanges("stand-in", 20);
+        let mut stand_in = Connection::open_in_memory().unwrap();
+        assert!(is_stand_in(&stand_in));
+        let mut idle = IdleWork::new();
+        idle.memory_trim.pending = Some(1);
+        let mut email = Connection::open_in_memory().unwrap();
+        assert!(!idle.step(&mut email, &mut stand_in, trim_budget()));
+        assert_eq!(idle.memory_trim.pending, Some(1), "kept for the memory once it is open again");
+        // Once the memory is open again, the idle writer trims it.
+        let mut steps = 0;
+        while idle.step(&mut email, &mut memory, trim_budget()) {
+            steps += 1;
+            assert!(steps < 1000, "the idle writer must stop");
+        }
+        assert_eq!(idle.memory_trim.pending, None);
+        assert_eq!(memory_db::memory_db_count(&memory).unwrap(), 0);
+        drop(memory);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2453,17 +2869,20 @@ mod tests {
         let reader_memory = Mutex::new(Connection::open_in_memory().unwrap());
 
         let cleared = handle_write_request(&mut email, &mut memory, &mut known_years, &db, &memory_db, None,
-            &reader_email, &reader_memory, "clear", "c", &serde_json::json!({}));
+            &reader_email, &reader_memory, "clear", "c", &serde_json::json!({}),
+            &mut MemoryTrimWork { request_budget: trim_budget(), pending: None });
         assert!(cleared.is_err(), "a clear that could not create the database answered {cleared:?}");
         reopen_stand_in(&mut email, "test", || crate::fts::db::open_writer_connection(&db));
         let refused = handle_write_request(&mut email, &mut memory, &mut known_years, &db, &memory_db, None,
-            &reader_email, &reader_memory, "indexBatch", "r", &serde_json::json!({"rows": [row("new")]}));
+            &reader_email, &reader_memory, "indexBatch", "r", &serde_json::json!({"rows": [row("new")]}),
+            &mut MemoryTrimWork { request_budget: trim_budget(), pending: None });
         assert!(refused.is_err(), "a write with no database to go to answered {refused:?}");
 
         std::fs::create_dir_all(&dir).unwrap();
         reopen_stand_in(&mut email, "test", || crate::fts::db::open_writer_connection(&db));
         let written = handle_write_request(&mut email, &mut memory, &mut known_years, &db, &memory_db, None,
-            &reader_email, &reader_memory, "indexBatch", "w", &serde_json::json!({"rows": [row("new")]}));
+            &reader_email, &reader_memory, "indexBatch", "w", &serde_json::json!({"rows": [row("new")]}),
+            &mut MemoryTrimWork { request_budget: trim_budget(), pending: None });
         assert_eq!(written.expect("write after the fault ended")["result"]["count"], 1);
         drop(email);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -2565,7 +2984,8 @@ mod tests {
         let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
         let rows = serde_json::json!({"rows": [{"msgId": "a", "subject": "s", "body": "b", "dateMs": now_ms, "hasAttachments": false}]});
         let written = handle_write_request(&mut email, &mut memory, &mut known_years, &db, &memory_db, None,
-            &reader_email, &reader_memory, "indexBatch", "w", &rows);
+            &reader_email, &reader_memory, "indexBatch", "w", &rows,
+            &mut MemoryTrimWork { request_budget: trim_budget(), pending: None });
         assert_eq!(written.expect("a write to the database")["result"]["count"], 1);
         let mut opened = false;
         reopen_stand_in(&mut email, "test", || {
@@ -2631,7 +3051,8 @@ mod tests {
                     std::thread::yield_now();
                 }
                 let answered = handle_write_request(&mut email, &mut memory, &mut known_years, &db, &memory_db, None,
-                    &reader_email, &reader_memory, method, "c", &serde_json::json!({}));
+                    &reader_email, &reader_memory, method, "c", &serde_json::json!({}),
+            &mut MemoryTrimWork { request_budget: trim_budget(), pending: None });
                 stop.store(true, Ordering::SeqCst);
                 let closed = reader.join().unwrap();
                 let reads = reads.load(Ordering::SeqCst);
