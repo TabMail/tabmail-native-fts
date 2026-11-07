@@ -220,8 +220,11 @@ for many kept requests. Now the writer finishes it without waiting for requests:
 - **Clients.** They still get the same answers. Their copy ("more go as new requests are kept")
   now understates how soon memory settles; changing it is the clients' call.
 - **Tests.** Unit tests in `src/main.rs` cover:
-  - for `memoryTrim` and for a limited `memoryIndexBatch`, the request's own trim cut short
-    (1 ms request budget) and the idle writer then finishing it: within the limit, the oldest
+  - the writer thread itself (`writer_thread_main`, which takes its `IdleWork` from the caller
+    for this), for `memoryTrim` and a limited `memoryIndexBatch`: the request's own trim cut
+    short (1 ms request budget), no further request, and the memory file then within the limit,
+    oldest exchanges removed and every newer one kept, after the writer stops;
+  - the same for `IdleWork::step` driven directly: within the limit, the oldest
     exchanges removed and every newer one kept, compaction after it;
   - the pending rules through the request handler: the latest limit wins; a refused or unrelated
     request changes nothing; a write without a limit, a trim within its limit, and a clear end it;

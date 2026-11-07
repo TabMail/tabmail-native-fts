@@ -228,7 +228,7 @@ fn run_multi_threaded(
     let reader_memory_conn = Arc::new(Mutex::new(reader_memory_conn));
 
     // Shared stdout for writing responses from both threads
-    let shared_stdout: Arc<Mutex<Stdout>> = Arc::new(Mutex::new(out_stream));
+    let shared_stdout: Arc<Mutex<dyn Write + Send>> = Arc::new(Mutex::new(out_stream));
 
     // Channels: main → reader, main → writer
     let (reader_tx, reader_rx) = mpsc::channel::<ThreadMessage>();
@@ -283,6 +283,7 @@ fn run_multi_threaded(
                     memory_path,
                     reader_email_conn,
                     reader_memory_conn,
+                    IdleWork::new(),
                 );
             })?
     };
@@ -417,7 +418,7 @@ fn reader_thread_main(
     memory_conn: Arc<Mutex<Connection>>,
     engine: Option<Arc<EmbeddingEngine>>,
     synonyms: Arc<SynonymLookup>,
-    stdout: Arc<Mutex<Stdout>>,
+    stdout: Arc<Mutex<dyn Write + Send>>,
     email_db_path: PathBuf,
     memory_db_path: PathBuf,
 ) {
@@ -678,21 +679,23 @@ fn handle_read_request(
 // Writer thread
 // ============================================================================
 
+/// The writer thread: answers the requests on `rx` in turn and does `idle` work while none
+/// waits. The caller builds `idle` (`IdleWork::new()`), so a test can drive this loop itself.
 fn writer_thread_main(
     rx: mpsc::Receiver<ThreadMessage>,
     mut email_conn: Connection,
     mut memory_conn: Connection,
     mut known_years: HashSet<i32>,
     engine: Option<Arc<EmbeddingEngine>>,
-    stdout: Arc<Mutex<Stdout>>,
+    stdout: Arc<Mutex<dyn Write + Send>>,
     email_db_path: PathBuf,
     memory_db_path: PathBuf,
     reader_email_conn: Arc<Mutex<Connection>>,
     reader_memory_conn: Arc<Mutex<Connection>>,
+    mut idle: IdleWork,
 ) {
     log::info!("[writer] Thread started");
 
-    let mut idle = IdleWork::new();
     loop {
         let next = next_write_request(&rx, || idle.step(&mut email_conn, &mut memory_conn, idle_trim_budget()));
         let Some(msg) = next else { break };
@@ -1051,7 +1054,7 @@ fn response_or_error(msg_id: &str, result: anyhow::Result<Value>) -> Value {
     }
 }
 
-fn write_response(stdout: &Arc<Mutex<Stdout>>, msg_id: &str, result: anyhow::Result<Value>) {
+fn write_response(stdout: &Arc<Mutex<dyn Write + Send>>, msg_id: &str, result: anyhow::Result<Value>) {
     let value = response_or_error(msg_id, result);
 
     let mut out = stdout.lock().unwrap();
@@ -2081,6 +2084,78 @@ mod tests {
             // The space it freed went back too: compaction runs once the trim ends.
             let free: i64 = memory.query_row("PRAGMA freelist_count", [], |r| r.get(0)).unwrap();
             assert_eq!(free, 0, "{method}");
+            drop(memory);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_the_writer_finishes_a_trim_its_request_left_while_no_request_follows() {
+        // The writer thread itself: a limited request's own trim runs out of time, the client
+        // stays connected and sends nothing more, and memory still settles within the limit.
+        for method in ["memoryTrim", "memoryIndexBatch"] {
+            let (dir, memory_db, memory) = memory_file_with_exchanges(&format!("writer-{method}"), 3000);
+            let limit = memory_db::memory_used_bytes(&memory).unwrap() / 4;
+            drop(memory);
+            let (email_db, email, known_years) = crate::fts::db::open_or_create_db(&dir.join("email")).unwrap();
+            let memory = memory_db::open_memory_writer_connection(&memory_db).unwrap();
+            let answers = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let out: Arc<Mutex<dyn Write + Send>> = answers.clone();
+            let mut idle = IdleWork::new();
+            idle.memory_trim.request_budget = std::time::Duration::from_millis(1);
+            let (tx, rx) = mpsc::channel();
+            let writer = {
+                let memory_db = memory_db.clone();
+                std::thread::spawn(move || {
+                    writer_thread_main(rx, email, memory, known_years, None, out, email_db, memory_db,
+                        Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+                        Arc::new(Mutex::new(Connection::open_in_memory().unwrap())), idle)
+                })
+            };
+            let params = match method {
+                "memoryTrim" => serde_json::json!({ "maxBytes": limit }),
+                _ => serde_json::json!({
+                    "rows": [{
+                        "memId": "turn:3000", "role": "session", "content": "[USER]: 3000",
+                        "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": 3000,
+                    }],
+                    "maxBytes": limit,
+                }),
+            };
+            tx.send(ThreadMessage { method: method.to_string(), id: "m".to_string(), params }).unwrap();
+
+            // Generous deadlines: on a loaded machine the writer is slow, not wrong.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            let answer = loop {
+                let bytes = answers.lock().unwrap().clone();
+                if bytes.len() >= 4 {
+                    let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+                    if bytes.len() >= 4 + len {
+                        break serde_json::from_slice::<Value>(&bytes[4..4 + len]).unwrap();
+                    }
+                }
+                assert!(std::time::Instant::now() < deadline, "{method}: no answer");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            assert_eq!(answer["id"], "m");
+            assert_eq!(answer["result"]["withinLimit"], false, "{method}: the request's own trim must be cut short");
+            let reader = memory_db::open_read_only_memory_connection(&memory_db).unwrap();
+            while memory_db::memory_used_bytes(&reader).unwrap() > limit {
+                assert!(std::time::Instant::now() < deadline, "{method}: memory must settle with no further request");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            drop(reader);
+            drop(tx);
+            writer.join().unwrap();
+
+            // Durable: the file, opened again, is within the limit, the oldest exchanges went and
+            // every newer one stayed.
+            let (_path, memory) = memory_db::open_or_create_memory_db(&dir).unwrap();
+            assert!(memory_db::memory_used_bytes(&memory).unwrap() <= limit, "{method}");
+            let kept = memory_db::memory_db_count(&memory).unwrap();
+            let newest = if method == "memoryTrim" { 2999 } else { 3000 };
+            assert!(kept > 0, "{method}");
+            assert_eq!(oldest_and_newest(&memory), (newest + 1 - kept, newest), "{method}");
             drop(memory);
             std::fs::remove_dir_all(&dir).unwrap();
         }
