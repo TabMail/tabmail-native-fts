@@ -6,7 +6,8 @@
 """
 Init with profilePath moves an index the old profile guess left where no
 profile reads it into a profile without an index, removes the rest, and keeps
-every index a profile does read.
+every index a profile does read. Init without profilePath is refused: the
+helper no longer guesses a profile.
 
 The helper runs with a temporary HOME (and APPDATA), so it only ever sees
 the fixture's profiles.
@@ -20,7 +21,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 
@@ -151,32 +151,67 @@ class TestProfilePathCleanup(unittest.TestCase):
         self.assertTrue((data_dir / "tabmail_fts" / "fts.db").exists())
         self.assertFalse((fallback / "browser-extension-data").exists())
 
-    # Without profilePath (add-on releases before it) the helper still guesses.
+    # Without profilePath (add-on releases before it) the helper refuses init: it never guesses.
 
-    def test_guess_takes_the_most_recently_modified_profile(self):
-        self._link_models()
+    def _session(self, requests):
+        """Runs hello and then `requests` in a helper whose HOME is the
+        fixture; returns every response as it came."""
+        env = dict(os.environ)
+        env["HOME"] = str(self.home)
+        env["USERPROFILE"] = str(self.home)
+        env["APPDATA"] = str(self.home / "AppData" / "Roaming")
+        proc = subprocess.Popen(
+            [self.helper],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=env,
+        )
+        try:
+            _send_message(proc, {"id": "hello", "method": "hello", "params": {"addonVersion": "1.8.5"}})
+            self.assertIn("result", _read_message(proc))
+            responses = []
+            for i, (method, request_params) in enumerate(requests):
+                _send_message(proc, {"id": f"r{i}", "method": method, "params": request_params})
+                response = _read_message(proc)
+                # Clients match a response to its request by id; an answer under another id is lost.
+                self.assertEqual(response.get("id"), f"r{i}", response)
+                responses.append(response)
+            return responses
+        finally:
+            proc.stdin.close()
+            proc.wait(timeout=30)
+            proc.stdout.close()
+
+    def _indexes_under_home(self):
+        return sorted(str(p.relative_to(self.home)) for p in self.home.rglob("*") if p.name in ("tabmail_fts", "fts.db", "memory.db"))
+
+    def test_init_without_a_profile_path_is_refused_and_opens_nothing(self):
+        # Profiles the old guess would have picked from, one with an index an older helper left.
+        fallback = self._link_models()
+        orphan = _write_index(fallback)
         profiles = _profiles_dir(self.home)
-        older = profiles / "older.default"
-        newest = profiles / "newest.default"
-        hidden = profiles / ".hidden"
-        for directory in (newest, older, hidden):
-            directory.mkdir(parents=True)
-        now = time.time()
-        os.utime(older, (now - 3600, now - 3600))
-        os.utime(newest, (now - 60, now - 60))
-        os.utime(hidden, (now, now))
+        (profiles / "newest.default").mkdir(parents=True)
+        before = self._indexes_under_home()
 
-        self.assertEqual(Path(self._init({})["tbProfile"]), newest)
+        refusals = [{}, {"addonId": ADDON_ID}, {"profilePath": None}, {"profilePath": ""},
+                    {"profilePath": "relative/dir"}, {"profilePath": 7}]
+        responses = self._session([("init", params) for params in refusals])
+        self.assertEqual(len(responses), len(refusals))
+        for params, response in zip(refusals, responses):
+            self.assertNotIn("result", response, params)
+            self.assertIn("profilePath", response.get("error", ""), params)
+        # No index was opened or created, and the orphan was neither moved nor removed.
+        self.assertEqual(self._indexes_under_home(), before)
+        self.assertTrue((orphan / "fts.db").exists())
 
-    def test_guess_falls_back_without_profiles(self):
-        fallback = self._link_models()
-        self.assertEqual(Path(self._init({})["tbProfile"]), fallback)
-
-    def test_guess_falls_back_with_an_empty_profiles_directory(self):
-        fallback = self._link_models()
-        _profiles_dir(self.home).mkdir(parents=True)
-        self.assertEqual(Path(self._init({})["tbProfile"]), fallback)
-
+    def test_a_refused_init_leaves_the_helper_waiting_for_one_with_a_profile_path(self):
+        self._link_models()
+        data_dir = self.home / "own.default" / "browser-extension-data" / ADDON_ID
+        refused, accepted, stats = self._session([("init", {}), ("init", {"profilePath": str(data_dir)}), ("stats", {})])
+        self.assertIn("error", refused)
+        self.assertEqual(Path(accepted["result"]["dbPath"]), data_dir / "tabmail_fts" / "fts.db")
+        self.assertEqual(stats["result"]["docs"], 0)
 
 if __name__ == "__main__":
     unittest.main()

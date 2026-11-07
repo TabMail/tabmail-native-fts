@@ -1176,57 +1176,23 @@ fn handle_init(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Res
         },
     };
 
-    // Get addon ID (required for new storage location)
-    let addon_id = params
-        .get("addonId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("thunderbird@tabmail.ai");
-
-    // profilePath: the add-on names this profile's data directory; use it directly.
-    // Without it, guess the profile (add-on releases before profilePath).
-    let (tb_profile, new_fts_parent) =
-        if let Some(override_path) = params.get("profilePath").and_then(|v| v.as_str()) {
-            let p = PathBuf::from(override_path);
-            log::info!("Using explicit profilePath: {}", p.display());
-            std::fs::create_dir_all(&p)?;
-            // A caller that names its model folder owns every location it uses
-            // and is not the add-on: it never adopts or removes the indexes an
-            // earlier add-on release left in a guessed profile.
-            if model_dir.is_none() {
-                adopt_or_remove_orphaned_indexes(&p, &guessed_profile_dirs());
-            }
-            (p.clone(), p)
-        } else {
-            // Auto-detect Thunderbird profile
-            let tb_profile = find_thunderbird_profile_dir()?;
-            log::info!("Detected TB profile: {}", tb_profile.display());
-
-            // Old location: <profile>/tabmail_fts/
-            // New location: <profile>/browser-extension-data/<addon-id>/tabmail_fts/
-            let old_fts_dir = tb_profile.join("tabmail_fts");
-            let new_fts_parent = tb_profile.join("browser-extension-data").join(addon_id);
-            let new_fts_dir = new_fts_parent.join("tabmail_fts");
-
-            log::info!("FTS paths:");
-            log::info!("  Old: {}", old_fts_dir.display());
-            log::info!("  New: {}", new_fts_dir.display());
-
-            // Check for migration from old to new location
-            let migration_result = migrate_fts_data(&old_fts_dir, &new_fts_dir);
-            if let Ok(true) = migration_result {
-                log::info!("✅ Migrated FTS data from old location");
-            }
-
-            // Ensure new parent directory exists
-            if let Err(e) = std::fs::create_dir_all(&new_fts_parent) {
-                log::warn!("Could not create addon data dir: {}", e);
-            }
-
-            (tb_profile, new_fts_parent)
-        };
+    // profilePath: the client names its data directory. Without it there is no
+    // profile to open; the helper never guesses one (ADR-NF-007 amendment).
+    let data_dir = match parse_absolute_dir(params.get("profilePath").and_then(|v| v.as_str()), "profilePath") {
+        Ok(dir) => dir,
+        Err(e) => return Ok(serde_json::json!({ "id": msg_id, "error": format!("{e}") })),
+    };
+    log::info!("Using profilePath: {}", data_dir.display());
+    std::fs::create_dir_all(&data_dir)?;
+    // A caller that names its model folder owns every location it uses
+    // and is not the add-on: it never adopts or removes the indexes an
+    // earlier add-on release left in a guessed profile.
+    if model_dir.is_none() {
+        adopt_or_remove_orphaned_indexes(&data_dir, &guessed_profile_dirs());
+    }
 
     // Initialize email FTS DB
-    let (db_path, conn, known_years) = open_or_create_db(&new_fts_parent)?;
+    let (db_path, conn, known_years) = open_or_create_db(&data_dir)?;
     state.db_path = Some(db_path.clone());
     state.conn = Some(conn);
     state.known_years = known_years;
@@ -1240,7 +1206,7 @@ fn handle_init(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Res
     };
 
     // Initialize memory DB (separate database file, inside tabmail_fts/ subdir)
-    let fts_subdir = new_fts_parent.join("tabmail_fts");
+    let fts_subdir = data_dir.join("tabmail_fts");
     std::fs::create_dir_all(&fts_subdir)?;
     // A memory that cannot be opened (a corrupt page, a full disk) is left closed rather than failing
     // init: a failed init fails every start, taking email search down and leaving Clear chat history,
@@ -1304,8 +1270,8 @@ fn handle_init(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Res
             "docs": docs,
             "memoryDocs": memory_docs,
             "vfs": "native",
-            "tbProfile": tb_profile.to_string_lossy(),
-            "addonDataDir": new_fts_parent.to_string_lossy(),
+            "tbProfile": data_dir.to_string_lossy(),
+            "addonDataDir": data_dir.to_string_lossy(),
             "hasEmbeddings": has_embeddings
         }
     }))
@@ -1315,7 +1281,7 @@ fn handle_init(state: &mut DbState, msg_id: &str, params: &Value) -> anyhow::Res
 // Utility functions
 // ============================================================================
 
-/// A caller-named folder (`--log-dir`, `modelDir`) must be a non-empty absolute path.
+/// A caller-named folder (`--log-dir`, `modelDir`, `profilePath`) must be a non-empty absolute path.
 fn parse_absolute_dir(value: Option<&str>, name: &str) -> anyhow::Result<PathBuf> {
     match value {
         Some(v) if !v.is_empty() && Path::new(v).is_absolute() => Ok(PathBuf::from(v)),
@@ -1338,85 +1304,6 @@ fn read_arg_value(args: &[String], key: &str) -> Option<String> {
         .cloned()
 }
 
-/// Migrate FTS data from old TB profile location to new addon data directory.
-/// Returns Ok(true) if migration was performed, Ok(false) if not needed.
-fn migrate_fts_data(old_fts_dir: &Path, new_fts_dir: &Path) -> anyhow::Result<bool> {
-    let old_db = old_fts_dir.join("fts.db");
-
-    // No old data to migrate
-    if !old_db.exists() {
-        log::info!("No old FTS data found, skipping migration");
-        return Ok(false);
-    }
-
-    let new_db = new_fts_dir.join("fts.db");
-
-    // New location already has data - skip
-    if new_db.exists() {
-        log::info!("New location already has FTS data, skipping migration");
-        // Clean up old data
-        if let Err(e) = std::fs::remove_dir_all(old_fts_dir) {
-            log::warn!("Could not remove old FTS directory: {}", e);
-        }
-        return Ok(false);
-    }
-
-    log::info!("Migrating FTS data from old to new location...");
-
-    // Create new directory
-    std::fs::create_dir_all(new_fts_dir)?;
-
-    // Copy files
-    let mut copied = 0;
-    for entry in std::fs::read_dir(old_fts_dir)? {
-        let entry = entry?;
-        let src = entry.path();
-        let dst = new_fts_dir.join(entry.file_name());
-
-        if let Err(e) = std::fs::copy(&src, &dst) {
-            log::error!("Failed to copy {:?}: {}", entry.file_name(), e);
-        } else {
-            copied += 1;
-        }
-    }
-
-    log::info!("Copied {} files to new location", copied);
-
-    // Remove old directory
-    if let Err(e) = std::fs::remove_dir_all(old_fts_dir) {
-        log::warn!("Could not remove old FTS directory: {}", e);
-    }
-
-    Ok(copied > 0)
-}
-
-fn find_thunderbird_profile_dir() -> anyhow::Result<PathBuf> {
-    let Some(profiles_dir) = thunderbird_profiles_dir()? else {
-        log::warn!("Unknown OS: {}, using fallback", std::env::consts::OS);
-        return fallback_profile_dir();
-    };
-
-    if !profiles_dir.exists() {
-        log::warn!(
-            "TB profiles directory not found: {}",
-            profiles_dir.display()
-        );
-        return fallback_profile_dir();
-    }
-
-    let mut candidates = profile_dir_candidates(&profiles_dir)?;
-
-    if candidates.is_empty() {
-        log::warn!("No profiles found in {}", profiles_dir.display());
-        return fallback_profile_dir();
-    }
-
-    candidates.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-    let most_recent = candidates.last().cloned().unwrap();
-    log::info!("Found TB profile: {}", most_recent.display());
-    Ok(most_recent)
-}
-
 /// The directory holding Thunderbird profiles on this OS; None on an OS the
 /// helper does not know.
 fn thunderbird_profiles_dir() -> anyhow::Result<Option<PathBuf>> {
@@ -1431,13 +1318,13 @@ fn thunderbird_profiles_dir() -> anyhow::Result<Option<PathBuf>> {
     })
 }
 
-/// Where `find_thunderbird_profile_dir` lands when it finds no profile.
+/// Where the old profile guess landed when it found no profile.
 fn fallback_profile_dir() -> anyhow::Result<PathBuf> {
     Ok(home_dir()?.join(".tabmail"))
 }
 
 /// The non-hidden subdirectories of `profiles_dir`, any of which
-/// `find_thunderbird_profile_dir` may take for a profile.
+/// the old profile guess may have taken for a profile.
 fn profile_dir_candidates(profiles_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(std::fs::read_dir(profiles_dir)?
         .filter_map(|e| e.ok())
@@ -1452,7 +1339,7 @@ fn profile_dir_candidates(profiles_dir: &Path) -> std::io::Result<Vec<PathBuf>> 
         .collect())
 }
 
-/// Every directory `find_thunderbird_profile_dir` can return.
+/// Every directory the old profile guess could return.
 fn guessed_profile_dirs() -> Vec<PathBuf> {
     let Ok(fallback) = fallback_profile_dir() else {
         return Vec::new();
