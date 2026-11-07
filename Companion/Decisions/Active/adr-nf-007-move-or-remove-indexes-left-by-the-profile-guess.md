@@ -93,3 +93,31 @@ do it costs one directory listing and a few `stat` calls.
   `tests/test_profile_path_cleanup.py` (the helper binary with a temporary HOME: a real
   index moved with its rows, removal when this profile has an index, and the guess
   without `profilePath`).
+
+## Amendment 2026-11-06 (#8): init without `profilePath` is refused; the guess is gone
+
+Add-on 1.9.0, the first release that always sends `profilePath` and fails closed
+without it, was published on 2026-10-06. TabMail Voice always sends it too. A month
+later the helper stops guessing:
+
+- `init` without a non-empty absolute `profilePath` (missing, null, empty, relative or
+  not a string) is answered `{id, error}`, the way an invalid `modelDir` is. The helper
+  opens nothing, creates no index and runs no orphan clean-up, and it stays before
+  init, so a later `init` with `profilePath` still works.
+- Deleted: `find_thunderbird_profile_dir`, the `addonId` parameter it used, and
+  `migrate_fts_data`. The latter moved an index from the pre-extension-data location
+  `<profile>/tabmail_fts`, and was reachable only through the guess.
+- **Kept: `adopt_or_remove_orphaned_indexes`** and the candidate-directory helpers it
+  uses (`guessed_profile_dirs`, `profile_dir_candidates`, `thunderbird_profiles_dir`,
+  `fallback_profile_dir`). A user who stays on a pre-1.9 add-on until after this
+  helper arrives still has an index in a guessed directory. When their add-on
+  updates, the first `init` with `profilePath` moves that index into the profile, so
+  nothing unread stays on disk. Deleting the clean-up would leave such copies of mail
+  and chat memory on disk for good. Awaiting the owner's blessing.
+- Accepted: an add-on older than 1.9.0 gets no full-text search until it updates. Its
+  `init` fails, it disconnects, and it shows the helper as missing. It retries at most
+  once per its 60 s reconnect cooldown, so the retries are bounded.
+- Tests: in `tests/test_profile_path_cleanup.py`, the three guess tests were replaced
+  by two. One shows that each kind of missing or invalid `profilePath` is refused,
+  opens no index and leaves an orphan in place. The other shows that a refused `init`
+  leaves the helper accepting a following `init` with `profilePath`.
