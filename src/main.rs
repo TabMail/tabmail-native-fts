@@ -122,11 +122,11 @@ fn real_main() -> anyhow::Result<()> {
                 native_messaging::write_json(&mut out_stream, &resp)?;
             }
             "updateCheck" => {
-                let resp = handle_update_check(&req.id, &req.params)?;
+                let resp = response_or_error(&req.id, handle_update_check(&req.id, &req.params));
                 native_messaging::write_json(&mut out_stream, &resp)?;
             }
             "updateRequest" => {
-                let resp = handle_update_request(&req.id, &req.params)?;
+                let resp = response_or_error(&req.id, handle_update_request(&req.id, &req.params));
                 native_messaging::write_json(&mut out_stream, &resp)?;
                 // updateRequest with success means process should exit for restart
                 if resp.get("result").and_then(|r| r.get("success")).and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -318,13 +318,13 @@ fn run_multi_threaded(
         // These can arrive post-init when the user triggers a manual update check.
         match req.method.as_str() {
             "updateCheck" => {
-                let resp = handle_update_check(&req.id, &req.params)?;
+                let resp = response_or_error(&req.id, handle_update_check(&req.id, &req.params));
                 let mut out = shared_stdout.lock().unwrap();
                 native_messaging::write_json(&mut *out, &resp)?;
                 continue;
             }
             "updateRequest" => {
-                let resp = handle_update_request(&req.id, &req.params)?;
+                let resp = response_or_error(&req.id, handle_update_request(&req.id, &req.params));
                 let mut out = shared_stdout.lock().unwrap();
                 native_messaging::write_json(&mut *out, &resp)?;
                 if resp.get("result").and_then(|r| r.get("success")).and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -966,14 +966,19 @@ fn handle_write_request(
 // Shared helpers
 // ============================================================================
 
-fn write_response(stdout: &Arc<Mutex<Stdout>>, msg_id: &str, result: anyhow::Result<Value>) {
-    let value = match result {
+/// A request that fails is answered with `{ id, error }`; the helper keeps running.
+fn response_or_error(msg_id: &str, result: anyhow::Result<Value>) -> Value {
+    match result {
         Ok(v) => v,
         Err(e) => {
             log::error!("Handler error for {}: {:?}", msg_id, e);
             serde_json::json!({ "id": msg_id, "error": format!("{e}") })
         }
-    };
+    }
+}
+
+fn write_response(stdout: &Arc<Mutex<Stdout>>, msg_id: &str, result: anyhow::Result<Value>) {
+    let value = response_or_error(msg_id, result);
 
     let mut out = stdout.lock().unwrap();
     if let Err(e) = native_messaging::write_json(&mut *out, &value) {
