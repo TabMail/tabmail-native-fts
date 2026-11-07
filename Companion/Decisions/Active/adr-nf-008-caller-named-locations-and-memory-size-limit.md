@@ -258,6 +258,13 @@ A review of the merged amendment above found two faults; this replaces the rules
   with the overrun), the same as behind a request's own trim and under the clients' 60 s timeout.
   This step size is an overnight judgement call awaiting the owner's blessing; 5 s is the
   alternative (about 30% slower to finish, a 5 s worst-case wait).
+- **Lifetime.** The pending trim lives only in the helper process, as before. Thunderbird keeps
+  its helper running, so the trim finishes there. TabMail Voice ends its helper two minutes after
+  its last request once the model has loaded, which drops the rest of a large trim (measured: a
+  2.7 GB memory lowered to 100 MiB was left at 1.34 GB). The helper cannot keep trimming after its
+  client closes it without two helpers writing the same memory, so keeping the helper running
+  while a trim is unfinished is Voice's change (TabMail/tabmail-voice#393). Until then, Voice's
+  later limited writes trim as before #12.
 - **Tests** now cover: one idle step with a 1 ms budget leaves the memory above the limit and
   returns more-to-do (a step never runs the whole trim); a batch cut short leaves nothing pending
   and the idle writer removes nothing; `memoryTrim(low)` cut short, `memoryTrim(high)` within,
