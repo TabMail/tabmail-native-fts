@@ -147,8 +147,8 @@ pub mod memory {
     pub const TRIM_TARGET_PERCENT: i64 = 95;
     // Wall-time budget for one trim, checked after every row removed; well
     // under the add-on's native RPC timeout (60 s). A trim cut short keeps the
-    // rows it removed, reports `withinLimit: false`, and the next write or trim
-    // continues it.
+    // rows it removed, reports `withinLimit: false`, and the writer continues it
+    // while idle (below).
     pub const TRIM_TIME_BUDGET_MS: u64 = 20_000;
     // A trim that ended above its limit continues while the writer is idle (#12), in steps of this
     // wall-time budget; the writer checks for requests between steps, so a request waits for at most
