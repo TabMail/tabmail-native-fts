@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::io::Read;
 
 use anyhow::{bail, Context};
@@ -493,14 +493,17 @@ fn eq_hex_lower(a: &str, b: &str) -> bool {
     a.trim().eq_ignore_ascii_case(b.trim())
 }
 
+#[cfg(unix)]
 fn make_executable(p: &Path) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(p)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(p, perms)?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(p)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(p, perms)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_executable(_p: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -635,15 +638,32 @@ fn spawn_apply_update_helper(current: &Path, target: &Path, staged: &Path, stage
     // On Windows, we can't overwrite a running exe. We spawn a TEMP COPY of ourselves to perform the swap.
     let tmp_dir = std::env::temp_dir().join("tabmail-native-fts-update");
     std::fs::create_dir_all(&tmp_dir)?;
-    let helper = tmp_dir.join("fts_helper_apply_update.exe");
+    let helper = tmp_dir.join(config::update::APPLY_COPY_FILE_NAME);
     std::fs::copy(current, &helper).with_context(|| format!("failed copying helper to {}", helper.display()))?;
 
     log::info!("Spawning apply-update helper: {}", helper.display());
-    apply_update_command(&helper, target, staged, staged_notices)
-        .spawn()
-        .context("failed spawning apply-update helper")?;
+    let mut command = apply_update_command(&helper, target, staged, staged_notices);
+    // The copy outlives this process, so none of the client's pipes is its stdin, stdout or stderr.
+    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        // Thunderbird runs a native host in a job object and terminates the job when the host
+        // exits, so the copy leaves the job; detached, it has no console to lose with it
+        // (ADR-NF-025).
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS);
+    }
+    command.spawn().context("failed spawning apply-update helper")?;
     Ok(())
 }
+
+/// `CreateProcess` flag: the child is not part of the parent's job object.
+#[cfg(windows)]
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+/// `CreateProcess` flag: the child has no console.
+#[cfg(windows)]
+const DETACHED_PROCESS: u32 = 0x0000_0008;
 
 /// The Windows apply-update process: once the old helper has exited, installs the staged
 /// binary and its staged notices as a pair. It always runs the binary of the updater that
@@ -705,6 +725,7 @@ mod tests {
     }
 
     /// The apply-update copy goes to one fixed temporary path, so tests that start it run one at a time.
+    #[cfg(unix)]
     static LAUNCHER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn notices_crediting(version: &str) -> String {
@@ -833,7 +854,7 @@ mod tests {
     #[test]
     fn the_apply_update_process_reads_back_exactly_what_the_updater_starts_it_with() {
         let (target, staged, notices) = (Path::new("/i/fts_helper.exe"), Path::new("/i/fts_helper.exe.new"), Path::new("/i/n.new"));
-        let command = apply_update_command(Path::new("/t/fts_helper_apply_update.exe"), target, staged, notices);
+        let command = apply_update_command(Path::new("/t/fts_helper_apply.exe"), target, staged, notices);
         let mut args = vec![command.get_program().to_str().unwrap().to_string()];
         args.extend(command.get_args().map(|a| a.to_str().unwrap().to_string()));
         assert_eq!(
@@ -861,11 +882,75 @@ mod tests {
         }
         let args: Vec<String> = std::fs::read_to_string(&record).unwrap().lines().map(str::to_string).collect();
         assert_ne!(Path::new(&args[0]), current.as_path(), "it must run a copy, not the installed binary");
+        assert_eq!(Path::new(&args[0]).file_name().unwrap(), config::update::APPLY_COPY_FILE_NAME);
         assert_eq!(
             parse_apply_update_args(&args).unwrap(),
             Some(ApplyUpdateArgs { target, staged, staged_notices: notices })
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Set only in the updater process that `the_apply_update_copy_holds_none_of_the_updater_s_pipes`
+    /// starts: the directory its stand-in apply-update copy reports into.
+    #[cfg(unix)]
+    const PIPE_PROBE_DIR_ENV: &str = "TABMAIL_NF_TEST_PIPE_PROBE_DIR";
+    #[cfg(unix)]
+    const COPY_OUTPUT_MARKER: &str = "apply-update-copy-wrote-this";
+
+    #[cfg(unix)]
+    #[test]
+    fn the_apply_update_copy_holds_none_of_the_updater_s_pipes() {
+        // The client writes to the helper's stdin and reads its stdout and stderr. The copy outlives
+        // the helper, so it must neither read the client's input nor write into the client's output.
+        // The updater here is this test binary, started with piped stdio; its copy reads one line of
+        // stdin and writes a marker to stdout and stderr.
+        let _one_at_a_time = LAUNCHER.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = test_dir("pipes");
+        let mut updater = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "self_update::tests::apply_update_copy_pipe_probe", "--test-threads=1"])
+            .env(PIPE_PROBE_DIR_ENV, &dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Dropping the handle closes the client's end, so a copy holding the pipe reads this line.
+        std::io::Write::write_all(&mut updater.stdin.take().unwrap(), b"client-input\n").unwrap();
+        let output = updater.wait_with_output().unwrap();
+        assert!(output.status.success(), "the updater failed: {}", String::from_utf8_lossy(&output.stderr));
+        let read_from_stdin = dir.join("read-from-stdin");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(config::update::NOTICES_READ_TIMEOUT_SECS);
+        while !read_from_stdin.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(config::update::NOTICES_READ_POLL_MS));
+        }
+        assert_eq!(std::fs::read_to_string(&read_from_stdin).unwrap(), "", "the copy read the client's input");
+        let (stdout, stderr) = (String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(!stdout.contains(COPY_OUTPUT_MARKER), "the copy wrote into the client's stdout");
+        assert!(!stderr.contains(COPY_OUTPUT_MARKER), "the copy wrote into the client's stderr");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_update_copy_pipe_probe() {
+        // Does nothing unless started by `the_apply_update_copy_holds_none_of_the_updater_s_pipes`.
+        let Some(dir) = std::env::var_os(PIPE_PROBE_DIR_ENV).map(PathBuf::from) else { return };
+        let current = dir.join("helper");
+        let report = dir.join("read-from-stdin");
+        std::fs::write(&current, format!(
+            "#!/bin/sh\nIFS= read -r line\nprintf '%s' \"$line\" > '{0}.tmp'\necho {1}\necho {1} >&2\nmv '{0}.tmp' '{0}'\n",
+            report.display(), COPY_OUTPUT_MARKER)).unwrap();
+        make_executable(&current).unwrap();
+        spawn_apply_update_helper(&current, &dir.join("target"), &dir.join("staged"), &dir.join("notices")).unwrap();
+    }
+
+    #[test]
+    fn the_apply_update_copy_is_not_named_like_an_installer() {
+        // UAC refuses to start such an unmanifested executable for a standard user (os error 740).
+        let name = config::update::APPLY_COPY_FILE_NAME.to_ascii_lowercase();
+        for word in ["install", "setup", "update", "patch"] {
+            assert!(!name.contains(word), "{name} contains {word}");
+        }
     }
 
     #[test]
