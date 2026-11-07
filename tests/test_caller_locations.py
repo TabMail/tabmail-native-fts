@@ -42,6 +42,11 @@ DAY_MS = 24 * 60 * 60 * 1000
 LIVE_LOG = "fts_helper.log_rCURRENT.log"
 # A session that has not finished by then is stuck (a read of a FIFO blocks).
 SESSION_DEADLINE_S = 60
+# Rows in a memory too large for one memoryTrim request (20 s budget) to finish.
+LARGE_MEMORY_ROWS = 400_000
+# A helper whose client has gone stops its idle trim at the next row; one that
+# kept going would finish its 20 s step first.
+CLIENT_GONE_EXIT_S = 5
 
 
 def _tree_hashes(root):
@@ -682,6 +687,121 @@ class TestCallerLocations(unittest.TestCase):
         self.assertTrue(result["withinLimit"], batch)
         self.assertLessEqual(after["result"]["usedBytes"], limit)
         self.assertEqual(result["usedBytes"], after["result"]["usedBytes"])
+
+    def _write_large_memory(self, db_dir, model_dir):
+        """A memory of LARGE_MEMORY_ROWS rows (FTS only), written straight into
+        the helper's own schema: indexing that many through the helper would
+        take minutes. Returns the memory database path."""
+        (init,) = self._session(
+            ["--log-dir", str(self.caller / "logs")],
+            [("init", {"profilePath": str(db_dir), "modelDir": str(model_dir)})],
+        )
+        self.assertFalse(init["result"]["hasEmbeddings"], init)
+        memory_db = Path(init["result"]["memoryDbPath"])
+        conn = sqlite3.connect(memory_db)
+        try:
+            conn.execute("PRAGMA synchronous = OFF")
+            text = "planning notes for the quarterly review meeting " * 20
+            for first in range(0, LARGE_MEMORY_ROWS, 5000):
+                rows = [(i + 1, f"turn:{i}", f"[USER]: note {i} {text}") for i in range(first, first + 5000)]
+                conn.executemany(
+                    "INSERT INTO memory_fts(rowid, memId, role, content, sessionId) VALUES (?, ?, 'session', ?, 'persistent_chat')",
+                    rows,
+                )
+                conn.executemany("INSERT INTO memory_ids(rowid, memId) VALUES (?, ?)", [(r[0], r[1]) for r in rows])
+                conn.executemany(
+                    "INSERT INTO memory_meta(rowid, dateMs, sessionId, turnIndex) VALUES (?, ?, 'persistent_chat', 0)",
+                    [(r[0], 1_700_000_000_000 + r[0]) for r in rows],
+                )
+                conn.commit()
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            conn.close()
+        return memory_db
+
+    def test_a_helper_whose_client_closes_it_during_an_idle_trim_exits_at_once_and_leaves_whole_rows(self):
+        db_dir = self.caller / "db" / "voice"
+        # FTS only: the fixture writes no vectors.
+        model_dir = self.caller / "no-model"
+        _write_unreadable_model(model_dir)
+        memory_db = self._write_large_memory(db_dir, model_dir)
+        init_params = {"profilePath": str(db_dir), "modelDir": str(model_dir)}
+
+        def write_lock_held():
+            conn = sqlite3.connect(memory_db, timeout=0)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.rollback()
+                return False
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e):
+                    raise
+                return True
+            finally:
+                conn.close()
+
+        def rows_left():
+            conn = sqlite3.connect(memory_db)
+            try:
+                return conn.execute("SELECT COUNT(*) FROM memory_meta").fetchone()[0]
+            finally:
+                conn.close()
+
+        proc = self._spawn(["--log-dir", str(self.caller / "logs")])
+        watchdog = threading.Timer(SESSION_DEADLINE_S, proc.kill)
+        watchdog.start()
+        try:
+            _send_message(proc, {"id": "init", "method": "init", "params": init_params})
+            self.assertIn("result", _read_message(proc))
+            _send_message(proc, {"id": "trim", "method": "memoryTrim", "params": {"maxBytes": 1 << 20}})
+            trim = _read_message(proc)
+            self.assertFalse(trim["result"]["withinLimit"], f"the trim must be cut short to leave idle work: {trim}")
+            after_request = LARGE_MEMORY_ROWS - trim["result"]["trimmed"]
+            self.assertEqual(rows_left(), after_request)
+
+            # Nothing more is asked: the idle helper goes on trimming, in a
+            # write transaction it holds for the step.
+            deadline = time.monotonic() + SESSION_DEADLINE_S / 4
+            while not write_lock_held() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(write_lock_held(), "the idle helper did not continue the trim")
+
+            # The client closes the helper, as Voice does when it ends one.
+            closed = time.monotonic()
+            proc.stdin.close()
+            proc.wait(timeout=SESSION_DEADLINE_S)
+            exit_s = time.monotonic() - closed
+        finally:
+            watchdog.cancel()
+            proc.kill()
+            proc.stdout.close()
+        self.assertLess(exit_s, CLIENT_GONE_EXIT_S, f"exited {exit_s:.1f}s after its client closed it")
+        left = rows_left()
+        self.assertGreater(left, 0)
+        self.assertLessEqual(left, after_request)
+
+        # A successor writes at once, and nothing trims after the old helper exits.
+        newest = self._rows(LARGE_MEMORY_ROWS, 1, 40)
+        _, batch, stats, read = self._session(
+            ["--log-dir", str(self.caller / "logs")],
+            [
+                ("init", init_params),
+                ("memoryIndexBatch", {"rows": newest}),
+                ("memoryStats", {}),
+                ("memoryRead", {"timestampMs": newest[0]["dateMs"], "toleranceMs": 60_000}),
+            ],
+        )
+        self.assertEqual(batch["result"]["count"], 1, batch)
+        self.assertEqual(stats["result"]["docs"], left + 1, stats)
+        self.assertIn(f"note {LARGE_MEMORY_ROWS}", str(read["result"]))
+        # Every row left is whole: in all three tables or in none.
+        conn = sqlite3.connect(memory_db)
+        try:
+            counts = [conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("memory_fts", "memory_ids", "memory_meta")]
+            self.assertEqual(counts, [left + 1] * 3)
+            self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        finally:
+            conn.close()
 
 if __name__ == "__main__":
     unittest.main()
