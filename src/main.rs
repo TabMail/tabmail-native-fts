@@ -235,7 +235,7 @@ fn run_multi_threaded(
     let (reader_tx, reader_rx) = mpsc::channel::<ThreadMessage>();
     let (writer_tx, writer_rx) = mpsc::channel::<ThreadMessage>();
     let idle = IdleWork::new();
-    let client_gone = Arc::clone(&idle.client_gone);
+    let writer_tx = WriterSender { tx: writer_tx, client_gone: Arc::clone(&idle.client_gone) };
 
     // Spawn reader thread
     let reader_handle = {
@@ -370,7 +370,7 @@ fn run_multi_threaded(
 
     // Shutdown: drop senders so threads exit their recv() loops
     drop(reader_tx);
-    stop_writer(writer_tx, &client_gone);
+    drop(writer_tx);
     let _ = reader_handle.join();
     let _ = writer_handle.join();
 
@@ -734,7 +734,8 @@ fn writer_thread_main(
 /// The writer's memory trim (#12). Every trim, a request's or an idle step's, gets `budget`. A
 /// `memoryTrim` (sent when the client changes its limit) that ends above its limit leaves that
 /// limit `pending`, and the idle writer finishes it; one that ends within its limit, or a clear,
-/// leaves nothing pending; a failed request changes nothing. A batch's own limit never sets or
+/// leaves nothing pending. A refused request changes nothing; a `memoryTrim` whose own trim fails
+/// still ends any older pending limit. A batch's own limit never sets or
 /// ends it: a batch can carry a limit read before the client changed it, and an older limit must
 /// never outlive a newer one.
 struct MemoryTrimWork {
@@ -750,7 +751,7 @@ struct IdleWork {
     memory_trim: MemoryTrimWork,
     memory_compacting: bool,
     memory_compaction_stopped: bool,
-    /// Set once the client has closed stdin (`stop_writer`): a trim step under way stops at its
+    /// Set once the client has closed stdin (`WriterSender`): a trim step under way stops at its
     /// next row, as when its time runs out, so the helper commits and exits at once instead of
     /// holding the memory's write lock until the step's deadline, where a helper the client
     /// started in its place would fail its memory writes.
@@ -856,11 +857,25 @@ fn compact_memory_when_idle(conn: &Connection, compacting: &mut bool, stopped: &
 /// stale-shard conversion at a time (returning false once nothing is left), and
 /// the queue is checked again after each, so a request waits for at most the one
 /// shard in progress. None once the channel closes.
-/// Tells the writer the client has gone: its idle work stops at the next row (`IdleWork`), and
-/// it exits once the requests already sent are answered.
-fn stop_writer<T>(writer_tx: mpsc::Sender<T>, client_gone: &AtomicBool) {
-    client_gone.store(true, Ordering::Relaxed);
-    drop(writer_tx);
+/// The dispatcher's sender to the writer. Dropping it, whichever way the dispatch loop ends, tells
+/// the writer the client has gone: its idle work stops at the next row (`IdleWork`), and it exits
+/// once the requests already sent are answered.
+struct WriterSender {
+    tx: mpsc::Sender<ThreadMessage>,
+    client_gone: Arc<AtomicBool>,
+}
+
+impl WriterSender {
+    fn send(&self, msg: ThreadMessage) -> Result<(), mpsc::SendError<ThreadMessage>> {
+        self.tx.send(msg)
+    }
+}
+
+impl Drop for WriterSender {
+    fn drop(&mut self) {
+        // Before `tx` is dropped, so the writer sees the flag by the time it sees the disconnect.
+        self.client_gone.store(true, Ordering::Relaxed);
+    }
 }
 
 fn next_write_request<T>(rx: &mpsc::Receiver<T>, mut convert_one_shard: impl FnMut() -> bool) -> Option<T> {
@@ -2376,12 +2391,99 @@ mod tests {
     }
 
     #[test]
-    fn test_stop_writer_tells_the_idle_writer_the_client_has_gone() {
+    fn test_dropping_the_writer_sender_tells_the_idle_writer_the_client_has_gone() {
         let idle = IdleWork::new();
         let (tx, rx) = mpsc::channel::<ThreadMessage>();
-        stop_writer(tx, &idle.client_gone);
+        let sender = WriterSender { tx, client_gone: Arc::clone(&idle.client_gone) };
+        sender.send(ThreadMessage { method: "memoryStats".to_string(), id: "q".to_string(), params: Value::Null }).unwrap();
+        assert!(!idle.client_gone.load(Ordering::Relaxed), "not while the client is there");
+        drop(sender);
         assert!(idle.client_gone.load(Ordering::Relaxed));
+        // A request already sent is still answered; then the writer sees the disconnect.
+        assert_eq!(rx.try_recv().unwrap().id, "q");
         assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn test_an_idle_trim_step_stops_at_the_next_row_when_the_client_goes_during_it() {
+        // The client goes while the step is deleting: an update hook sets the flag at the first
+        // row the trim deletes, inside its open write transaction.
+        unsafe extern "C" fn gone_at_first_delete(
+            flag: *mut std::ffi::c_void, operation: i32, _: *const std::ffi::c_char,
+            table: *const std::ffi::c_char, _: i64,
+        ) {
+            if operation == rusqlite::ffi::SQLITE_DELETE && !table.is_null()
+                && std::ffi::CStr::from_ptr(table).to_bytes() == b"memory_meta"
+            {
+                (*(flag as *const AtomicBool)).store(true, Ordering::Relaxed);
+            }
+        }
+        let (dir, db, mut memory) = memory_file_with_exchanges("gone-during", 3000);
+        // No merge left from indexing, so the step reaches its deletions at once.
+        memory.execute("INSERT INTO memory_fts(memory_fts) VALUES('optimize')", []).unwrap();
+        let limit = memory_db::memory_used_bytes(&memory).unwrap() / 4;
+        let mut idle = IdleWork::new();
+        idle.memory_trim.budget = std::time::Duration::from_secs(600);
+        idle.memory_trim.pending = Some(limit);
+        unsafe {
+            rusqlite::ffi::sqlite3_update_hook(memory.handle(), Some(gone_at_first_delete),
+                Arc::as_ptr(&idle.client_gone) as *mut std::ffi::c_void);
+        }
+        let mut email = Connection::open_in_memory().unwrap();
+
+        idle.step(&mut email, &mut memory);
+        assert!(idle.client_gone.load(Ordering::Relaxed), "the fixture must mark the client gone during a delete");
+        assert!(memory.is_autocommit(), "the stopped step commits and holds no write transaction");
+        assert_eq!(memory_db::memory_db_count(&memory).unwrap(), 2999, "one whole exchange goes, then it stops");
+        unsafe { rusqlite::ffi::sqlite3_update_hook(memory.handle(), None, std::ptr::null_mut()) };
+        // A helper started in its place writes at once, and every other exchange is whole.
+        let next = memory_db::open_memory_writer_connection(&db).unwrap();
+        next.execute("INSERT INTO memory_ids(memId) VALUES('successor')", []).unwrap();
+        for table in ["memory_fts", "memory_meta"] {
+            let kept: Vec<i64> = next.prepare(&format!("SELECT rowid FROM {table} ORDER BY rowid")).unwrap()
+                .query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+            assert_eq!((kept.len(), kept.first(), kept.last()), (2999, Some(&2), Some(&3000)), "{table}");
+        }
+        drop(next);
+        drop(memory);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_a_batch_whose_trim_fails_keeps_its_row_and_the_pending_trim() {
+        // A `memoryTrim` left work pending; a batch then commits a new exchange and its own trim meets
+        // a transient storage failure. Once storage recovers, the pending trim still finishes with no
+        // further request, and the new exchange stays.
+        let (dir, db, mut memory) = memory_file_with_exchanges("batch-fails", 3000);
+        let limit = memory_db::memory_used_bytes(&memory).unwrap() / 4;
+        let mut idle = IdleWork::new();
+        cut_short(&mut memory, &db, &mut idle.memory_trim, "memoryTrim", serde_json::json!({ "maxBytes": limit }));
+        idle.memory_trim.budget = trim_budget();
+        memory.execute_batch("CREATE TRIGGER fail_delete BEFORE DELETE ON memory_ids BEGIN SELECT RAISE(ABORT, 'injected storage failure'); END;").unwrap();
+        let row = serde_json::json!({
+            "memId": "turn:fresh", "role": "session", "content": "[USER]: fresh",
+            "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": 3000,
+        });
+        let failed = memory_write(&mut memory, &db, &mut idle.memory_trim, "memoryIndexBatch", serde_json::json!({ "rows": [row], "maxBytes": limit })).unwrap_err();
+        assert!(failed.to_string().contains("injected storage failure"), "{failed}");
+        assert_eq!(idle.memory_trim.pending, Some(limit));
+        let fresh = |memory: &Connection| -> i64 {
+            memory.query_row("SELECT COUNT(*) FROM memory_ids WHERE memId = 'turn:fresh'", [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(fresh(&memory), 1, "the batch's row was kept before its trim failed");
+        memory.execute_batch("DROP TRIGGER fail_delete;").unwrap();
+        let count = memory_db::memory_db_count(&memory).unwrap();
+        let mut email = Connection::open_in_memory().unwrap();
+        let mut steps = 0;
+        while idle.step(&mut email, &mut memory) {
+            steps += 1;
+            assert!(steps < 100_000, "the idle writer must stop");
+        }
+        assert!(memory_db::memory_used_bytes(&memory).unwrap() <= limit);
+        assert!(memory_db::memory_db_count(&memory).unwrap() < count, "the idle writer removed older rows");
+        assert_eq!(fresh(&memory), 1, "the new exchange stays");
+        drop(memory);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2393,8 +2495,11 @@ mod tests {
         let mut idle = IdleWork::new();
         cut_short(&mut memory, &db, &mut idle.memory_trim, "memoryTrim", serde_json::json!({ "maxBytes": used / 4 }));
         assert_eq!(idle.memory_trim.pending, Some(used / 4));
+        // Time enough for the newer trim to reach a deletion, where the fault is.
+        idle.memory_trim.budget = trim_budget();
         memory.execute_batch("CREATE TRIGGER fail_delete BEFORE DELETE ON memory_ids BEGIN SELECT RAISE(ABORT, 'injected storage failure'); END;").unwrap();
-        assert!(memory_write(&mut memory, &db, &mut idle.memory_trim, "memoryTrim", serde_json::json!({ "maxBytes": used / 2 })).is_err());
+        let failed = memory_write(&mut memory, &db, &mut idle.memory_trim, "memoryTrim", serde_json::json!({ "maxBytes": used / 2 })).unwrap_err();
+        assert!(failed.to_string().contains("injected storage failure"), "{failed}");
         assert_eq!(idle.memory_trim.pending, None);
         memory.execute_batch("DROP TRIGGER fail_delete;").unwrap();
         let count = memory_db::memory_db_count(&memory).unwrap();

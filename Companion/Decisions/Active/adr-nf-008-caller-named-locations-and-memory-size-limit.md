@@ -262,7 +262,8 @@ A review of the merged amendment above found two faults; this replaces the rules
   its deadline, so a helper whose client closed stdin mid-step kept the write lock for up to
   about 20 s, and a helper the client started in its place (Voice does, on its next request)
   failed its memory writes (`database is locked`) or left its memory closed at init. Now the
-  dispatcher marks the client gone when stdin ends (`stop_writer`), and the idle trim's stop
+  dispatcher's sender to the writer (`WriterSender`) marks the client gone when it is dropped,
+  whichever way the dispatch loop ends (stdin closed, a read error), and the idle trim's stop
   check answers true on that as on its deadline (`memory_trim_to_bytes_unless`), so the step
   commits within one row and the helper exits. Measured with a 200,000-row memory and stdin closed
   5 s into a step: the old helper exited 6 to 16 s after stdin closed and the new helper's writes
@@ -277,8 +278,11 @@ A review of the merged amendment above found two faults; this replaces the rules
   while a trim is unfinished is Voice's change (TabMail/tabmail-voice#393). Until then, Voice's
   later limited writes trim as before #12.
 - **Tests** now cover: an idle step with the client gone removes nothing and leaves no
-  transaction open, and trims once the client is back; `stop_writer` sets the flag and
-  disconnects the writer; a failed `memoryTrim` after a cut-short one leaves nothing pending and
+  transaction open, and trims once the client is back; the client going in the middle of a step
+  (set at the step's first deletion) stops it after one whole exchange, commits, and a successor
+  writes at once; dropping `WriterSender` sets the flag before the writer sees the disconnect, and
+  a request already sent is still served; a batch whose own trim fails keeps its committed row
+  and the pending trim, which the idle writer then finishes; a failed `memoryTrim` after a cut-short one leaves nothing pending and
   the idle writer removes nothing; one idle step with a 1 ms budget leaves the memory above the limit and
   returns more-to-do (a step never runs the whole trim); a batch cut short leaves nothing pending
   and the idle writer removes nothing; `memoryTrim(low)` cut short, `memoryTrim(high)` within,
