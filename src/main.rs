@@ -692,15 +692,9 @@ fn writer_thread_main(
 ) {
     log::info!("[writer] Thread started");
 
-    let mut attempted_shards: HashSet<i32> = HashSet::new();
-    let mut shards_left = true;
-    let (mut memory_compacting, mut memory_compaction_stopped) = (false, false);
+    let mut idle = IdleWork::new();
     loop {
-        let next = next_write_request(&rx, || {
-            // Nothing to convert or compact in a failed clear's stand-in; the next request reopens it.
-            (!is_stand_in(&email_conn) && convert_one_shard_when_idle(&mut email_conn, &mut attempted_shards, &mut shards_left))
-                || (!is_stand_in(&memory_conn) && compact_memory_when_idle(&memory_conn, &mut memory_compacting, &mut memory_compaction_stopped))
-        });
+        let next = next_write_request(&rx, || idle.step(&mut email_conn, &mut memory_conn, idle_trim_budget()));
         let Some(msg) = next else { break };
         reopen_stand_in(&mut email_conn, "writer's email", || crate::fts::db::open_writer_connection(&email_db_path));
         reopen_stand_in(&mut memory_conn, "writer's memory", || memory_db::open_memory_writer_connection(&memory_db_path));
@@ -718,6 +712,7 @@ fn writer_thread_main(
             &msg.id,
             &msg.params,
         );
+        idle.memory_trim_pending = memory_trim_pending_after(&msg.method, &msg.params, &resp, idle.memory_trim_pending);
 
         write_response(&stdout, &msg.id, resp);
     }
@@ -728,6 +723,39 @@ fn writer_thread_main(
     drop(reader_memory_conn);
     drop(email_conn);
     drop(memory_conn);
+}
+
+/// The writer's work while no request waits, one step at a time.
+struct IdleWork {
+    attempted_shards: HashSet<i32>,
+    shards_left: bool,
+    /// The limit a trim left the memory above (#12): see `memory_trim_pending_after`.
+    memory_trim_pending: Option<i64>,
+    memory_compacting: bool,
+    memory_compaction_stopped: bool,
+}
+
+impl IdleWork {
+    fn new() -> Self {
+        IdleWork {
+            attempted_shards: HashSet::new(),
+            shards_left: true,
+            memory_trim_pending: None,
+            memory_compacting: false,
+            memory_compaction_stopped: false,
+        }
+    }
+
+    /// One step: a stale shard, else a step of a trim left above its limit, else a step of giving
+    /// the memory's freed space back (the trim first, so the space it frees goes back too). True
+    /// while there is more to do. Nothing to convert, trim or compact in a failed clear's stand-in;
+    /// the next request reopens it.
+    fn step(&mut self, email_conn: &mut Connection, memory_conn: &mut Connection, trim_budget: std::time::Duration) -> bool {
+        (!is_stand_in(email_conn) && convert_one_shard_when_idle(email_conn, &mut self.attempted_shards, &mut self.shards_left))
+            || (!is_stand_in(memory_conn) && trim_memory_when_idle(memory_conn, &mut self.memory_trim_pending, trim_budget))
+            || (!is_stand_in(memory_conn)
+                && compact_memory_when_idle(memory_conn, &mut self.memory_compacting, &mut self.memory_compaction_stopped))
+    }
 }
 
 /// One idle step of the shard migration: converts the next stale shard and
@@ -750,6 +778,52 @@ fn convert_one_shard_when_idle(conn: &mut Connection, attempted: &mut HashSet<i3
             false
         }
     }
+}
+
+/// The limit a trim still has to reach while the writer is idle (#12), once `method` was answered
+/// `resp`. A limited write that ends above its limit (`withinLimit: false`) sets it, the latest one
+/// winning; one that ends within its limit, a memory write without a limit (the client keeps none
+/// now), or a clear ends it. A failed request changes nothing.
+fn memory_trim_pending_after(method: &str, params: &Value, resp: &anyhow::Result<Value>, pending: Option<i64>) -> Option<i64> {
+    let Some(result) = resp.as_ref().ok().and_then(|r| r.get("result")) else {
+        return pending;
+    };
+    match method {
+        "memoryIndexBatch" | "memoryTrim" => match result.get("withinLimit").and_then(Value::as_bool) {
+            Some(false) => params.get("maxBytes").and_then(Value::as_i64),
+            _ => None,
+        },
+        "memoryClear" => None,
+        _ => pending,
+    }
+}
+
+/// One idle step of a trim a request left above its limit (#12): true while there is more to do.
+/// It ends within the limit, once no rows are left to remove (a limit below the empty memory's
+/// size), or on an error (logged; the next limited write trims again), so the idle writer can
+/// never spin on it.
+fn trim_memory_when_idle(conn: &mut Connection, pending: &mut Option<i64>, budget: std::time::Duration) -> bool {
+    let Some(max_bytes) = *pending else {
+        return false;
+    };
+    let more = match memory_db::memory_trim_to_bytes(conn, max_bytes, budget) {
+        Ok(trim) if trim.within_limit => false,
+        Ok(_) => match memory_db::memory_db_count(conn) {
+            Ok(rows) => rows > 0,
+            Err(e) => {
+                log::error!("[writer] Idle memory trim stopped: {:?}", e);
+                false
+            }
+        },
+        Err(e) => {
+            log::error!("[writer] Idle memory trim stopped: {:?}", e);
+            false
+        }
+    };
+    if !more {
+        *pending = None;
+    }
+    more
 }
 
 /// One idle step of giving the memory's freed space back (#11): true while there is more to do.
@@ -1063,6 +1137,10 @@ fn hello_capabilities() -> Value {
 
 fn trim_budget() -> std::time::Duration {
     std::time::Duration::from_millis(config::memory::TRIM_TIME_BUDGET_MS)
+}
+
+fn idle_trim_budget() -> std::time::Duration {
+    std::time::Duration::from_millis(config::memory::IDLE_TRIM_STEP_BUDGET_MS)
 }
 
 fn required_nonempty_string<'a>(params: &'a Value, name: &str) -> anyhow::Result<&'a str> {
@@ -1915,6 +1993,119 @@ mod tests {
         });
         assert_eq!(next, Some("request"));
         assert_eq!(conversions, 1, "the request must not wait for the next shard");
+    }
+
+    /// A memory in a temporary folder holding `n` text-only exchanges, oldest first.
+    fn memory_with_exchanges(name: &str, n: usize) -> (PathBuf, Connection) {
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+        let dir = std::env::temp_dir().join(format!("tabmail-idle-trim-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (_path, mut conn) = memory_db::open_or_create_memory_db(&dir).unwrap();
+        let filler = "planning notes for the quarterly review meeting ".repeat(20);
+        let rows: Vec<Value> = (0..n)
+            .map(|i| serde_json::json!({
+                "memId": format!("turn:{i}"), "role": "session", "content": format!("[USER]: {i} {filler}"),
+                "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": i as i64,
+            }))
+            .collect();
+        memory_db::memory_index_batch(&mut conn, &rows, None).unwrap();
+        (dir, conn)
+    }
+
+    #[test]
+    fn test_the_latest_memory_write_decides_whether_a_trim_goes_on_while_idle() {
+        let ok = |result: Value| -> anyhow::Result<Value> { Ok(serde_json::json!({ "id": "r", "result": result })) };
+        let over = serde_json::json!({ "ok": true, "withinLimit": false });
+        let within = serde_json::json!({ "ok": true, "withinLimit": true });
+        let limit = |n: i64| serde_json::json!({ "maxBytes": n });
+
+        // A limited write that ends above its limit leaves that limit to reach; the latest one wins.
+        let pending = memory_trim_pending_after("memoryTrim", &limit(100), &ok(over.clone()), None);
+        assert_eq!(pending, Some(100));
+        let pending = memory_trim_pending_after("memoryIndexBatch", &limit(50), &ok(over.clone()), pending);
+        assert_eq!(pending, Some(50));
+        // Other requests, failed requests and error answers change nothing.
+        assert_eq!(memory_trim_pending_after("indexBatch", &serde_json::json!({}), &ok(serde_json::json!({ "ok": true })), pending), Some(50));
+        assert_eq!(memory_trim_pending_after("memoryIndexBatch", &limit(10), &Err(anyhow::anyhow!("failed")), pending), Some(50));
+        let refused = Ok(serde_json::json!({ "id": "r", "error": "maxBytes must be a positive integer" }));
+        assert_eq!(memory_trim_pending_after("memoryTrim", &limit(0), &refused, pending), Some(50));
+        // Within its limit, without a limit, or cleared: nothing is left to trim.
+        assert_eq!(memory_trim_pending_after("memoryTrim", &limit(80), &ok(within.clone()), pending), None);
+        assert_eq!(memory_trim_pending_after("memoryIndexBatch", &limit(80), &ok(within), pending), None);
+        assert_eq!(memory_trim_pending_after("memoryIndexBatch", &serde_json::json!({}), &ok(serde_json::json!({ "ok": true, "count": 1 })), pending), None);
+        assert_eq!(memory_trim_pending_after("memoryClear", &serde_json::json!({}), &ok(serde_json::json!({ "ok": true })), pending), None);
+    }
+
+    #[test]
+    fn test_an_idle_writer_finishes_a_trim_a_request_left_above_its_limit() {
+        let (dir, mut memory) = memory_with_exchanges("finish", 3000);
+        let limit = memory_db::memory_used_bytes(&memory).unwrap() / 4;
+        let mut email = Connection::open_in_memory().unwrap();
+        let mut idle = IdleWork::new();
+        idle.memory_trim_pending = Some(limit);
+        // A short step budget, so one step cannot finish the trim.
+        let budget = std::time::Duration::from_millis(1);
+
+        assert!(idle.step(&mut email, &mut memory, budget));
+        assert_eq!(idle.memory_trim_pending, Some(limit), "one step must not finish this trim");
+        assert!(memory_db::memory_used_bytes(&memory).unwrap() > limit);
+        let mut steps = 1;
+        while idle.step(&mut email, &mut memory, budget) {
+            steps += 1;
+            assert!(steps < 100_000, "the idle writer must finish the trim and stop");
+        }
+
+        assert_eq!(idle.memory_trim_pending, None);
+        assert!(memory_db::memory_used_bytes(&memory).unwrap() <= limit);
+        let kept = memory_db::memory_db_count(&memory).unwrap();
+        assert!(kept > 0 && kept < 3000, "{kept}");
+        let oldest: i64 = memory.query_row("SELECT MIN(dateMs) FROM memory_meta", [], |r| r.get(0)).unwrap();
+        assert_eq!(oldest, 3000 - kept, "the oldest exchanges go first");
+        // Its freed space went back too: the trim comes before compaction, which runs once it ends.
+        let free: i64 = memory.query_row("PRAGMA freelist_count", [], |r| r.get(0)).unwrap();
+        assert_eq!(free, 0);
+        drop(memory);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_an_idle_trim_ends_once_no_rows_are_left_to_remove() {
+        // A limit below the empty memory's own size can never be reached.
+        let (dir, mut memory) = memory_with_exchanges("empty", 20);
+        let mut pending = Some(1);
+        assert!(!trim_memory_when_idle(&mut memory, &mut pending, trim_budget()), "nothing more can be done");
+        assert_eq!(pending, None);
+        assert_eq!(memory_db::memory_db_count(&memory).unwrap(), 0);
+        assert!(!trim_memory_when_idle(&mut memory, &mut pending, trim_budget()));
+        drop(memory);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_no_idle_trim_runs_in_a_stand_in() {
+        let (dir, mut memory) = memory_with_exchanges("stand-in", 20);
+        let mut stand_in = Connection::open_in_memory().unwrap();
+        assert!(is_stand_in(&stand_in));
+        let mut idle = IdleWork::new();
+        idle.memory_trim_pending = Some(1);
+        let mut email = Connection::open_in_memory().unwrap();
+        assert!(!idle.step(&mut email, &mut stand_in, trim_budget()));
+        assert_eq!(idle.memory_trim_pending, Some(1), "kept for the memory once it is open again");
+        // Once the memory is open again, the idle writer trims it.
+        let mut steps = 0;
+        while idle.step(&mut email, &mut memory, trim_budget()) {
+            steps += 1;
+            assert!(steps < 1000, "the idle writer must stop");
+        }
+        assert_eq!(idle.memory_trim_pending, None);
+        assert_eq!(memory_db::memory_db_count(&memory).unwrap(), 0);
+        drop(memory);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

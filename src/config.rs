@@ -150,6 +150,10 @@ pub mod memory {
     // rows it removed, reports `withinLimit: false`, and the next write or trim
     // continues it.
     pub const TRIM_TIME_BUDGET_MS: u64 = 20_000;
+    // A trim that ended above its limit continues while the writer is idle (#12), in steps of this
+    // wall-time budget; the writer checks for requests between steps, so a request waits for at most
+    // one (plus the overrun `trim_until` allows past a deadline).
+    pub const IDLE_TRIM_STEP_BUDGET_MS: u64 = 1_000;
     // Pages one FTS merge step writes; the budget is checked between steps.
     // The trim starts its merge once (negative) after removing rows and
     // continues it with positive steps, so a merge cut short survives the

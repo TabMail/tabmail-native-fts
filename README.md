@@ -206,8 +206,9 @@ A client can bound the memory database: `memoryIndexBatch` takes an optional `ma
 `memoryTrim { maxBytes }` applies a changed limit.
 
 - A trim stops asking for more work after about 20 s, and can finish the step under way (at 5 GiB
-  a call ran at most about 2 s past that). One cut short reports `withinLimit: false`, and the next
-  write or trim continues it.
+  a call ran at most about 2 s past that). One cut short reports `withinLimit: false`, and the helper
+  finishes it while no request is waiting, in steps of about 1 s, so later requests wait for at most
+  one step. A later write with a different limit, or without one, or `memoryClear`, replaces it.
 - The limit counts the database's pages in use; the write-ahead log can add to the files on disk.
 - The oldest entries are removed first. The space they took is reused by new entries, and the file
   keeps its largest size.
