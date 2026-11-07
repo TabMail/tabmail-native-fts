@@ -974,8 +974,18 @@ pub fn memory_trim_to_bytes(
     max_bytes: i64,
     budget: std::time::Duration,
 ) -> anyhow::Result<MemoryTrimResult> {
+    memory_trim_to_bytes_unless(conn, max_bytes, budget, &|| false)
+}
+
+/// `memory_trim_to_bytes`, also stopping, as when `budget` runs out, once `stop` answers true.
+pub fn memory_trim_to_bytes_unless(
+    conn: &mut Connection,
+    max_bytes: i64,
+    budget: std::time::Duration,
+    stop: &dyn Fn() -> bool,
+) -> anyhow::Result<MemoryTrimResult> {
     let deadline = std::time::Instant::now() + budget;
-    trim_until(conn, max_bytes, &mut || std::time::Instant::now() >= deadline)
+    trim_until(conn, max_bytes, &mut || stop() || std::time::Instant::now() >= deadline)
 }
 
 /// `memory_trim_to_bytes`, stopping once `out_of_time` answers true. It is

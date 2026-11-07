@@ -235,3 +235,58 @@ for many kept requests. Now the writer finishes it without waiting for requests:
   - the end when no rows are left;
   - no trim in a stand-in, and the trim once the memory is open again.
 
+## Follow-up 2026-11-07 (#12): only `memoryTrim` leaves a trim pending, and idle steps get the trim's own budget
+
+A review of the merged amendment above found two faults; this replaces the rules they name.
+
+- **A batch's limit can be older than the client's latest one.** Voice reads `memorySizeLimit`
+  when the key goes down and sends it with that exchange's `memoryIndexBatch`; TB reads it just
+  before sending. A user who lowers the limit and then raises it can have a batch built before
+  the raise arrive after the raise's `memoryTrim`. Under the amendment above, that batch, cut short,
+  set its low limit pending again, and the idle writer went on deleting the memory down to a limit
+  the user had already lifted: lost exchanges, the older setting beating the newer. Fixed by
+  deletion: a `memoryIndexBatch` still trims to its own `maxBytes` within its own budget, as
+  before #12, but neither sets nor ends the pending trim. Only `memoryTrim` (which every client
+  sends when the limit changes) sets it when it ends above its limit, and ends it when it ends
+  within; `memoryClear` ends it. A batch without `maxBytes` no longer ends it either. The batch
+  path's remaining excess is trimmed by the next limited batch, as before #12.
+- **The 1 s idle step was too slow.** Each step pays the fixed cost of starting a trim (the size
+  reading and the FTS merge start); on a 1.2 GB memory lowered to 100 MB, 1 s steps had not
+  finished after 1,201 s, 5 s steps took 329 s and 20 s steps 254 s. `IDLE_TRIM_STEP_BUDGET_MS`
+  is deleted; an idle step uses `TRIM_TIME_BUDGET_MS` (20 s), held with the pending limit in
+  `MemoryTrimWork.budget`. A request arriving during a step waits for at most one step (about 22 s
+  with the overrun), the same as behind a request's own trim and under the clients' 60 s timeout.
+  This step size is still to be confirmed; 5 s is the alternative (about 30% slower to finish, a
+  5 s worst-case wait).
+- **A step stops once the client has gone.** A step holds the memory's write transaction until
+  its deadline, so a helper whose client closed stdin mid-step kept the write lock for up to
+  about 20 s, and a helper the client started in its place (Voice does, on its next request)
+  failed its memory writes (`database is locked`) or left its memory closed at init. Now the
+  dispatcher's sender to the writer (`WriterSender`) marks the client gone when it is dropped,
+  whichever way the dispatch loop ends (stdin closed, a read error), and the idle trim's stop
+  check answers true on that as on its deadline (`memory_trim_to_bytes_unless`), so the step
+  commits within one row and the helper exits. Measured with a 200,000-row memory and stdin closed
+  5 s into a step: the old helper exited 6 to 16 s after stdin closed and the new helper's writes
+  failed in 2 of 3 runs; with the stop, it exited within 0.3 s and every write succeeded (3 of 3).
+- **A failed `memoryTrim` still replaces an older limit.** It clears the pending limit before it
+  trims, so a newer limit whose own trim fails never leaves an older one deleting while idle.
+- **Lifetime.** The pending trim lives only in the helper process, as before. Thunderbird keeps
+  its helper running, so the trim finishes there. TabMail Voice ends its helper two minutes after
+  its last request once the model has loaded, which drops the rest of a large trim (measured: a
+  2.7 GB memory lowered to 100 MiB was left at 1.34 GB). The helper cannot keep trimming after its
+  client closes it without two helpers writing the same memory, so keeping the helper running
+  while a trim is unfinished is Voice's change (TabMail/tabmail-voice#393). Until then, Voice's
+  later limited writes trim as before #12.
+- **Tests** now cover: an idle step with the client gone removes nothing and leaves no
+  transaction open, and trims once the client is back; the client going in the middle of a step
+  (set at the step's first deletion) stops it after one whole exchange, commits, and a successor
+  writes at once; dropping `WriterSender` sets the flag before the writer sees the disconnect, and
+  a request already sent is still served; a batch whose own trim fails keeps its committed row
+  and the pending trim, which the idle writer then finishes; a failed `memoryTrim` after a cut-short one leaves nothing pending and
+  the idle writer removes nothing; one idle step with a 1 ms budget leaves the memory above the limit and
+  returns more-to-do (a step never runs the whole trim); a batch cut short leaves nothing pending
+  and the idle writer removes nothing; `memoryTrim(low)` cut short, `memoryTrim(high)` within,
+  then a batch carrying the old low limit cut short: the idle writer removes nothing; the
+  pending rules (refused, unrelated and batch requests change nothing; the latest `memoryTrim`
+  wins; within limit and clear end it); and the writer-thread hand-off for `memoryTrim`, with and
+  without an unrelated write queued behind it.
