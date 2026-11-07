@@ -211,8 +211,8 @@ A client can bound the memory database: `memoryIndexBatch` takes an optional `ma
   request waits for at most one step, as it would behind a request's own trim. A later `memoryTrim`
   replaces it, and `memoryClear` ends it. A `memoryIndexBatch` trims to its own `maxBytes` but
   leaves nothing to finish: its limit may be older than the latest `memoryTrim`. What is left is
-  kept only while the helper runs; a helper that ends (its client closes it) leaves the rest to the
-  next limited write.
+  kept only while the helper runs; a helper whose client closes it stops trimming at once and
+  leaves the rest to the next limited write.
 - The limit counts the database's pages in use; the write-ahead log can add to the files on disk.
 - The oldest entries are removed first. The space they took is reused by new entries, and the file
   keeps its largest size.

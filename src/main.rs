@@ -15,6 +15,7 @@ mod update_signature;
 use std::collections::HashSet;
 use std::io::{stdin, stdout, Stdin, Stdout, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{bail, Context};
@@ -233,6 +234,8 @@ fn run_multi_threaded(
     // Channels: main → reader, main → writer
     let (reader_tx, reader_rx) = mpsc::channel::<ThreadMessage>();
     let (writer_tx, writer_rx) = mpsc::channel::<ThreadMessage>();
+    let idle = IdleWork::new();
+    let client_gone = Arc::clone(&idle.client_gone);
 
     // Spawn reader thread
     let reader_handle = {
@@ -283,7 +286,7 @@ fn run_multi_threaded(
                     memory_path,
                     reader_email_conn,
                     reader_memory_conn,
-                    IdleWork::new(),
+                    idle,
                 );
             })?
     };
@@ -367,7 +370,7 @@ fn run_multi_threaded(
 
     // Shutdown: drop senders so threads exit their recv() loops
     drop(reader_tx);
-    drop(writer_tx);
+    stop_writer(writer_tx, &client_gone);
     let _ = reader_handle.join();
     let _ = writer_handle.join();
 
@@ -747,6 +750,11 @@ struct IdleWork {
     memory_trim: MemoryTrimWork,
     memory_compacting: bool,
     memory_compaction_stopped: bool,
+    /// Set once the client has closed stdin (`stop_writer`): a trim step under way stops at its
+    /// next row, as when its time runs out, so the helper commits and exits at once instead of
+    /// holding the memory's write lock until the step's deadline, where a helper the client
+    /// started in its place would fail its memory writes.
+    client_gone: Arc<AtomicBool>,
 }
 
 impl IdleWork {
@@ -757,6 +765,7 @@ impl IdleWork {
             memory_trim: MemoryTrimWork { budget: trim_budget(), pending: None },
             memory_compacting: false,
             memory_compaction_stopped: false,
+            client_gone: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -766,7 +775,7 @@ impl IdleWork {
     /// the next request reopens it.
     fn step(&mut self, email_conn: &mut Connection, memory_conn: &mut Connection) -> bool {
         (!is_stand_in(email_conn) && convert_one_shard_when_idle(email_conn, &mut self.attempted_shards, &mut self.shards_left))
-            || (!is_stand_in(memory_conn) && trim_memory_when_idle(memory_conn, &mut self.memory_trim.pending, self.memory_trim.budget))
+            || (!is_stand_in(memory_conn) && trim_memory_when_idle(memory_conn, &mut self.memory_trim.pending, self.memory_trim.budget, &self.client_gone))
             || (!is_stand_in(memory_conn)
                 && compact_memory_when_idle(memory_conn, &mut self.memory_compacting, &mut self.memory_compaction_stopped))
     }
@@ -798,11 +807,12 @@ fn convert_one_shard_when_idle(conn: &mut Connection, attempted: &mut HashSet<i3
 /// It ends within the limit, once no rows are left to remove (a limit below the empty memory's
 /// size), or on an error (logged; the next limited write trims again), so the idle writer can
 /// never spin on it.
-fn trim_memory_when_idle(conn: &mut Connection, pending: &mut Option<i64>, budget: std::time::Duration) -> bool {
+fn trim_memory_when_idle(conn: &mut Connection, pending: &mut Option<i64>, budget: std::time::Duration, client_gone: &AtomicBool) -> bool {
     let Some(max_bytes) = *pending else {
         return false;
     };
-    let more = match memory_db::memory_trim_to_bytes(conn, max_bytes, budget) {
+    let stop = || client_gone.load(Ordering::Relaxed);
+    let more = match memory_db::memory_trim_to_bytes_unless(conn, max_bytes, budget, &stop) {
         Ok(trim) if trim.within_limit => false,
         Ok(_) => match memory_db::memory_db_count(conn) {
             Ok(rows) => rows > 0,
@@ -846,6 +856,13 @@ fn compact_memory_when_idle(conn: &Connection, compacting: &mut bool, stopped: &
 /// stale-shard conversion at a time (returning false once nothing is left), and
 /// the queue is checked again after each, so a request waits for at most the one
 /// shard in progress. None once the channel closes.
+/// Tells the writer the client has gone: its idle work stops at the next row (`IdleWork`), and
+/// it exits once the requests already sent are answered.
+fn stop_writer<T>(writer_tx: mpsc::Sender<T>, client_gone: &AtomicBool) {
+    client_gone.store(true, Ordering::Relaxed);
+    drop(writer_tx);
+}
+
 fn next_write_request<T>(rx: &mpsc::Receiver<T>, mut convert_one_shard: impl FnMut() -> bool) -> Option<T> {
     loop {
         match rx.try_recv() {
@@ -1001,6 +1018,8 @@ fn handle_write_request(
         "memoryTrim" => {
             // Sent when the client lowers its limit.
             let max_bytes = parse_memory_max_bytes(params.get("maxBytes").unwrap_or(&Value::Null))?;
+            // The client's latest limit replaces any older one, even when its own trim fails.
+            trim.pending = None;
             let trim_result = memory_db::memory_trim_to_bytes(memory_conn, max_bytes, trim.budget)?;
             trim.pending = (!trim_result.within_limit).then_some(max_bytes);
             let trim = trim_result;
@@ -2261,11 +2280,11 @@ mod tests {
         memory.execute_batch("CREATE TRIGGER fail_delete BEFORE DELETE ON memory_ids BEGIN SELECT RAISE(ABORT, 'injected storage failure'); END;").unwrap();
 
         let mut pending = Some(limit);
-        assert!(!trim_memory_when_idle(&mut memory, &mut pending, trim_budget()), "a storage error must end the idle trim");
+        assert!(!trim_memory_when_idle(&mut memory, &mut pending, trim_budget(), &AtomicBool::new(false)), "a storage error must end the idle trim");
         assert_eq!(pending, None, "and it is not tried again while idle");
         let changes = memory.total_changes();
         for _ in 0..3 {
-            assert!(!trim_memory_when_idle(&mut memory, &mut pending, trim_budget()));
+            assert!(!trim_memory_when_idle(&mut memory, &mut pending, trim_budget(), &AtomicBool::new(false)));
         }
         assert_eq!(memory.total_changes(), changes, "no further attempt");
         for table in ["memory_ids", "memory_meta", "memory_fts"] {
@@ -2311,13 +2330,13 @@ mod tests {
 
         // A step with no time left removes nothing, so the count decides whether more is left.
         let mut pending = Some(limit);
-        let more = trim_memory_when_idle(&mut memory, &mut pending, std::time::Duration::ZERO);
+        let more = trim_memory_when_idle(&mut memory, &mut pending, std::time::Duration::ZERO, &AtomicBool::new(false));
         assert_eq!(denied.load(Ordering::SeqCst), 1, "the fault must hit the count after the step");
         assert!(!more, "a failed count must end the idle trim");
         assert_eq!(pending, None, "and it is not tried again while idle");
         let changes = memory.total_changes();
         for _ in 0..3 {
-            assert!(!trim_memory_when_idle(&mut memory, &mut pending, trim_budget()));
+            assert!(!trim_memory_when_idle(&mut memory, &mut pending, trim_budget(), &AtomicBool::new(false)));
         }
         assert_eq!(memory.total_changes(), changes, "no further attempt");
         assert_eq!(denied.load(Ordering::SeqCst), 1);
@@ -2333,14 +2352,72 @@ mod tests {
     }
 
     #[test]
+    fn test_an_idle_trim_step_stops_at_once_once_the_client_has_gone() {
+        // A step with all the time it could want, but the client closed stdin: it removes nothing
+        // more and lets go of the memory, so a helper started in its place can write to it.
+        let (dir, mut memory) = memory_with_exchanges("client-gone", 3000);
+        let limit = memory_db::memory_used_bytes(&memory).unwrap() / 4;
+        let mut idle = IdleWork::new();
+        idle.memory_trim.budget = std::time::Duration::from_secs(600);
+        idle.memory_trim.pending = Some(limit);
+        idle.client_gone.store(true, Ordering::Relaxed);
+        let mut email = Connection::open_in_memory().unwrap();
+
+        idle.step(&mut email, &mut memory);
+        assert_eq!(memory_db::memory_db_count(&memory).unwrap(), 3000, "no row removed once the client has gone");
+        assert!(memory_db::memory_used_bytes(&memory).unwrap() > limit);
+        assert!(memory.is_autocommit(), "no transaction left open");
+        // Two-sided: with the client still there, the same step trims.
+        idle.client_gone.store(false, Ordering::Relaxed);
+        idle.step(&mut email, &mut memory);
+        assert!(memory_db::memory_used_bytes(&memory).unwrap() <= limit);
+        drop(memory);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_stop_writer_tells_the_idle_writer_the_client_has_gone() {
+        let idle = IdleWork::new();
+        let (tx, rx) = mpsc::channel::<ThreadMessage>();
+        stop_writer(tx, &idle.client_gone);
+        assert!(idle.client_gone.load(Ordering::Relaxed));
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn test_a_memory_trim_that_fails_still_replaces_an_older_limit() {
+        // The client lowers its limit (cut short, left pending), then sets another; that trim fails.
+        // The older limit must not go on deleting while idle.
+        let (dir, db, mut memory) = memory_file_with_exchanges("failed-newer", 3000);
+        let used = memory_db::memory_used_bytes(&memory).unwrap();
+        let mut idle = IdleWork::new();
+        cut_short(&mut memory, &db, &mut idle.memory_trim, "memoryTrim", serde_json::json!({ "maxBytes": used / 4 }));
+        assert_eq!(idle.memory_trim.pending, Some(used / 4));
+        memory.execute_batch("CREATE TRIGGER fail_delete BEFORE DELETE ON memory_ids BEGIN SELECT RAISE(ABORT, 'injected storage failure'); END;").unwrap();
+        assert!(memory_write(&mut memory, &db, &mut idle.memory_trim, "memoryTrim", serde_json::json!({ "maxBytes": used / 2 })).is_err());
+        assert_eq!(idle.memory_trim.pending, None);
+        memory.execute_batch("DROP TRIGGER fail_delete;").unwrap();
+        let count = memory_db::memory_db_count(&memory).unwrap();
+        let mut email = Connection::open_in_memory().unwrap();
+        let mut steps = 0;
+        while idle.step(&mut email, &mut memory) {
+            steps += 1;
+            assert!(steps < 100_000, "the idle writer must stop");
+        }
+        assert_eq!(memory_db::memory_db_count(&memory).unwrap(), count, "the idle writer removes nothing");
+        drop(memory);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn test_an_idle_trim_ends_once_no_rows_are_left_to_remove() {
         // A limit below the empty memory's own size can never be reached.
         let (dir, mut memory) = memory_with_exchanges("empty", 20);
         let mut pending = Some(1);
-        assert!(!trim_memory_when_idle(&mut memory, &mut pending, trim_budget()), "nothing more can be done");
+        assert!(!trim_memory_when_idle(&mut memory, &mut pending, trim_budget(), &AtomicBool::new(false)), "nothing more can be done");
         assert_eq!(pending, None);
         assert_eq!(memory_db::memory_db_count(&memory).unwrap(), 0);
-        assert!(!trim_memory_when_idle(&mut memory, &mut pending, trim_budget()));
+        assert!(!trim_memory_when_idle(&mut memory, &mut pending, trim_budget(), &AtomicBool::new(false)));
         drop(memory);
         std::fs::remove_dir_all(&dir).unwrap();
     }

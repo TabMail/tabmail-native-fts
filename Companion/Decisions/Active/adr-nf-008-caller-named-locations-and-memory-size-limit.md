@@ -256,8 +256,19 @@ A review of the merged amendment above found two faults; this replaces the rules
   is deleted; an idle step uses `TRIM_TIME_BUDGET_MS` (20 s), held with the pending limit in
   `MemoryTrimWork.budget`. A request arriving during a step waits for at most one step (about 22 s
   with the overrun), the same as behind a request's own trim and under the clients' 60 s timeout.
-  This step size is an overnight judgement call awaiting the owner's blessing; 5 s is the
-  alternative (about 30% slower to finish, a 5 s worst-case wait).
+  This step size is still to be confirmed; 5 s is the alternative (about 30% slower to finish, a
+  5 s worst-case wait).
+- **A step stops once the client has gone.** A step holds the memory's write transaction until
+  its deadline, so a helper whose client closed stdin mid-step kept the write lock for up to
+  about 20 s, and a helper the client started in its place (Voice does, on its next request)
+  failed its memory writes (`database is locked`) or left its memory closed at init. Now the
+  dispatcher marks the client gone when stdin ends (`stop_writer`), and the idle trim's stop
+  check answers true on that as on its deadline (`memory_trim_to_bytes_unless`), so the step
+  commits within one row and the helper exits. Measured with a 200,000-row memory and stdin closed
+  5 s into a step: the old helper exited 6 to 16 s after stdin closed and the new helper's writes
+  failed in 2 of 3 runs; with the stop, it exited within 0.3 s and every write succeeded (3 of 3).
+- **A failed `memoryTrim` still replaces an older limit.** It clears the pending limit before it
+  trims, so a newer limit whose own trim fails never leaves an older one deleting while idle.
 - **Lifetime.** The pending trim lives only in the helper process, as before. Thunderbird keeps
   its helper running, so the trim finishes there. TabMail Voice ends its helper two minutes after
   its last request once the model has loaded, which drops the rest of a large trim (measured: a
@@ -265,7 +276,10 @@ A review of the merged amendment above found two faults; this replaces the rules
   client closes it without two helpers writing the same memory, so keeping the helper running
   while a trim is unfinished is Voice's change (TabMail/tabmail-voice#393). Until then, Voice's
   later limited writes trim as before #12.
-- **Tests** now cover: one idle step with a 1 ms budget leaves the memory above the limit and
+- **Tests** now cover: an idle step with the client gone removes nothing and leaves no
+  transaction open, and trims once the client is back; `stop_writer` sets the flag and
+  disconnects the writer; a failed `memoryTrim` after a cut-short one leaves nothing pending and
+  the idle writer removes nothing; one idle step with a 1 ms budget leaves the memory above the limit and
   returns more-to-do (a step never runs the whole trim); a batch cut short leaves nothing pending
   and the idle writer removes nothing; `memoryTrim(low)` cut short, `memoryTrim(high)` within,
   then a batch carrying the old low limit cut short: the idle writer removes nothing; the
