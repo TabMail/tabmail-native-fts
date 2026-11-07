@@ -23,6 +23,7 @@ made for the test, which the helper is told to trust through TM_UPDATE_PUBLIC_KE
 import base64
 import functools
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -96,11 +97,25 @@ class _HelperFolder(unittest.TestCase):
         return subprocess.Popen([str(exe)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, env=env or self._env(), cwd=self.cwd)
 
+    _ids = itertools.count(1)
+
     def _call(self, proc, method, params):
-        _send(proc, {"id": method, "method": method, "params": params})
+        # Ids like a client's (Thunderbird sends `rpc-<n>`), never the method name, so an answer
+        # carrying anything but the request's own id fails here.
+        msg_id = f"rpc-{next(self._ids)}"
+        _send(proc, {"id": msg_id, "method": method, "params": params})
         resp = _read(proc)
         self.assertIsNotNone(resp, f"no {method} response")
+        self.assertEqual(resp.get("id"), msg_id, resp)
         return resp
+
+    def _init(self, proc):
+        models = self.root / "models"
+        models.mkdir(exist_ok=True)
+        for name in MODEL_FILES:
+            (models / name).write_bytes(b"not a model")
+        resp = self._call(proc, "init", {"profilePath": str(self.root / "profile"), "modelDir": str(models)})
+        self.assertNotIn("error", resp)
 
     def _say_hello(self, proc):
         resp = self._call(proc, "hello", {"addonVersion": "test"})
@@ -291,14 +306,6 @@ class _SignedUpdates(_HelperFolder):
         return {"targetVersion": version, "updateUrl": url, "sha256": sha, "platform": UPDATE_PLATFORM,
                 "signature": base64.b64encode(signature).decode("ascii")}
 
-    def _init(self, proc):
-        models = self.root / "models"
-        models.mkdir(exist_ok=True)
-        for name in MODEL_FILES:
-            (models / name).write_bytes(b"not a model")
-        resp = self._call(proc, "init", {"profilePath": str(self.root / "profile"), "modelDir": str(models)})
-        self.assertNotIn("error", resp)
-
     def _update(self, version, after_init):
         proc = self._start(self.exe, self._update_env())
         try:
@@ -307,6 +314,9 @@ class _SignedUpdates(_HelperFolder):
             if after_init:
                 self._init(proc)
             resp = self._call(proc, "updateRequest", self._update_params(version))
+            if resp.get("result", {}).get("success") is True:
+                # A successful update ends the helper by itself, with its input still open.
+                proc.wait(timeout=SESSION_DEADLINE_S)
         finally:
             code = self._finish(proc)
         return resp, code
@@ -367,11 +377,12 @@ class TestAFailedUpdateIsAnswered(_SignedUpdates):
         try:
             if after_init:
                 self._init(proc)
-            resp = self._call(proc, method, params)
-            self.assertEqual(resp["id"], method)
-            self.assertNotIn("result", resp)
-            self.assertIsInstance(resp["error"], str)
-            self.assertTrue(resp["error"])
+            # Twice, so successive failures are each answered under their own id.
+            for _ in range(2):
+                resp = self._call(proc, method, params)
+                self.assertNotIn("result", resp)
+                self.assertIsInstance(resp["error"], str)
+                self.assertTrue(resp["error"])
             # The session goes on: before init it still says hello and initializes; after init
             # the reader thread still answers.
             if not after_init:
@@ -394,6 +405,28 @@ class TestAFailedUpdateIsAnswered(_SignedUpdates):
         for after_init in (False, True):
             with self.subTest(after_init=after_init):
                 self._assert_answered_with_an_error("updateCheck", {}, after_init)
+
+
+class TestAValidUpdateCheckIsAnswered(_HelperFolder):
+    """A valid `updateCheck`, before and after `init`, is answered with the eligibility result."""
+
+    def test_a_valid_update_check_reports_the_versions_and_eligibility(self):
+        major, minor, patch = (int(part) for part in VERSION.split(".")[:3])
+        newer = f"{major}.{minor}.{patch + 1}"
+        exe = self._install()
+        for after_init in (False, True):
+            with self.subTest(after_init=after_init):
+                proc = self._start(exe)
+                try:
+                    if after_init:
+                        self._init(proc)
+                    for target, needs_update in ((newer, True), (VERSION, False)):
+                        resp = self._call(proc, "updateCheck", {"targetVersion": target})
+                        self.assertNotIn("error", resp)
+                        self.assertEqual(resp["result"], {"currentVersion": VERSION, "targetVersion": target,
+                                                          "needsUpdate": needs_update, "canUpdate": True})
+                finally:
+                    self.assertEqual(self._finish(proc), 0)
 
 
 class _QuietHandler(SimpleHTTPRequestHandler):
