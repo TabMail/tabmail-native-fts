@@ -762,9 +762,11 @@ class TestCallerLocations(unittest.TestCase):
             # Nothing more is asked: the idle helper goes on trimming, in a
             # write transaction it holds for the step.
             deadline = time.monotonic() + SESSION_DEADLINE_S / 4
-            while not write_lock_held() and time.monotonic() < deadline:
+            idle_trimming = write_lock_held()
+            while not idle_trimming and time.monotonic() < deadline:
                 time.sleep(0.05)
-            self.assertTrue(write_lock_held(), "the idle helper did not continue the trim")
+                idle_trimming = write_lock_held()
+            self.assertTrue(idle_trimming, "the idle helper did not continue the trim")
 
             # The client closes the helper, as Voice does when it ends one.
             closed = time.monotonic()

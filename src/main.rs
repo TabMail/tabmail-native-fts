@@ -853,10 +853,6 @@ fn compact_memory_when_idle(conn: &Connection, compacting: &mut bool, stopped: &
     }
 }
 
-/// The writer's next request. While none is waiting, `convert_one_shard` runs one
-/// stale-shard conversion at a time (returning false once nothing is left), and
-/// the queue is checked again after each, so a request waits for at most the one
-/// shard in progress. None once the channel closes.
 /// The dispatcher's sender to the writer. Dropping it, whichever way the dispatch loop ends, tells
 /// the writer the client has gone: its idle work stops at the next row (`IdleWork`), and it exits
 /// once the requests already sent are answered.
@@ -878,6 +874,10 @@ impl Drop for WriterSender {
     }
 }
 
+/// The writer's next request. While none is waiting, `convert_one_shard` runs one
+/// stale-shard conversion at a time (returning false once nothing is left), and
+/// the queue is checked again after each, so a request waits for at most the one
+/// shard in progress. None once the channel closes.
 fn next_write_request<T>(rx: &mpsc::Receiver<T>, mut convert_one_shard: impl FnMut() -> bool) -> Option<T> {
     loop {
         match rx.try_recv() {
