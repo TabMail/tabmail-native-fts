@@ -173,7 +173,10 @@ class TestProfilePathCleanup(unittest.TestCase):
             responses = []
             for i, (method, request_params) in enumerate(requests):
                 _send_message(proc, {"id": f"r{i}", "method": method, "params": request_params})
-                responses.append(_read_message(proc))
+                response = _read_message(proc)
+                # Clients match a response to its request by id; an answer under another id is lost.
+                self.assertEqual(response.get("id"), f"r{i}", response)
+                responses.append(response)
             return responses
         finally:
             proc.stdin.close()

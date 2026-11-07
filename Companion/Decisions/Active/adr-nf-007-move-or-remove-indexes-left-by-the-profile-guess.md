@@ -113,7 +113,7 @@ later the helper stops guessing:
   helper arrives still has an index in a guessed directory. When their add-on
   updates, the first `init` with `profilePath` moves that index into the profile, so
   nothing unread stays on disk. Deleting the clean-up would leave such copies of mail
-  and chat memory on disk for good. Awaiting the owner's blessing.
+  and chat memory on disk for good.
 - Accepted: an add-on older than 1.9.0 gets no full-text search until it updates. Its
   `init` fails, it disconnects, and it shows the helper as missing. It retries at most
   once per its 60 s reconnect cooldown, so the retries are bounded.
