@@ -643,7 +643,7 @@ fn spawn_apply_update_helper(current: &Path, target: &Path, staged: &Path, stage
 
     log::info!("Spawning apply-update helper: {}", helper.display());
     let mut command = apply_update_command(&helper, target, staged, staged_notices);
-    // The copy outlives this process, so it holds none of the client's pipes.
+    // The copy outlives this process, so none of the client's pipes is its stdin, stdout or stderr.
     command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(windows)]
     {
@@ -725,6 +725,7 @@ mod tests {
     }
 
     /// The apply-update copy goes to one fixed temporary path, so tests that start it run one at a time.
+    #[cfg(unix)]
     static LAUNCHER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn notices_crediting(version: &str) -> String {
@@ -891,7 +892,9 @@ mod tests {
 
     /// Set only in the updater process that `the_apply_update_copy_holds_none_of_the_updater_s_pipes`
     /// starts: the directory its stand-in apply-update copy reports into.
+    #[cfg(unix)]
     const PIPE_PROBE_DIR_ENV: &str = "TABMAIL_NF_TEST_PIPE_PROBE_DIR";
+    #[cfg(unix)]
     const COPY_OUTPUT_MARKER: &str = "apply-update-copy-wrote-this";
 
     #[cfg(unix)]

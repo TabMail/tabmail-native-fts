@@ -35,8 +35,11 @@ With all three, the same Thunderbird run applied the update: the new binary and 
 
 ## Consequences
 
-- If a job further up does not allow breakaway, `CreateProcess` fails, the update is answered with an error
-  (#64), and it is retried at the next connection. Nothing is installed in that case.
+- If the client's own job does not allow breakaway, `CreateProcess` fails, the update is answered with an
+  error (#64), and it is retried at the next connection. Nothing is installed in that case. With nested jobs
+  the copy leaves only the client's job: a job further up that does not allow breakaway keeps the copy, and
+  creation does not fail (Microsoft, "Nested Jobs"). In the measured Thunderbird run the copy still sat in a
+  job and the update applied.
 - A second process running the same helper (a second Thunderbird profile) still makes every swap attempt fail
   after the success answer, as ADR-NF-024 describes. The client limits how often it asks for the same version.
 - A helper released before this change runs updates with the old launch, so it cannot update itself into this
