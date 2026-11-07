@@ -2092,9 +2092,12 @@ mod tests {
     #[test]
     fn test_the_writer_finishes_a_trim_its_request_left_while_no_request_follows() {
         // The writer thread itself: a limited request's own trim runs out of time, the client
-        // stays connected and sends nothing more, and memory still settles within the limit.
-        for method in ["memoryTrim", "memoryIndexBatch"] {
-            let (dir, memory_db, memory) = memory_file_with_exchanges(&format!("writer-{method}"), 3000);
+        // stays connected and sends nothing more (or only an unrelated write, queued right
+        // behind it), and memory still settles within the limit.
+        let cases = [("memoryTrim", false), ("memoryIndexBatch", false), ("memoryTrim", true), ("memoryIndexBatch", true)];
+        for (method, then_unrelated) in cases {
+            let case = format!("{method}{}", if then_unrelated { " then memoryRemoveBatch" } else { "" });
+            let (dir, memory_db, memory) = memory_file_with_exchanges(&format!("writer-{method}-{then_unrelated}"), 3000);
             let limit = memory_db::memory_used_bytes(&memory).unwrap() / 4;
             drop(memory);
             let (email_db, email, known_years) = crate::fts::db::open_or_create_db(&dir.join("email")).unwrap();
@@ -2123,25 +2126,42 @@ mod tests {
                 }),
             };
             tx.send(ThreadMessage { method: method.to_string(), id: "m".to_string(), params }).unwrap();
+            if then_unrelated {
+                let params = serde_json::json!({ "ids": [] });
+                tx.send(ThreadMessage { method: "memoryRemoveBatch".to_string(), id: "u".to_string(), params }).unwrap();
+            }
 
             // Generous deadlines: on a loaded machine the writer is slow, not wrong.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-            let answer = loop {
+            let expected = if then_unrelated { 2 } else { 1 };
+            let answers = loop {
                 let bytes = answers.lock().unwrap().clone();
-                if bytes.len() >= 4 {
-                    let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
-                    if bytes.len() >= 4 + len {
-                        break serde_json::from_slice::<Value>(&bytes[4..4 + len]).unwrap();
+                let mut frames = Vec::new();
+                let mut rest = &bytes[..];
+                while rest.len() >= 4 {
+                    let len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+                    if rest.len() < 4 + len {
+                        break;
                     }
+                    frames.push(serde_json::from_slice::<Value>(&rest[4..4 + len]).unwrap());
+                    rest = &rest[4 + len..];
                 }
-                assert!(std::time::Instant::now() < deadline, "{method}: no answer");
+                if frames.len() >= expected {
+                    break frames;
+                }
+                assert!(std::time::Instant::now() < deadline, "{case}: no answer");
                 std::thread::sleep(std::time::Duration::from_millis(20));
             };
-            assert_eq!(answer["id"], "m");
-            assert_eq!(answer["result"]["withinLimit"], false, "{method}: the request's own trim must be cut short");
+            assert_eq!(answers.len(), expected, "{case}");
+            assert_eq!(answers[0]["id"], "m");
+            assert_eq!(answers[0]["result"]["withinLimit"], false, "{case}: the request's own trim must be cut short");
+            if then_unrelated {
+                assert_eq!(answers[1]["id"], "u");
+                assert_eq!(answers[1]["result"]["count"], 0, "{case}: the unrelated write removes nothing");
+            }
             let reader = memory_db::open_read_only_memory_connection(&memory_db).unwrap();
             while memory_db::memory_used_bytes(&reader).unwrap() > limit {
-                assert!(std::time::Instant::now() < deadline, "{method}: memory must settle with no further request");
+                assert!(std::time::Instant::now() < deadline, "{case}: memory must settle with no further request");
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
             drop(reader);
@@ -2151,11 +2171,11 @@ mod tests {
             // Durable: the file, opened again, is within the limit, the oldest exchanges went and
             // every newer one stayed.
             let (_path, memory) = memory_db::open_or_create_memory_db(&dir).unwrap();
-            assert!(memory_db::memory_used_bytes(&memory).unwrap() <= limit, "{method}");
+            assert!(memory_db::memory_used_bytes(&memory).unwrap() <= limit, "{case}");
             let kept = memory_db::memory_db_count(&memory).unwrap();
             let newest = if method == "memoryTrim" { 2999 } else { 3000 };
-            assert!(kept > 0, "{method}");
-            assert_eq!(oldest_and_newest(&memory), (newest + 1 - kept, newest), "{method}");
+            assert!(kept > 0, "{case}");
+            assert_eq!(oldest_and_newest(&memory), (newest + 1 - kept, newest), "{case}");
             drop(memory);
             std::fs::remove_dir_all(&dir).unwrap();
         }
@@ -2223,6 +2243,57 @@ mod tests {
         let answer = memory_write(&mut memory, &db, &mut trim, "memoryTrim", serde_json::json!({ "maxBytes": limit })).unwrap();
         assert_eq!(answer["result"]["withinLimit"], true, "the next limited write trims again");
         assert!(memory_db::memory_db_count(&memory).unwrap() < before.len() as i64);
+        drop(memory);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_an_idle_trim_whose_row_count_fails_stops_and_the_next_limited_write_retries() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Test-only fault: an SQLite authorizer denies the whole-table read of `memory_fts` (the
+        // row count after a trim step), counting each denial.
+        unsafe extern "C" fn deny_fts_count(
+            denied: *mut std::ffi::c_void, action: i32, table: *const std::ffi::c_char,
+            column: *const std::ffi::c_char, _: *const std::ffi::c_char, _: *const std::ffi::c_char,
+        ) -> i32 {
+            let whole_table = column.is_null() || std::ffi::CStr::from_ptr(column).to_bytes().is_empty();
+            if action == rusqlite::ffi::SQLITE_READ && !table.is_null()
+                && std::ffi::CStr::from_ptr(table).to_bytes() == b"memory_fts" && whole_table
+            {
+                (*(denied as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst);
+                rusqlite::ffi::SQLITE_DENY
+            } else {
+                rusqlite::ffi::SQLITE_OK
+            }
+        }
+        let (dir, db, mut memory) = memory_file_with_exchanges("count-fault", 20);
+        // Within reach: an empty memory's own size is above half of this small one.
+        let limit = memory_db::memory_used_bytes(&memory).unwrap() * 9 / 10;
+        let denied = AtomicUsize::new(0);
+        let status = unsafe {
+            rusqlite::ffi::sqlite3_set_authorizer(memory.handle(), Some(deny_fts_count), &denied as *const AtomicUsize as *mut _)
+        };
+        assert_eq!(status, rusqlite::ffi::SQLITE_OK);
+
+        // A step with no time left removes nothing, so the count decides whether more is left.
+        let mut pending = Some(limit);
+        let more = trim_memory_when_idle(&mut memory, &mut pending, std::time::Duration::ZERO);
+        assert_eq!(denied.load(Ordering::SeqCst), 1, "the fault must hit the count after the step");
+        assert!(!more, "a failed count must end the idle trim");
+        assert_eq!(pending, None, "and it is not tried again while idle");
+        let changes = memory.total_changes();
+        for _ in 0..3 {
+            assert!(!trim_memory_when_idle(&mut memory, &mut pending, trim_budget()));
+        }
+        assert_eq!(memory.total_changes(), changes, "no further attempt");
+        assert_eq!(denied.load(Ordering::SeqCst), 1);
+        unsafe { rusqlite::ffi::sqlite3_set_authorizer(memory.handle(), None, std::ptr::null_mut()) };
+        assert_eq!(memory_db::memory_db_count(&memory).unwrap(), 20, "every exchange stays");
+
+        let mut trim = MemoryTrimWork { request_budget: trim_budget(), pending: None };
+        let answer = memory_write(&mut memory, &db, &mut trim, "memoryTrim", serde_json::json!({ "maxBytes": limit })).unwrap();
+        assert_eq!(answer["result"]["withinLimit"], true, "the next limited write trims again");
+        assert!(memory_db::memory_db_count(&memory).unwrap() < 20);
         drop(memory);
         std::fs::remove_dir_all(&dir).unwrap();
     }

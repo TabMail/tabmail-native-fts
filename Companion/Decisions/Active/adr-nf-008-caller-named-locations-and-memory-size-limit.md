@@ -222,14 +222,16 @@ for many kept requests. Now the writer finishes it without waiting for requests:
 - **Tests.** Unit tests in `src/main.rs` cover:
   - the writer thread itself (`writer_thread_main`, which takes its `IdleWork` from the caller
     for this), for `memoryTrim` and a limited `memoryIndexBatch`: the request's own trim cut
-    short (1 ms request budget), no further request, and the memory file then within the limit,
+    short (1 ms request budget), no further request or only an unrelated write queued behind it,
+    and the memory file then within the limit,
     oldest exchanges removed and every newer one kept, after the writer stops;
   - the same for `IdleWork::step` driven directly: within the limit, the oldest
     exchanges removed and every newer one kept, compaction after it;
   - the pending rules through the request handler: the latest limit wins; a refused or unrelated
     request changes nothing; a write without a limit, a trim within its limit, and a clear end it;
-  - a storage error during an idle step: the trim stops, nothing is retried while idle, every
-    exchange stays whole, and the next limited write trims again;
+  - a storage error during an idle step, in the trim and in the row count after it: the trim
+    stops, nothing is retried while idle, every exchange stays whole, and the next limited write
+    trims again;
   - the end when no rows are left;
   - no trim in a stand-in, and the trim once the memory is open again.
 
