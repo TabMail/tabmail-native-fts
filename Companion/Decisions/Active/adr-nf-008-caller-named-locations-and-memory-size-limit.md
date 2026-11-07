@@ -196,14 +196,16 @@ Before this, a trim cut short at its 20 s budget continued only with the next li
 for many kept requests. Now the writer finishes it without waiting for requests:
 
 - **What is pending.** The writer keeps the limit of the latest limited write (`memoryIndexBatch`
-  with `maxBytes`, or `memoryTrim`) that answered `withinLimit: false`
-  (`memory_trim_pending_after`). These end it:
+  with `maxBytes`, or `memoryTrim`) that answered `withinLimit: false`. The request handler sets it
+  in the writer's `MemoryTrimWork`, next to the trim it just ran, so no second reading of the
+  answer can drift from it. These end it:
   - a later limited write that ends within its limit, or that sets another limit (the latest
     wins: the client's latest setting);
   - a `memoryIndexBatch` without `maxBytes` (the client keeps no limit now);
   - `memoryClear`.
 
-  A failed request or an error answer changes nothing. It lives only in the process; after a
+  A refused request (a bad `maxBytes`) changes nothing; a request whose own trim fails is
+  answered with an error and leaves no new limit pending. It lives only in the process; after a
   restart, the next limited write trims again, as before.
 - **Idle steps.** The writer's idle work (`IdleWork::step`) runs one step at a time and checks
   for requests between steps, in this order:
@@ -211,15 +213,20 @@ for many kept requests. Now the writer finishes it without waiting for requests:
   2. a step of the pending trim, `memory_trim_to_bytes` with `IDLE_TRIM_STEP_BUDGET_MS` (1 s,
      plus the overrun past a deadline described above), so a request waits for at most one step;
   3. compaction (ADR-NF-021). It comes after the trim, so the space the trim freed goes back too.
-- **Never spins.** The step ends at the limit, on an error (logged), or once no rows are left,
+- **Never spins.** The step ends at the limit, on an error (logged; nothing is left pending, and
+  the next limited write trims again), or once no rows are left,
   which happens when the limit is below an empty memory's size. A step with time left removes at
   least one row or runs one merge step.
 - **Clients.** They still get the same answers. Their copy ("more go as new requests are kept")
   now understates how soon memory settles; changing it is the clients' call.
 - **Tests.** Unit tests in `src/main.rs` cover:
-  - the pending rules, for every method and outcome;
-  - an idle writer with a 1 ms step budget finishing a trim that one step could not finish,
-    oldest first, with compaction after it;
+  - for `memoryTrim` and for a limited `memoryIndexBatch`, the request's own trim cut short
+    (1 ms request budget) and the idle writer then finishing it: within the limit, the oldest
+    exchanges removed and every newer one kept, compaction after it;
+  - the pending rules through the request handler: the latest limit wins; a refused or unrelated
+    request changes nothing; a write without a limit, a trim within its limit, and a clear end it;
+  - a storage error during an idle step: the trim stops, nothing is retried while idle, every
+    exchange stays whole, and the next limited write trims again;
   - the end when no rows are left;
   - no trim in a stand-in, and the trim once the memory is open again.
 
