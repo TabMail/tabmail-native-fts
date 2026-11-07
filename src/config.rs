@@ -58,6 +58,12 @@ pub mod update {
 
     /// The installed notices are kept under this suffix while an update replaces them.
     pub const NOTICES_BACKUP_SUFFIX: &str = ".backup";
+
+    /// The file name of the Windows apply-update copy. Windows UAC treats an executable without
+    /// an elevation manifest whose name contains an installer word ("update", "setup",
+    /// "install", "patch") as an installer, and refuses to start it for a standard user
+    /// (os error 740), so this name carries none (ADR-NF-025).
+    pub const APPLY_COPY_FILE_NAME: &str = "fts_helper_apply.exe";
 }
 
 pub mod sqlite {

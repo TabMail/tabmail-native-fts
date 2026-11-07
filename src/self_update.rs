@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::io::Read;
 
 use anyhow::{bail, Context};
@@ -493,14 +493,17 @@ fn eq_hex_lower(a: &str, b: &str) -> bool {
     a.trim().eq_ignore_ascii_case(b.trim())
 }
 
+#[cfg(unix)]
 fn make_executable(p: &Path) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(p)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(p, perms)?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(p)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(p, perms)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_executable(_p: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -635,15 +638,32 @@ fn spawn_apply_update_helper(current: &Path, target: &Path, staged: &Path, stage
     // On Windows, we can't overwrite a running exe. We spawn a TEMP COPY of ourselves to perform the swap.
     let tmp_dir = std::env::temp_dir().join("tabmail-native-fts-update");
     std::fs::create_dir_all(&tmp_dir)?;
-    let helper = tmp_dir.join("fts_helper_apply_update.exe");
+    let helper = tmp_dir.join(config::update::APPLY_COPY_FILE_NAME);
     std::fs::copy(current, &helper).with_context(|| format!("failed copying helper to {}", helper.display()))?;
 
     log::info!("Spawning apply-update helper: {}", helper.display());
-    apply_update_command(&helper, target, staged, staged_notices)
-        .spawn()
-        .context("failed spawning apply-update helper")?;
+    let mut command = apply_update_command(&helper, target, staged, staged_notices);
+    // The copy outlives this process, so it holds none of the client's pipes.
+    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        // Thunderbird runs a native host in a job object and terminates the job when the host
+        // exits, so the copy leaves the job; detached, it has no console to lose with it
+        // (ADR-NF-025).
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS);
+    }
+    command.spawn().context("failed spawning apply-update helper")?;
     Ok(())
 }
+
+/// `CreateProcess` flag: the child is not part of the parent's job object.
+#[cfg(windows)]
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+/// `CreateProcess` flag: the child has no console.
+#[cfg(windows)]
+const DETACHED_PROCESS: u32 = 0x0000_0008;
 
 /// The Windows apply-update process: once the old helper has exited, installs the staged
 /// binary and its staged notices as a pair. It always runs the binary of the updater that
@@ -833,7 +853,7 @@ mod tests {
     #[test]
     fn the_apply_update_process_reads_back_exactly_what_the_updater_starts_it_with() {
         let (target, staged, notices) = (Path::new("/i/fts_helper.exe"), Path::new("/i/fts_helper.exe.new"), Path::new("/i/n.new"));
-        let command = apply_update_command(Path::new("/t/fts_helper_apply_update.exe"), target, staged, notices);
+        let command = apply_update_command(Path::new("/t/fts_helper_apply.exe"), target, staged, notices);
         let mut args = vec![command.get_program().to_str().unwrap().to_string()];
         args.extend(command.get_args().map(|a| a.to_str().unwrap().to_string()));
         assert_eq!(
@@ -861,11 +881,21 @@ mod tests {
         }
         let args: Vec<String> = std::fs::read_to_string(&record).unwrap().lines().map(str::to_string).collect();
         assert_ne!(Path::new(&args[0]), current.as_path(), "it must run a copy, not the installed binary");
+        assert_eq!(Path::new(&args[0]).file_name().unwrap(), config::update::APPLY_COPY_FILE_NAME);
         assert_eq!(
             parse_apply_update_args(&args).unwrap(),
             Some(ApplyUpdateArgs { target, staged, staged_notices: notices })
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_apply_update_copy_is_not_named_like_an_installer() {
+        // UAC refuses to start such an unmanifested executable for a standard user (os error 740).
+        let name = config::update::APPLY_COPY_FILE_NAME.to_ascii_lowercase();
+        for word in ["install", "setup", "update", "patch"] {
+            assert!(!name.contains(word), "{name} contains {word}");
+        }
     }
 
     #[test]
