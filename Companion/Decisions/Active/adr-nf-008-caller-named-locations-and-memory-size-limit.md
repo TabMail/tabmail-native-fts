@@ -235,3 +235,33 @@ for many kept requests. Now the writer finishes it without waiting for requests:
   - the end when no rows are left;
   - no trim in a stand-in, and the trim once the memory is open again.
 
+## Follow-up 2026-11-07 (#12): only `memoryTrim` leaves a trim pending, and idle steps get the trim's own budget
+
+A review of the merged amendment above found two faults; this replaces the rules they name.
+
+- **A batch's limit can be older than the client's latest one.** Voice reads `memorySizeLimit`
+  when the key goes down and sends it with that exchange's `memoryIndexBatch`; TB reads it just
+  before sending. A user who lowers the limit and then raises it can have a batch built before
+  the raise arrive after the raise's `memoryTrim`. Under the amendment above, that batch, cut short,
+  set its low limit pending again, and the idle writer went on deleting the memory down to a limit
+  the user had already lifted: lost exchanges, the older setting beating the newer. Fixed by
+  deletion: a `memoryIndexBatch` still trims to its own `maxBytes` within its own budget, as
+  before #12, but neither sets nor ends the pending trim. Only `memoryTrim` (which every client
+  sends when the limit changes) sets it when it ends above its limit, and ends it when it ends
+  within; `memoryClear` ends it. A batch without `maxBytes` no longer ends it either. The batch
+  path's remaining excess is trimmed by the next limited batch, as before #12.
+- **The 1 s idle step was too slow.** Each step pays the fixed cost of starting a trim (the size
+  reading and the FTS merge start); on a 1.2 GB memory lowered to 100 MB, 1 s steps had not
+  finished after 1,201 s, 5 s steps took 329 s and 20 s steps 254 s. `IDLE_TRIM_STEP_BUDGET_MS`
+  is deleted; an idle step uses `TRIM_TIME_BUDGET_MS` (20 s), held with the pending limit in
+  `MemoryTrimWork.budget`. A request arriving during a step waits for at most one step (about 22 s
+  with the overrun), the same as behind a request's own trim and under the clients' 60 s timeout.
+  This step size is an overnight judgement call awaiting the owner's blessing; 5 s is the
+  alternative (about 30% slower to finish, a 5 s worst-case wait).
+- **Tests** now cover: one idle step with a 1 ms budget leaves the memory above the limit and
+  returns more-to-do (a step never runs the whole trim); a batch cut short leaves nothing pending
+  and the idle writer removes nothing; `memoryTrim(low)` cut short, `memoryTrim(high)` within,
+  then a batch carrying the old low limit cut short: the idle writer removes nothing; the
+  pending rules (refused, unrelated and batch requests change nothing; the latest `memoryTrim`
+  wins; within limit and clear end it); and the writer-thread hand-off for `memoryTrim`, with and
+  without an unrelated write queued behind it.
