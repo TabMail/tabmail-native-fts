@@ -889,6 +889,58 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Set only in the updater process that `the_apply_update_copy_holds_none_of_the_updater_s_pipes`
+    /// starts: the directory its stand-in apply-update copy reports into.
+    const PIPE_PROBE_DIR_ENV: &str = "TABMAIL_NF_TEST_PIPE_PROBE_DIR";
+    const COPY_OUTPUT_MARKER: &str = "apply-update-copy-wrote-this";
+
+    #[cfg(unix)]
+    #[test]
+    fn the_apply_update_copy_holds_none_of_the_updater_s_pipes() {
+        // The client writes to the helper's stdin and reads its stdout and stderr. The copy outlives
+        // the helper, so it must neither read the client's input nor write into the client's output.
+        // The updater here is this test binary, started with piped stdio; its copy reads one line of
+        // stdin and writes a marker to stdout and stderr.
+        let _one_at_a_time = LAUNCHER.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = test_dir("pipes");
+        let mut updater = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "self_update::tests::apply_update_copy_pipe_probe", "--test-threads=1"])
+            .env(PIPE_PROBE_DIR_ENV, &dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Dropping the handle closes the client's end, so a copy holding the pipe reads this line.
+        std::io::Write::write_all(&mut updater.stdin.take().unwrap(), b"client-input\n").unwrap();
+        let output = updater.wait_with_output().unwrap();
+        assert!(output.status.success(), "the updater failed: {}", String::from_utf8_lossy(&output.stderr));
+        let read_from_stdin = dir.join("read-from-stdin");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(config::update::NOTICES_READ_TIMEOUT_SECS);
+        while !read_from_stdin.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(config::update::NOTICES_READ_POLL_MS));
+        }
+        assert_eq!(std::fs::read_to_string(&read_from_stdin).unwrap(), "", "the copy read the client's input");
+        let (stdout, stderr) = (String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(!stdout.contains(COPY_OUTPUT_MARKER), "the copy wrote into the client's stdout");
+        assert!(!stderr.contains(COPY_OUTPUT_MARKER), "the copy wrote into the client's stderr");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_update_copy_pipe_probe() {
+        // Does nothing unless started by `the_apply_update_copy_holds_none_of_the_updater_s_pipes`.
+        let Some(dir) = std::env::var_os(PIPE_PROBE_DIR_ENV).map(PathBuf::from) else { return };
+        let current = dir.join("helper");
+        let report = dir.join("read-from-stdin");
+        std::fs::write(&current, format!(
+            "#!/bin/sh\nIFS= read -r line\nprintf '%s' \"$line\" > '{0}.tmp'\necho {1}\necho {1} >&2\nmv '{0}.tmp' '{0}'\n",
+            report.display(), COPY_OUTPUT_MARKER)).unwrap();
+        make_executable(&current).unwrap();
+        spawn_apply_update_helper(&current, &dir.join("target"), &dir.join("staged"), &dir.join("notices")).unwrap();
+    }
+
     #[test]
     fn the_apply_update_copy_is_not_named_like_an_installer() {
         // UAC refuses to start such an unmanifested executable for a standard user (os error 740).
