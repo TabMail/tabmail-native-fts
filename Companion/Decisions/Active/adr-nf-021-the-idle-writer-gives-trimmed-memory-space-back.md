@@ -65,7 +65,8 @@ gaps from removed rows. A SQLite upgrade that changed this fails that test.
   `test_the_idle_helper_converts_an_older_memory_and_gives_its_space_back`).
 - The one-time conversion copies what is kept, once per older memory, and a request that arrives
   meanwhile waits for it (a VACUUM cannot be stopped partway: its final copy back is one
-  uninterruptible backup step). Measured on synthetic memories: about 14 s per GB (ADR-NF-008's
+  uninterruptible backup step). Since #75 (ADR-NF-008, follow-up 2026-11-08) it is interrupted,
+  before that copy back, once the client has closed the helper, and the next start converts it. Measured on synthetic memories: about 14 s per GB (ADR-NF-008's
   2.2 GB) to about 17-19 s per GB (4.9 GB kept: 83 s for a waiting request, review round 2026-10-26).
   So for an older memory keeping more than about 3 GB (Voice and Thunderbird offer limits up to
   5 GB), one request can pass the clients' 60 s timeout. **Accepted by the owner (2026-10-26):** it

@@ -290,3 +290,32 @@ A review of the merged amendment above found two faults; this replaces the rules
   pending rules (refused, unrelated and batch requests change nothing; the latest `memoryTrim`
   wins; within limit and clear end it); and the writer-thread hand-off for `memoryTrim`, with and
   without an unrelated write queued behind it.
+
+## Follow-up 2026-11-08 (#75): the shard conversion and the memory VACUUM stop once the client has gone
+
+The trim's stop above covered only the idle trim. The two other idle steps cannot stop at a row:
+converting a stale email shard (`rebuild_next_stale_shard`, ADR-NF-005) copies the whole year shard
+in one transaction, and converting an older memory (`compact_memory_step`, ADR-NF-021) is one full
+`VACUUM`. A helper whose client closed it during either kept its write lock until the step ended,
+and a helper started in its place could fail its writes on that database meanwhile.
+
+- **SQLite interrupts them.** `IdleWork::step` runs both under `stopped_once_client_gone`, which
+  installs a progress handler (`IDLE_STOP_CHECK_INSTRUCTIONS`, every 1,000 virtual-machine
+  instructions) that answers the same `client_gone` flag as the trim's stop check, and removes it
+  when the step ends. Once the flag is set the running statement fails, its transaction rolls back
+  and the writer exits: the shard stays stale and the memory unconverted, every row with them, and
+  the next start converts them. The failed step is logged, as any failed idle step is, and is not
+  retried in that process.
+- **Only the idle step runs under it.** A request already sent is answered in full after it, as
+  before (the handler is off outside the step).
+- **What it cannot stop:** a `VACUUM`'s final copy back into the database file is one backup step
+  with no virtual-machine instructions, so a client that goes during it still waits for that copy
+  (about the time to write what is kept). Everything before it, the copy into the temporary
+  database, stops.
+- **Tests** (`src/main.rs`): a conversion with the client already gone leaves the shard whole and
+  stale, no transaction open, and a long statement after it runs in full; the client going during
+  the copy (set at the first row written to the new shard) rolls the copy back and leaves no
+  `_retok` table; an older memory with the client gone stays at `auto_vacuum` NONE with its rows and
+  free pages unchanged; each converts with the client present. All three fail with the handler
+  removed.
+
