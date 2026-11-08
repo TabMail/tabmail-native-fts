@@ -25,7 +25,7 @@ INSTALL_PS1 = ROOT / "scripts" / "install.ps1"
 CDN = "https://cdn.tabmail.ai/releases/"
 
 # Stands in for curl: serves https://cdn.tabmail.ai/releases/<path> from $FAKE_CDN/<path>, and
-# fails (as `curl -f` does on a 404) for a file that is not there.
+# fails (as `curl -f` does on a 404) for a file that is not there. Every URL asked for is logged.
 FAKE_CURL = """#!/bin/sh
 url="" out=""
 while [ $# -gt 0 ]; do
@@ -35,12 +35,14 @@ while [ $# -gt 0 ]; do
         *) url="$1"; shift ;;
     esac
 done
+echo "$url" >> "$FAKE_LOG"
 path="${url#%s}"
 [ "$path" != "$url" ] && [ -f "$FAKE_CDN/$path" ] || { echo "curl: (22) 404 $url" >&2; exit 22; }
 cp "$FAKE_CDN/$path" "$out"
 """ % CDN
 
 # Stands in for wget: as wget -O does, it empties the output file first and exits 8 on a 404.
+# Every URL asked for is logged.
 FAKE_WGET = """#!/bin/sh
 url="" out=""
 while [ $# -gt 0 ]; do
@@ -51,6 +53,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 : > "$out"
+echo "$url" >> "$FAKE_LOG"
 path="${url#%s}"
 [ "$path" != "$url" ] && [ -f "$FAKE_CDN/$path" ] || exit 8
 cp "$FAKE_CDN/$path" "$out"
@@ -99,6 +102,7 @@ class TestInstallSh(unittest.TestCase):
             self.platform = "linux-x86_64"
             self.install_dir = self.home / ".local" / "share" / "tabmail" / "native"
             self.messaging = [self.home / ".mozilla" / "native-messaging-hosts"]
+        self.log = self.tmp / "requests.log"
         self.cdn = self.tmp / "cdn"
         self.release = self.cdn / self.platform
         self.release.mkdir(parents=True)
@@ -120,8 +124,12 @@ class TestInstallSh(unittest.TestCase):
             % (version_json, CDN, self.platform))
 
     def install(self):
-        env = {"HOME": str(self.home), "PATH": self.path, "FAKE_CDN": str(self.cdn), "REAL_MV": self.real_mv}
+        env = {"HOME": str(self.home), "PATH": self.path, "FAKE_CDN": str(self.cdn), "REAL_MV": self.real_mv,
+               "FAKE_LOG": str(self.log)}
         return subprocess.run(["/bin/bash", str(INSTALL_SH)], env=env, capture_output=True, text=True)
+
+    def requested(self):
+        return self.log.read_text().splitlines() if self.log.exists() else []
 
     def installed(self):
         return sorted(p.name for p in self.install_dir.iterdir())
@@ -183,9 +191,12 @@ class TestInstallSh(unittest.TestCase):
                              '"0.12.3/../fts_helper-latest"', '"v0.12.3"', '"0.12.3.4"', '"x0.12.3"'):
             with self.subTest(version=version_json):
                 self.manifest(version_json)
+                self.log.unlink(missing_ok=True)
                 result = self.install()
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("names no release version", result.stdout + result.stderr)
+                # The CDN collapses ".." in a path, so a malformed version must reach no URL at all.
+                self.assertEqual(self.requested(), [f"{CDN}{self.platform}/update-manifest.json"])
                 self.assertEqual(self.installed(), [])
 
 
@@ -199,8 +210,8 @@ class TestInstallPs1(unittest.TestCase):
         self.assertIn('Invoke-RestMethod -Uri "$Cdn/update-manifest.json"', live)
         self.assertIn("$UpdateManifest.latest.version", live)
         self.assertNotIn("-latest", live)
-        binary = re.findall(r'-Uri "\$Cdn/fts_helper-\$Version\.exe" -OutFile \$HelperDownload', live)
-        notices = re.findall(r'-Uri "\$Cdn/fts_helper-\$Version-THIRD_PARTY_NOTICES\.txt" -OutFile \$NoticesDownload', live)
+        binary = re.findall(r'-Uri "\$Cdn/fts_helper-\$Version\.exe" -OutFile \$HelperDownload -UseBasicParsing', live)
+        notices = re.findall(r'-Uri "\$Cdn/fts_helper-\$Version-THIRD_PARTY_NOTICES\.txt" -OutFile \$NoticesDownload -UseBasicParsing', live)
         self.assertEqual((len(binary), len(notices)), (1, 1))
 
     def test_installs_nothing_unless_both_downloads_succeed_and_moves_the_binary_first(self):
@@ -213,8 +224,9 @@ class TestInstallPs1(unittest.TestCase):
             'throw "The update manifest names no release version."',
             "-OutFile $HelperDownload",
             "-OutFile $NoticesDownload",
-            "-LiteralPath $HelperDownload -Destination $HelperPath",
-            "-LiteralPath $NoticesDownload -Destination $NoticesPath",
+            # -Force: without it Move-Item refuses an existing file, so every reinstall would fail.
+            "Move-Item -Force -LiteralPath $HelperDownload -Destination $HelperPath",
+            "Move-Item -Force -LiteralPath $NoticesDownload -Destination $NoticesPath",
             "} catch {",
             "Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $HelperDownload, $NoticesDownload",
             "exit 1",
