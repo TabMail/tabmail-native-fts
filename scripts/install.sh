@@ -100,8 +100,9 @@ fi
 
 # Download the binary and its notices next to the install, then put both in place: a failed
 # download leaves an earlier install as it was. The binary goes first, so a binary that cannot be
-# replaced leaves the earlier pair. If the notices then fail, the installer reports it, and the new
-# binary puts its own notices there on its next hello once the file can be replaced.
+# replaced leaves the earlier pair. Unlike a self-update, the pair is not kept when the notices then
+# fail: the installer reports it, and the new binary puts its own notices there on its next hello once
+# the file can be replaced.
 HELPER_DOWNLOAD="$INSTALL_DIR/fts_helper.download"
 NOTICES_DOWNLOAD="$INSTALL_DIR/fts_helper-THIRD_PARTY_NOTICES.txt.download"
 UPDATE_MANIFEST="$INSTALL_DIR/update-manifest.json.download"

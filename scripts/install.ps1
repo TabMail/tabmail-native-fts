@@ -35,9 +35,9 @@ New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
 # Download the binary and its notices next to the install, then put both in place: a failed
 # download leaves an earlier install as it was. The binary goes first: Windows refuses to replace a
-# running helper's file, and that leaves the earlier pair. If the notices then fail, the installer
-# reports it, and the new binary puts its own notices there on its next hello once the file can be
-# replaced.
+# running helper's file, and that leaves the earlier pair. Unlike a self-update, the pair is not
+# kept when the notices then fail: the installer reports it, and the new binary puts its own notices
+# there on its next hello once the file can be replaced.
 try {
     Write-Host "Reading the current release..."
     $UpdateManifest = Invoke-RestMethod -Uri "$Cdn/update-manifest.json"
