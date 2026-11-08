@@ -67,9 +67,10 @@ irm https://raw.githubusercontent.com/TabMail/tabmail-native-fts/main/scripts/in
 ```
 
 The install scripts live in this repo at [`scripts/install.sh`](scripts/install.sh) and
-[`scripts/install.ps1`](scripts/install.ps1). Read them before piping to a shell. Each downloads
-the prebuilt `fts_helper` binary for your platform from the CDN and registers it as a Thunderbird
-native-messaging host.
+[`scripts/install.ps1`](scripts/install.ps1). Read them before piping to a shell. Each reads the
+current release from your platform's update manifest on the CDN, downloads that release's prebuilt
+`fts_helper` binary and its third-party notices (`fts_helper-THIRD_PARTY_NOTICES.txt`, installed
+next to it), and registers the helper as a Thunderbird native-messaging host.
 
 ## Building from source
 
