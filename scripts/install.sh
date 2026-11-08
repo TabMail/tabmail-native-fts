@@ -99,7 +99,9 @@ if [[ -n "${MANIFEST_DIR_ALT:-}" ]]; then
 fi
 
 # Download the binary and its notices next to the install, then put both in place: a failed
-# download leaves an earlier install as it was.
+# download leaves an earlier install as it was. The binary goes first, so a binary that cannot be
+# replaced leaves the earlier pair; if the notices then fail, the new binary (which always repairs
+# the notices beside it when it starts) puts its own there.
 HELPER_DOWNLOAD="$INSTALL_DIR/fts_helper.download"
 NOTICES_DOWNLOAD="$INSTALL_DIR/fts_helper-THIRD_PARTY_NOTICES.txt.download"
 UPDATE_MANIFEST="$INSTALL_DIR/update-manifest.json.download"
@@ -117,8 +119,8 @@ echo -e "Downloading native-fts ${VERSION} and its third-party notices..."
 download "$CDN_URL/fts_helper-${VERSION}" "$HELPER_DOWNLOAD"
 download "$CDN_URL/fts_helper-${VERSION}-THIRD_PARTY_NOTICES.txt" "$NOTICES_DOWNLOAD"
 chmod +x "$HELPER_DOWNLOAD"
-mv -f "$NOTICES_DOWNLOAD" "$NOTICES_PATH"
 mv -f "$HELPER_DOWNLOAD" "$HELPER_PATH"
+mv -f "$NOTICES_DOWNLOAD" "$NOTICES_PATH"
 
 # Create native messaging manifest
 echo -e "Creating native messaging manifest..."

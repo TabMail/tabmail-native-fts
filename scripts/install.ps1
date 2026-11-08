@@ -34,22 +34,25 @@ Write-Host "Creating directory..."
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
 # Download the binary and its notices next to the install, then put both in place: a failed
-# download leaves an earlier install as it was.
+# download leaves an earlier install as it was. The binary goes first: Windows refuses to replace a
+# running helper's file, and that leaves the earlier pair. If the notices then fail, the new binary
+# (which always repairs the notices beside it when it starts) puts its own there.
 try {
     Write-Host "Reading the current release..."
     $UpdateManifest = Invoke-RestMethod -Uri "$Cdn/update-manifest.json"
     $Version = [string]$UpdateManifest.latest.version
-    if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+    if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+\z') {
         throw "The update manifest names no release version."
     }
     Write-Host "Downloading native-fts $Version and its third-party notices..."
     Invoke-WebRequest -Uri "$Cdn/fts_helper-$Version.exe" -OutFile $HelperDownload -UseBasicParsing
     Invoke-WebRequest -Uri "$Cdn/fts_helper-$Version-THIRD_PARTY_NOTICES.txt" -OutFile $NoticesDownload -UseBasicParsing
-    Move-Item -Force -LiteralPath $NoticesDownload -Destination $NoticesPath
     Move-Item -Force -LiteralPath $HelperDownload -Destination $HelperPath
+    Move-Item -Force -LiteralPath $NoticesDownload -Destination $NoticesPath
 } catch {
-    Write-Host "Error: Failed to download native-fts" -ForegroundColor Red
+    Write-Host "Error: Failed to install native-fts" -ForegroundColor Red
     Write-Host $_.Exception.Message
+    Write-Host "If Thunderbird is running, close it and run the installer again."
     Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $HelperDownload, $NoticesDownload
     exit 1
 }
