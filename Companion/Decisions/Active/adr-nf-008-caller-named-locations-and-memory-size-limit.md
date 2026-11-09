@@ -290,3 +290,50 @@ A review of the merged amendment above found two faults; this replaces the rules
   pending rules (refused, unrelated and batch requests change nothing; the latest `memoryTrim`
   wins; within limit and clear end it); and the writer-thread hand-off for `memoryTrim`, with and
   without an unrelated write queued behind it.
+
+## Follow-up 2026-11-08 (#75): the shard conversion and the memory VACUUM stop once the client has gone
+
+The trim's stop above covered only the idle trim. The two other idle steps cannot stop at a row:
+converting a stale email shard (`rebuild_next_stale_shard`, ADR-NF-005) copies the whole year shard
+in one transaction, and converting an older memory (`compact_memory_step`, ADR-NF-021) is one full
+`VACUUM`. A helper whose client closed it during either kept its write lock until the step ended,
+and a helper started in its place could fail its writes on that database meanwhile.
+
+- **SQLite interrupts them.** `IdleWork::step` runs both under `stopped_once_client_gone`, which
+  installs a progress handler (`IDLE_STOP_CHECK_INSTRUCTIONS`, every 1,000 virtual-machine
+  instructions) that answers the same `client_gone` flag as the trim's stop check, and removes it
+  when the step ends. Once the flag is set the running statement fails, its transaction rolls back
+  and the writer exits: the shard stays stale and the memory unconverted, every row with them, and
+  the next start converts them. The failed step is logged, as any failed idle step is, and is not
+  retried in that process.
+- **Only the idle step runs under it.** A request already sent is answered in full after it, as
+  before (the handler is off outside the step).
+- **What it cannot stop:** the end of each step after SQLite's last check. For a `VACUUM` that is
+  the rest of the table being copied (it spends about four instructions per row, so up to about
+  250 rows; a sqlite-vec chunk table under about 250 rows, at about 1.5 MB per chunk, is copied
+  with no check at all), then the final copy back into the database file, which is one backup step
+  with no virtual-machine instructions, then the automatic checkpoint (no write lock) and the
+  step's `wal_checkpoint(TRUNCATE)`, which waits up to the 2 s busy timeout for readers. Measured
+  on a 90 MB memory, from the last check to the end of the `VACUUM`: 0.53 s with the automatic
+  checkpoint off, 0.74 s with it on; the copy back is estimated at about 3 s per GB kept, so
+  roughly 3-4 s for 1 GB and 15-20 s for 5 GB. For a shard it is freeing the old shard's pages,
+  the rename and the commit (35 ms of 246 ms for 3,000 messages, growing with the shard). It is
+  the helper started in its place that can meet this: its writes to that database within the
+  window can fail with "database is locked". At most once per older memory, and only if the
+  client closes in that window; before #75 the whole step was exposed.
+- **Incremental steps too.** The memory compaction step under the handler is also the incremental
+  one (`PRAGMA incremental_vacuum`) and its checkpoint; an interrupted incremental step rolls back
+  and compaction stops for the process, as on any error.
+- **Tests** (`src/main.rs`): a conversion with the client already gone leaves the shard whole and
+  stale, no transaction open, and a long statement after it runs in full; the client going during
+  the copy (set at the first row written to the new shard) rolls the copy back and leaves no
+  `_retok` table; an older memory with the client gone stays at `auto_vacuum` NONE with every row
+  of every table and its rowid (the vector chunks too, on a fixture with vectors and rowid gaps),
+  its free pages and `temp_store` MEMORY unchanged, also once reopened; each converts with the
+  client present; the client going once the `VACUUM` has begun (set by an authorizer at its first
+  write to its copy, `vacuum_db`) leaves the memory the same way, so a check made only before the
+  step starts does not pass; and an incremental step on a memory with more than one step's free
+  pages rolls back with the client gone and frees exactly one step with it there. Every fixture
+  registers sqlite-vec itself, so each test passes run alone. All five fail with the handler
+  removed; the incremental one also fails with only incremental steps left unstoppable.
+

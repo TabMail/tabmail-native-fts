@@ -1315,7 +1315,7 @@ pub(crate) mod tests {
     use super::*;
 
     /// Registers sqlite-vec, as main() does before opening any connection; twice is a no-op.
-    fn register_vec() {
+    pub(crate) fn register_vec() {
         type ExtensionInit = unsafe extern "C" fn(
             *mut rusqlite::ffi::sqlite3,
             *mut *mut std::os::raw::c_char,
@@ -2089,7 +2089,7 @@ pub(crate) mod tests {
 
     /// Every ordinary table's rows, each with its real rowid (`_rowid_`, which a column named
     /// rowid, as in sqlite-vec's vector chunks, does not hide).
-    fn every_row(conn: &Connection) -> Vec<(String, Vec<String>)> {
+    pub(crate) fn every_row(conn: &Connection) -> Vec<(String, Vec<String>)> {
         let tables: Vec<(String, String)> = conn
             .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' AND sql NOT LIKE 'CREATE VIRTUAL%' ORDER BY name").unwrap()
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
@@ -2124,7 +2124,7 @@ pub(crate) mod tests {
     }
 
     /// `n` exchanges, each with its own vector, then every third removed so the rowids have gaps.
-    fn fill_distinct_with_gaps(conn: &mut Connection, n: usize) {
+    pub(crate) fn fill_distinct_with_gaps(conn: &mut Connection, n: usize) {
         let filler = "planning notes for the quarterly review meeting ".repeat(20);
         let rows: Vec<Value> = (0..n)
             .map(|i| serde_json::json!({

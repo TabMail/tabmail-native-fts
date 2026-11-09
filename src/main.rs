@@ -752,9 +752,10 @@ struct IdleWork {
     memory_compacting: bool,
     memory_compaction_stopped: bool,
     /// Set once the client has closed stdin (`WriterSender`): a trim step under way stops at its
-    /// next row, as when its time runs out, so the helper commits and exits at once instead of
-    /// holding the memory's write lock until the step's deadline, where a helper the client
-    /// started in its place would fail its memory writes.
+    /// next row, as when its time runs out, and a shard conversion or memory compaction step is
+    /// interrupted (`stopped_once_client_gone`, #75), so the helper exits at once instead of
+    /// holding the write lock until the step ends, where a helper the client started in its place
+    /// would fail its writes.
     client_gone: Arc<AtomicBool>,
 }
 
@@ -775,11 +776,30 @@ impl IdleWork {
     /// while there is more to do. Nothing to convert, trim or compact in a failed clear's stand-in;
     /// the next request reopens it.
     fn step(&mut self, email_conn: &mut Connection, memory_conn: &mut Connection) -> bool {
-        (!is_stand_in(email_conn) && convert_one_shard_when_idle(email_conn, &mut self.attempted_shards, &mut self.shards_left))
-            || (!is_stand_in(memory_conn) && trim_memory_when_idle(memory_conn, &mut self.memory_trim.pending, self.memory_trim.budget, &self.client_gone))
+        let gone = &self.client_gone;
+        (!is_stand_in(email_conn)
+            && stopped_once_client_gone(email_conn, gone, |conn| convert_one_shard_when_idle(conn, &mut self.attempted_shards, &mut self.shards_left)))
+            || (!is_stand_in(memory_conn) && trim_memory_when_idle(memory_conn, &mut self.memory_trim.pending, self.memory_trim.budget, gone))
             || (!is_stand_in(memory_conn)
-                && compact_memory_when_idle(memory_conn, &mut self.memory_compacting, &mut self.memory_compaction_stopped))
+                && stopped_once_client_gone(memory_conn, gone, |conn| {
+                    compact_memory_when_idle(conn, &mut self.memory_compacting, &mut self.memory_compaction_stopped)
+                }))
     }
+}
+
+/// Runs an idle step that cannot stop part way on its own (a shard copied in one transaction, a
+/// memory compaction step: the full VACUUM that converts an older memory, or an incremental step
+/// and its checkpoint) so that SQLite interrupts it once the client has closed the helper (#75):
+/// the statement under way fails and its transaction rolls back, leaving the shard stale or the
+/// memory unconverted for the next start, and the helper exits at once instead of holding the
+/// write lock until the step ends, where a helper started in its place would fail its writes.
+/// Only the step runs under the check: a request already sent is answered in full.
+fn stopped_once_client_gone<T>(conn: &mut Connection, client_gone: &Arc<AtomicBool>, step: impl FnOnce(&mut Connection) -> T) -> T {
+    let gone = Arc::clone(client_gone);
+    conn.progress_handler(crate::config::sqlite::IDLE_STOP_CHECK_INSTRUCTIONS, Some(move || gone.load(Ordering::Relaxed)));
+    let result = step(conn);
+    conn.progress_handler(0, None::<fn() -> bool>);
+    result
 }
 
 /// One idle step of the shard migration: converts the next stale shard and
@@ -854,8 +874,9 @@ fn compact_memory_when_idle(conn: &Connection, compacting: &mut bool, stopped: &
 }
 
 /// The dispatcher's sender to the writer. Dropping it, whichever way the dispatch loop ends, tells
-/// the writer the client has gone: its idle work stops at the next row (`IdleWork`), and it exits
-/// once the requests already sent are answered.
+/// the writer the client has gone: its idle work stops (a trim at its next row, a conversion or
+/// compaction step at SQLite's next check, `IdleWork`), and it exits once the requests already
+/// sent are answered.
 struct WriterSender {
     tx: mpsc::Sender<ThreadMessage>,
     client_gone: Arc<AtomicBool>,
@@ -2445,6 +2466,229 @@ mod tests {
             assert_eq!((kept.len(), kept.first(), kept.last()), (2999, Some(&2), Some(&3000)), "{table}");
         }
         drop(next);
+        drop(memory);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An email database in a temporary folder with one shard in the schema from before the
+    /// attachmentNames column, holding `n` messages, so the idle writer has a shard to convert.
+    fn email_with_a_stale_shard(name: &str, n: usize) -> (PathBuf, Connection) {
+        // The email database opens sqlite-vec tables, as main() registers it for.
+        memory_db::tests::register_vec();
+        let dir = std::env::temp_dir().join(format!("tabmail-idle-stop-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (_path, conn, _years) = open_or_create_db(&dir).unwrap();
+        conn.execute_batch(&format!(
+            r#"CREATE VIRTUAL TABLE messages_fts_2005 USING fts5(
+                msgId, subject, from_, to_, cc, bcc, body,
+                tokenize = "{}", prefix = '{}');
+            WITH RECURSIVE i(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM i WHERE n < {n})
+            INSERT INTO messages_fts_2005(rowid, msgId, subject, from_, to_, cc, bcc, body)
+                SELECT n, 'acc:/:' || n, 'Budget review ' || n, 'sender@example.com', '', '', '',
+                    'planning notes for the quarterly review meeting ' || n FROM i;"#,
+            crate::config::sqlite::FTS_TOKENIZE,
+            crate::config::sqlite::FTS_PREFIXES,
+        )).unwrap();
+        (dir, conn)
+    }
+
+    /// Whether the 2005 shard still has the old schema, and how many messages it holds.
+    fn shard_2005(conn: &Connection) -> (bool, i64) {
+        let sql: String = conn.query_row("SELECT sql FROM sqlite_master WHERE name = 'messages_fts_2005'", [], |r| r.get(0)).unwrap();
+        let rows = conn.query_row("SELECT count(*) FROM messages_fts_2005", [], |r| r.get(0)).unwrap();
+        (!sql.contains("attachmentNames"), rows)
+    }
+
+    /// A statement long enough to meet the stop check many times over, as a request's would be.
+    fn long_statement(conn: &Connection) -> rusqlite::Result<i64> {
+        conn.query_row("WITH RECURSIVE i(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM i WHERE n < 100000) SELECT count(*) FROM i", [], |r| r.get(0))
+    }
+
+    #[test]
+    fn test_an_idle_shard_conversion_stops_once_the_client_has_gone() {
+        // #75: converting a shard is one transaction, so it can't stop at a row as the trim does.
+        // Once the client has closed the helper, SQLite interrupts it: the shard stays as it was
+        // for the next start, and the write lock is free for a helper started in its place.
+        let (dir, mut email) = email_with_a_stale_shard("shard", 5000);
+        let mut memory = Connection::open_in_memory().unwrap();
+        let mut idle = IdleWork::new();
+        idle.client_gone.store(true, Ordering::Relaxed);
+
+        idle.step(&mut email, &mut memory);
+        assert_eq!(shard_2005(&email), (true, 5000), "the shard is left whole and unconverted");
+        assert!(email.is_autocommit(), "no transaction left open");
+        // The check is on only while the step runs: what the writer answers next is not cut short.
+        assert_eq!(long_statement(&email).unwrap(), 100000);
+
+        // Two-sided: with the client still there, the same step converts it.
+        let mut idle = IdleWork::new();
+        idle.step(&mut email, &mut memory);
+        assert_eq!(shard_2005(&email), (false, 5000));
+        drop(email);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_an_idle_shard_conversion_stops_when_the_client_goes_during_it() {
+        // The client goes while the shard is being copied: an update hook sets the flag at the
+        // first message written to the new shard, inside the conversion's transaction.
+        unsafe extern "C" fn gone_at_first_copy(
+            flag: *mut std::ffi::c_void, operation: i32, _: *const std::ffi::c_char,
+            table: *const std::ffi::c_char, _: i64,
+        ) {
+            if operation == rusqlite::ffi::SQLITE_INSERT && !table.is_null()
+                && std::ffi::CStr::from_ptr(table).to_bytes() == b"messages_fts_2005_retok_content"
+            {
+                (*(flag as *const AtomicBool)).store(true, Ordering::Relaxed);
+            }
+        }
+        let (dir, mut email) = email_with_a_stale_shard("shard-during", 5000);
+        let mut memory = Connection::open_in_memory().unwrap();
+        let mut idle = IdleWork::new();
+        unsafe {
+            rusqlite::ffi::sqlite3_update_hook(email.handle(), Some(gone_at_first_copy),
+                Arc::as_ptr(&idle.client_gone) as *mut std::ffi::c_void);
+        }
+
+        idle.step(&mut email, &mut memory);
+        assert!(idle.client_gone.load(Ordering::Relaxed), "the fixture must mark the client gone during the copy");
+        unsafe { rusqlite::ffi::sqlite3_update_hook(email.handle(), None, std::ptr::null_mut()) };
+        assert!(email.is_autocommit(), "no transaction left open");
+        assert_eq!(shard_2005(&email), (true, 5000), "the shard is left whole and unconverted");
+        let copies: i64 = email.query_row("SELECT count(*) FROM sqlite_master WHERE name LIKE 'messages_fts_2005_retok%'", [], |r| r.get(0)).unwrap();
+        assert_eq!(copies, 0, "the part-made copy rolled back with its transaction");
+        drop(email);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Every ordinary table's rows with their rowids (the vector chunks too, which join the
+    /// memory's tables by rowid): what an interrupted step must leave exactly as it was.
+    type Rows = Vec<(String, Vec<String>)>;
+
+    /// A memory in a temporary folder, from before #11 (auto_vacuum NONE) when `older`, holding
+    /// exchanges with their own vectors and gaps in their rowids, trimmed to `share` of its size so
+    /// it has space to give back: its folder, connection, every row and free pages.
+    fn a_memory_with_space_to_give_back(name: &str, older: bool, exchanges: usize, share: i64) -> (PathBuf, Connection, Rows, i64) {
+        let dir = std::env::temp_dir().join(format!("tabmail-idle-stop-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        memory_db::tests::register_vec();
+        if older {
+            // auto_vacuum NONE, fixed by the first table.
+            let older = Connection::open(memory_db::memory_db_path(&dir)).unwrap();
+            older.execute_batch("PRAGMA auto_vacuum = NONE; CREATE TABLE fixes_the_mode (a); DROP TABLE fixes_the_mode;").unwrap();
+            drop(older);
+        }
+        let (_path, mut memory) = memory_db::open_or_create_memory_db(&dir).unwrap();
+        memory_db::tests::fill_distinct_with_gaps(&mut memory, exchanges);
+        let limit = memory_db::memory_used_bytes(&memory).unwrap() / share;
+        assert!(memory_db::memory_trim_to_bytes(&mut memory, limit, std::time::Duration::from_secs(600)).unwrap().within_limit);
+        assert_eq!(pragma(&memory, "auto_vacuum"), if older { 0 } else { 2 }, "the fixture's memory mode");
+        let free = pragma(&memory, "freelist_count");
+        assert!(free * 100 >= pragma(&memory, "page_count") * crate::config::memory::COMPACT_MIN_FREE_PERCENT, "the fixture has space to give back");
+        let rows = memory_db::tests::every_row(&memory);
+        (dir, memory, rows, free)
+    }
+
+    /// An older memory trimmed to half, so its conversion has space to give back.
+    fn an_older_memory_with_space_to_give_back(name: &str) -> (PathBuf, Connection, Rows, i64) {
+        a_memory_with_space_to_give_back(name, true, 3000, 2)
+    }
+
+    /// The memory reopened as the next start opens it.
+    fn reopened(dir: &std::path::Path, memory: Connection) -> Connection {
+        drop(memory);
+        memory_db::open_or_create_memory_db(dir).unwrap().1
+    }
+
+    fn pragma(conn: &Connection, name: &str) -> i64 {
+        conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn test_an_idle_memory_conversion_stops_once_the_client_has_gone() {
+        // #75: the one VACUUM that converts an older memory (#11) can't stop part way either.
+        // Once the client has closed the helper, SQLite interrupts it: the memory stays as it was,
+        // every row with it, and the next start converts it.
+        let (dir, mut memory, rows, free) = an_older_memory_with_space_to_give_back("vacuum");
+        let mut email = Connection::open_in_memory().unwrap();
+        let mut idle = IdleWork::new();
+        idle.client_gone.store(true, Ordering::Relaxed);
+
+        assert!(!idle.step(&mut email, &mut memory), "a stopped conversion leaves nothing to do in this process");
+        assert_eq!(pragma(&memory, "auto_vacuum"), 0, "the memory is left unconverted");
+        assert_eq!(pragma(&memory, "freelist_count"), free);
+        assert!(memory_db::tests::every_row(&memory) == rows, "a row or a rowid changed");
+        assert_eq!(pragma(&memory, "temp_store"), 2, "MEMORY again after the stopped VACUUM");
+        assert!(memory.is_autocommit(), "no transaction left open");
+        assert_eq!(long_statement(&memory).unwrap(), 100000, "what the writer answers next is not cut short");
+        let mut memory = reopened(&dir, memory);
+        assert_eq!(pragma(&memory, "auto_vacuum"), 0);
+        assert!(memory_db::tests::every_row(&memory) == rows, "a row or a rowid changed on disk");
+
+        // Two-sided: with the client still there, the same step converts it.
+        let mut idle = IdleWork::new();
+        idle.step(&mut email, &mut memory);
+        assert_eq!(pragma(&memory, "auto_vacuum"), 2);
+        assert!(memory_db::tests::every_row(&memory) == rows);
+        drop(memory);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_an_idle_memory_conversion_stops_when_the_client_goes_during_it() {
+        // The client goes once the VACUUM has begun: an authorizer sets the flag when the VACUUM
+        // prepares its first write to its copy (`vacuum_db`), after the step started with the
+        // client there. The VACUUM under way stops, not only one not yet begun.
+        let (dir, mut memory, rows, free) = an_older_memory_with_space_to_give_back("vacuum-during");
+        let mut email = Connection::open_in_memory().unwrap();
+        let mut idle = IdleWork::new();
+        let flag = Arc::clone(&idle.client_gone);
+        memory.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+            if ctx.database_name == Some("vacuum_db") && matches!(ctx.action, rusqlite::hooks::AuthAction::Insert { .. }) {
+                flag.store(true, Ordering::Relaxed);
+            }
+            rusqlite::hooks::Authorization::Allow
+        }));
+
+        assert!(!idle.step(&mut email, &mut memory), "a stopped conversion leaves nothing to do in this process");
+        memory.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>);
+        assert!(idle.client_gone.load(Ordering::Relaxed), "the fixture must mark the client gone during the VACUUM");
+        assert_eq!(pragma(&memory, "auto_vacuum"), 0, "the VACUUM begun with the client there stops once it goes");
+        assert_eq!(pragma(&memory, "freelist_count"), free);
+        assert!(memory_db::tests::every_row(&memory) == rows, "a row or a rowid changed");
+        assert_eq!(pragma(&memory, "temp_store"), 2, "MEMORY again after the stopped VACUUM");
+        assert!(memory.is_autocommit(), "no transaction left open");
+        let memory = reopened(&dir, memory);
+        assert_eq!(pragma(&memory, "auto_vacuum"), 0);
+        assert!(memory_db::tests::every_row(&memory) == rows, "a row or a rowid changed on disk");
+        drop(memory);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_an_idle_incremental_compaction_step_stops_once_the_client_has_gone() {
+        // A new or converted memory gives space back a step at a time (`incremental_vacuum`), one
+        // statement per step: once the client has gone it is interrupted and rolls back too.
+        let (dir, mut memory, rows, free) = a_memory_with_space_to_give_back("incremental", false, 6000, 10);
+        let step = crate::config::memory::COMPACT_STEP_PAGES;
+        assert!(free > step, "the fixture has more than one step to give back: {free} pages");
+        let mut email = Connection::open_in_memory().unwrap();
+        let mut idle = IdleWork::new();
+        idle.client_gone.store(true, Ordering::Relaxed);
+
+        assert!(!idle.step(&mut email, &mut memory), "a stopped compaction leaves nothing to do in this process");
+        assert!(idle.memory_compaction_stopped, "stopped until the next start");
+        assert_eq!(pragma(&memory, "freelist_count"), free, "the step under way rolled back");
+        assert!(memory_db::tests::every_row(&memory) == rows, "a row or a rowid changed");
+        assert!(memory.is_autocommit(), "no transaction left open");
+
+        // Two-sided: with the client still there, the same step frees one step's pages.
+        let mut idle = IdleWork::new();
+        assert!(idle.step(&mut email, &mut memory));
+        assert_eq!(pragma(&memory, "freelist_count"), free - step);
+        assert!(memory_db::tests::every_row(&memory) == rows);
         drop(memory);
         std::fs::remove_dir_all(&dir).unwrap();
     }
