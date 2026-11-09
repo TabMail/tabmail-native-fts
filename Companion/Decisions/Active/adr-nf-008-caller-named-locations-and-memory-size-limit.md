@@ -308,14 +308,28 @@ and a helper started in its place could fail its writes on that database meanwhi
   retried in that process.
 - **Only the idle step runs under it.** A request already sent is answered in full after it, as
   before (the handler is off outside the step).
-- **What it cannot stop:** a `VACUUM`'s final copy back into the database file is one backup step
-  with no virtual-machine instructions, so a client that goes during it still waits for that copy
-  (about the time to write what is kept). Everything before it, the copy into the temporary
-  database, stops.
+- **What it cannot stop:** the end of each step after SQLite's last check. For a `VACUUM` that is
+  the rest of the table being copied (it spends about four instructions per row, so up to about
+  250 rows; a sqlite-vec chunk table under about 250 rows, at about 1.5 MB per chunk, is copied
+  with no check at all), then the final copy back into the database file, which is one backup step
+  with no virtual-machine instructions, then the automatic checkpoint (no write lock) and the
+  step's `wal_checkpoint(TRUNCATE)`, which waits up to the 2 s busy timeout for readers. Measured
+  on a 90 MB memory, from the last check to the end of the `VACUUM`: 0.53 s with the automatic
+  checkpoint off, 0.74 s with it on; the copy back is estimated at about 3 s per GB kept, so
+  roughly 3-4 s for 1 GB and 15-20 s for 5 GB. For a shard it is freeing the old shard's pages,
+  the rename and the commit (35 ms of 246 ms for 3,000 messages, growing with the shard). It is
+  the helper started in its place that can meet this: its writes to that database within the
+  window can fail with "database is locked". At most once per older memory, and only if the
+  client closes in that window; before #75 the whole step was exposed.
+- **Incremental steps too.** The memory compaction step under the handler is also the incremental
+  one (`PRAGMA incremental_vacuum`) and its checkpoint; an interrupted incremental step rolls back
+  and compaction stops for the process, as on any error.
 - **Tests** (`src/main.rs`): a conversion with the client already gone leaves the shard whole and
   stale, no transaction open, and a long statement after it runs in full; the client going during
   the copy (set at the first row written to the new shard) rolls the copy back and leaves no
   `_retok` table; an older memory with the client gone stays at `auto_vacuum` NONE with its rows and
-  free pages unchanged; each converts with the client present. All three fail with the handler
-  removed.
+  free pages unchanged; each converts with the client present; and the client going once the
+  `VACUUM` has begun (set by an authorizer at its first write to its copy, `vacuum_db`) leaves the
+  memory the same way, so a check made only before the step starts does not pass. All four fail
+  with the handler removed.
 

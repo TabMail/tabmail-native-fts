@@ -78,7 +78,9 @@ pub mod sqlite {
     pub const PRAGMA_JOURNAL_SIZE_LIMIT_BYTES: i64 = 12 * 1024 * 1024;
     /// How often, in SQLite virtual-machine instructions, an idle shard conversion or memory
     /// VACUUM checks whether the client has closed the helper (#75). A check is one atomic load;
-    /// a thousand instructions take microseconds.
+    /// a thousand instructions take microseconds for email rows and most memory rows, but a VACUUM
+    /// spends about four per row, so about 250 of sqlite-vec's 1.5 MB vector chunks are copied
+    /// between checks, and a chunk table under about 250 rows is copied with no check at all.
     pub const IDLE_STOP_CHECK_INSTRUCTIONS: i32 = 1000;
 
     pub const FTS_PREFIXES: &str = "2 3 4";
