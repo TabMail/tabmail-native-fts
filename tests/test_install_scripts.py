@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -28,7 +29,8 @@ CDN = "https://cdn.tabmail.ai/releases/"
 # Stands in for curl: serves https://cdn.tabmail.ai/releases/<path> from $FAKE_CDN/<path>. For a file
 # that is not there it fails only with -f, as curl does on a 404; without -f it saves the error page
 # and succeeds. Every URL asked for is logged. With $FAKE_HOLD set, a notices download waits, after
-# creating $FAKE_HOLD.waiting, until $FAKE_HOLD.go exists.
+# creating $FAKE_HOLD.waiting, until $FAKE_HOLD.go exists, for at most a minute, so a failed test
+# cannot leave it waiting for good.
 FAKE_CURL = """#!/bin/sh
 url="" out="" fail=""
 while [ $# -gt 0 ]; do
@@ -46,7 +48,8 @@ case "$url" in
     *-THIRD_PARTY_NOTICES.txt)
         if [ -n "$FAKE_HOLD" ]; then
             : > "$FAKE_HOLD.waiting"
-            while [ ! -f "$FAKE_HOLD.go" ]; do "$SLEEP" 0.1; done
+            n=0
+            while [ ! -f "$FAKE_HOLD.go" ] && [ "$n" -lt 600 ]; do "$SLEEP" 0.1; n=$((n + 1)); done
         fi ;;
 esac
 path="${url#%s}"
@@ -76,10 +79,11 @@ path="${url#%s}"
 cp "$FAKE_CDN/$path" "$out"
 """ % CDN
 
-# Stands in for mv, refusing to replace the installed helper, as Windows refuses while it runs.
+# Stands in for mv, refusing to replace the installed file named $REFUSE (the helper, as Windows
+# refuses while it runs, or the notices).
 REFUSING_MV = """#!/bin/sh
 for last; do :; done
-case "$last" in */fts_helper) echo "mv: $last: Operation not permitted" >&2; exit 1 ;; esac
+case "$last" in */"$REFUSE") echo "mv: $last: Operation not permitted" >&2; exit 1 ;; esac
 exec "$REAL_MV" "$@"
 """
 
@@ -147,20 +151,34 @@ class TestInstallSh(unittest.TestCase):
         return {"HOME": str(self.home), "PATH": self.path, "FAKE_CDN": str(self.cdn), "REAL_MV": self.real_mv,
                 "FAKE_LOG": str(self.log), "SLEEP": shutil.which("sleep", path="/usr/bin:/bin"), **extra}
 
-    def install(self):
-        return subprocess.run(["/bin/bash", str(INSTALL_SH)], env=self.env(), capture_output=True, text=True)
+    def install(self, **extra):
+        return subprocess.run(["/bin/bash", str(INSTALL_SH)], env=self.env(**extra), capture_output=True, text=True)
+
+    def use_wget(self):
+        (self.shims / "curl").unlink(missing_ok=True)
+        executable(self.shims / "wget", FAKE_WGET)
 
     # An install held before its notices download until `go` is created; waits until it is held.
     def held_install(self, hold):
+        # Its own process group, so a failed test stops the held download with it.
         process = subprocess.Popen(["/bin/bash", str(INSTALL_SH)], env=self.env(FAKE_HOLD=str(hold)),
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        self.addCleanup(lambda: process.poll() is None and process.kill())
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                   start_new_session=True)
+        self.addCleanup(self.stop_group, process)
         for _ in range(300):
             if Path(f"{hold}.waiting").exists():
                 return process
             self.assertIsNone(process.poll(), "the install ended before its notices download")
             time.sleep(0.1)
         self.fail("the install never reached its notices download")
+
+    @staticmethod
+    def stop_group(process):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate()
 
     def release_held(self, hold, process):
         Path(f"{hold}.go").touch()
@@ -189,8 +207,7 @@ class TestInstallSh(unittest.TestCase):
             self.assertEqual(host["allowed_extensions"], ["thunderbird@tabmail.ai"], folder)
 
     def test_installs_with_wget_when_there_is_no_curl(self):
-        (self.shims / "curl").unlink()
-        executable(self.shims / "wget", FAKE_WGET)
+        self.use_wget()
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_pair("0.12.3")
@@ -201,31 +218,48 @@ class TestInstallSh(unittest.TestCase):
 
     def test_a_failed_download_leaves_an_earlier_install_as_it_was(self):
         self.assertEqual(self.install().returncode, 0)
-        for case, binary, notices in (("notices missing", "#!/bin/sh\necho 0.12.4\n", None),
-                                      ("binary missing", None, "notices of 0.12.4\n")):
-            with self.subTest(case):
-                for name in ("fts_helper-0.12.4", "fts_helper-0.12.4-THIRD_PARTY_NOTICES.txt"):
-                    (self.release / name).unlink(missing_ok=True)
-                self.publish("0.12.4", binary=binary, notices=notices)
-                self.manifest('"0.12.4"')
+        for tool in ("curl", "wget"):
+            if tool == "wget":
+                self.use_wget()
+            for case, binary, notices in (("notices missing", "#!/bin/sh\necho 0.12.4\n", None),
+                                          ("binary missing", None, "notices of 0.12.4\n")):
+                with self.subTest(case, tool=tool):
+                    for name in ("fts_helper-0.12.4", "fts_helper-0.12.4-THIRD_PARTY_NOTICES.txt"):
+                        (self.release / name).unlink(missing_ok=True)
+                    self.publish("0.12.4", binary=binary, notices=notices)
+                    self.manifest('"0.12.4"')
+                    self.assertNotEqual(self.install().returncode, 0)
+                    self.assert_pair("0.12.3")
+            with self.subTest("manifest missing", tool=tool):
+                manifest = self.release / "update-manifest.json"
+                manifest.unlink(missing_ok=True)
                 self.assertNotEqual(self.install().returncode, 0)
                 self.assert_pair("0.12.3")
-        with self.subTest("manifest missing"):
-            (self.release / "update-manifest.json").unlink()
-            self.assertNotEqual(self.install().returncode, 0)
-            self.assert_pair("0.12.3")
+                self.manifest('"0.12.3"')
 
     def test_a_binary_that_cannot_be_replaced_leaves_the_earlier_pair(self):
         self.assertEqual(self.install().returncode, 0)
         self.publish("0.12.4", binary="#!/bin/sh\necho 0.12.4\n", notices="notices of 0.12.4\n")
         self.manifest('"0.12.4"')
         executable(self.shims / "mv", REFUSING_MV)
-        result = self.install()
+        result = self.install(REFUSE="fts_helper")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Operation not permitted", result.stderr)
         self.assert_pair("0.12.3")
 
-    def test_reads_latest_version_however_the_manifest_is_laid_out(self):
+    def test_notices_that_cannot_be_replaced_after_the_binary_fail_loudly(self):
+        # The one case that splits the pair (ADR-NF-024): the user who ran the installer must see it.
+        self.assertEqual(self.install().returncode, 0)
+        self.publish("0.12.4", binary="#!/bin/sh\necho 0.12.4\n", notices="notices of 0.12.4\n")
+        self.manifest('"0.12.4"')
+        executable(self.shims / "mv", REFUSING_MV)
+        result = self.install(REFUSE="fts_helper-THIRD_PARTY_NOTICES.txt")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Operation not permitted", result.stderr)
+        self.assertEqual((self.install_dir / "fts_helper").read_text(), "#!/bin/sh\necho 0.12.4\n")
+        self.assertEqual(self.installed(), ["fts_helper", "fts_helper-THIRD_PARTY_NOTICES.txt"], "no download left behind")
+
+    def test_reads_the_version_of_the_latest_object_however_the_manifest_is_spaced(self):
         for case, text, version in (
                 ("compact", '{"latest":{"version":"0.12.3","sha256":"00"}}', "0.12.3"),
                 ("another version first", '{\n  "metadata": {\n    "version": "0.12.4"\n  },\n'
@@ -280,6 +314,13 @@ class TestInstallPs1(unittest.TestCase):
         text = INSTALL_PS1.read_text(encoding="utf-8")
         live = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
         self.assertIn('$Cdn = "https://cdn.tabmail.ai/releases/windows-x86_64"', live)
+        # The pair goes where the helper reads it, and each run downloads beside it to files of its own:
+        # a download to the install path itself would be removed with it when the other one fails.
+        for line in ('$HelperPath = "$InstallDir\\fts_helper.exe"',
+                     '$NoticesPath = "$InstallDir\\fts_helper-THIRD_PARTY_NOTICES.txt"',
+                     '$HelperDownload = "$InstallDir\\fts_helper.exe.download.$PID"',
+                     '$NoticesDownload = "$InstallDir\\fts_helper-THIRD_PARTY_NOTICES.txt.download.$PID"'):
+            self.assertIn(line, [text_line.strip() for text_line in live.splitlines()])
         self.assertIn('Invoke-RestMethod -Uri "$Cdn/update-manifest.json"', live)
         self.assertIn("$UpdateManifest.latest.version", live)
         self.assertNotIn("-latest", live)

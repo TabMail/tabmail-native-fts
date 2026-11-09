@@ -111,8 +111,9 @@ trap 'rm -f "$HELPER_DOWNLOAD" "$NOTICES_DOWNLOAD" "$UPDATE_MANIFEST"' EXIT
 
 echo -e "Reading the current release..."
 download "$CDN_URL/update-manifest.json" "$UPDATE_MANIFEST"
-# latest.version, however the JSON is laid out: the manifest without whitespace, then the "latest"
-# object's fields one per line. Any other version in the manifest is not the release to install.
+# latest.version of a flat "latest" object, as every release flow writes it, however the JSON is
+# spaced: the manifest without whitespace, then the "latest" object's fields one per line. Any other
+# version in the manifest is not the release to install.
 LATEST="$(tr -d '[:space:]' < "$UPDATE_MANIFEST" | sed -n 's/.*"latest":{\([^}]*\)}.*/\1/p')"
 VERSION="$(printf '%s\n' "$LATEST" | tr ',' '\n' | sed -n 's/^"version":"\([^"]*\)"$/\1/p')"
 if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
