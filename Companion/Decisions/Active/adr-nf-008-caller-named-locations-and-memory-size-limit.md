@@ -327,9 +327,13 @@ and a helper started in its place could fail its writes on that database meanwhi
 - **Tests** (`src/main.rs`): a conversion with the client already gone leaves the shard whole and
   stale, no transaction open, and a long statement after it runs in full; the client going during
   the copy (set at the first row written to the new shard) rolls the copy back and leaves no
-  `_retok` table; an older memory with the client gone stays at `auto_vacuum` NONE with its rows and
-  free pages unchanged; each converts with the client present; and the client going once the
-  `VACUUM` has begun (set by an authorizer at its first write to its copy, `vacuum_db`) leaves the
-  memory the same way, so a check made only before the step starts does not pass. All four fail
-  with the handler removed.
+  `_retok` table; an older memory with the client gone stays at `auto_vacuum` NONE with every row
+  of every table and its rowid (the vector chunks too, on a fixture with vectors and rowid gaps),
+  its free pages and `temp_store` MEMORY unchanged, also once reopened; each converts with the
+  client present; the client going once the `VACUUM` has begun (set by an authorizer at its first
+  write to its copy, `vacuum_db`) leaves the memory the same way, so a check made only before the
+  step starts does not pass; and an incremental step on a memory with more than one step's free
+  pages rolls back with the client gone and frees exactly one step with it there. Every fixture
+  registers sqlite-vec itself, so each test passes run alone. All five fail with the handler
+  removed; the incremental one also fails with only incremental steps left unstoppable.
 

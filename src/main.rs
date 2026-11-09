@@ -2473,6 +2473,8 @@ mod tests {
     /// An email database in a temporary folder with one shard in the schema from before the
     /// attachmentNames column, holding `n` messages, so the idle writer has a shard to convert.
     fn email_with_a_stale_shard(name: &str, n: usize) -> (PathBuf, Connection) {
+        // The email database opens sqlite-vec tables, as main() registers it for.
+        memory_db::tests::register_vec();
         let dir = std::env::temp_dir().join(format!("tabmail-idle-stop-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2560,42 +2562,44 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// An older memory (from before #11: auto_vacuum NONE) trimmed to half, so its conversion has
-    /// space to give back: its folder, connection, rows kept and free pages.
-    fn an_older_memory_with_space_to_give_back(name: &str) -> (std::path::PathBuf, Connection, i64, i64) {
+    /// Every ordinary table's rows with their rowids (the vector chunks too, which join the
+    /// memory's tables by rowid): what an interrupted step must leave exactly as it was.
+    type Rows = Vec<(String, Vec<String>)>;
+
+    /// A memory in a temporary folder, from before #11 (auto_vacuum NONE) when `older`, holding
+    /// exchanges with their own vectors and gaps in their rowids, trimmed to `share` of its size so
+    /// it has space to give back: its folder, connection, every row and free pages.
+    fn a_memory_with_space_to_give_back(name: &str, older: bool, exchanges: usize, share: i64) -> (PathBuf, Connection, Rows, i64) {
         let dir = std::env::temp_dir().join(format!("tabmail-idle-stop-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        type ExtensionInit = unsafe extern "C" fn(
-            *mut rusqlite::ffi::sqlite3,
-            *mut *mut std::os::raw::c_char,
-            *const rusqlite::ffi::sqlite3_api_routines,
-        ) -> std::os::raw::c_int;
-        unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<*const (), ExtensionInit>(
-                sqlite_vec::sqlite3_vec_init as *const (),
-            )));
+        memory_db::tests::register_vec();
+        if older {
+            // auto_vacuum NONE, fixed by the first table.
+            let older = Connection::open(memory_db::memory_db_path(&dir)).unwrap();
+            older.execute_batch("PRAGMA auto_vacuum = NONE; CREATE TABLE fixes_the_mode (a); DROP TABLE fixes_the_mode;").unwrap();
+            drop(older);
         }
-        // A memory from before #11: auto_vacuum NONE, fixed by its first table.
-        let older = Connection::open(memory_db::memory_db_path(&dir)).unwrap();
-        older.execute_batch("PRAGMA auto_vacuum = NONE; CREATE TABLE fixes_the_mode (a); DROP TABLE fixes_the_mode;").unwrap();
-        drop(older);
         let (_path, mut memory) = memory_db::open_or_create_memory_db(&dir).unwrap();
-        let filler = "planning notes for the quarterly review meeting ".repeat(20);
-        let rows: Vec<Value> = (0..3000)
-            .map(|i| serde_json::json!({
-                "memId": format!("turn:{i}"), "role": "session", "content": format!("[USER]: {i} {filler}"),
-                "sessionId": "persistent_chat", "turnIndex": 0, "dateMs": i as i64,
-            }))
-            .collect();
-        memory_db::memory_index_batch(&mut memory, &rows, None).unwrap();
-        let limit = memory_db::memory_used_bytes(&memory).unwrap() / 2;
+        memory_db::tests::fill_distinct_with_gaps(&mut memory, exchanges);
+        let limit = memory_db::memory_used_bytes(&memory).unwrap() / share;
         assert!(memory_db::memory_trim_to_bytes(&mut memory, limit, std::time::Duration::from_secs(600)).unwrap().within_limit);
-        assert_eq!(pragma(&memory, "auto_vacuum"), 0, "the fixture is an older memory");
-        let kept = memory_db::memory_db_count(&memory).unwrap();
+        assert_eq!(pragma(&memory, "auto_vacuum"), if older { 0 } else { 2 }, "the fixture's memory mode");
         let free = pragma(&memory, "freelist_count");
         assert!(free * 100 >= pragma(&memory, "page_count") * crate::config::memory::COMPACT_MIN_FREE_PERCENT, "the fixture has space to give back");
-        (dir, memory, kept, free)
+        let rows = memory_db::tests::every_row(&memory);
+        (dir, memory, rows, free)
+    }
+
+    /// An older memory trimmed to half, so its conversion has space to give back.
+    fn an_older_memory_with_space_to_give_back(name: &str) -> (PathBuf, Connection, Rows, i64) {
+        a_memory_with_space_to_give_back(name, true, 3000, 2)
+    }
+
+    /// The memory reopened as the next start opens it.
+    fn reopened(dir: &std::path::Path, memory: Connection) -> Connection {
+        drop(memory);
+        memory_db::open_or_create_memory_db(dir).unwrap().1
     }
 
     fn pragma(conn: &Connection, name: &str) -> i64 {
@@ -2607,7 +2611,7 @@ mod tests {
         // #75: the one VACUUM that converts an older memory (#11) can't stop part way either.
         // Once the client has closed the helper, SQLite interrupts it: the memory stays as it was,
         // every row with it, and the next start converts it.
-        let (dir, mut memory, kept, free) = an_older_memory_with_space_to_give_back("vacuum");
+        let (dir, mut memory, rows, free) = an_older_memory_with_space_to_give_back("vacuum");
         let mut email = Connection::open_in_memory().unwrap();
         let mut idle = IdleWork::new();
         idle.client_gone.store(true, Ordering::Relaxed);
@@ -2615,15 +2619,19 @@ mod tests {
         assert!(!idle.step(&mut email, &mut memory), "a stopped conversion leaves nothing to do in this process");
         assert_eq!(pragma(&memory, "auto_vacuum"), 0, "the memory is left unconverted");
         assert_eq!(pragma(&memory, "freelist_count"), free);
-        assert_eq!(memory_db::memory_db_count(&memory).unwrap(), kept, "every row stays");
+        assert!(memory_db::tests::every_row(&memory) == rows, "a row or a rowid changed");
+        assert_eq!(pragma(&memory, "temp_store"), 2, "MEMORY again after the stopped VACUUM");
         assert!(memory.is_autocommit(), "no transaction left open");
         assert_eq!(long_statement(&memory).unwrap(), 100000, "what the writer answers next is not cut short");
+        let mut memory = reopened(&dir, memory);
+        assert_eq!(pragma(&memory, "auto_vacuum"), 0);
+        assert!(memory_db::tests::every_row(&memory) == rows, "a row or a rowid changed on disk");
 
         // Two-sided: with the client still there, the same step converts it.
         let mut idle = IdleWork::new();
         idle.step(&mut email, &mut memory);
         assert_eq!(pragma(&memory, "auto_vacuum"), 2);
-        assert_eq!(memory_db::memory_db_count(&memory).unwrap(), kept);
+        assert!(memory_db::tests::every_row(&memory) == rows);
         drop(memory);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -2633,7 +2641,7 @@ mod tests {
         // The client goes once the VACUUM has begun: an authorizer sets the flag when the VACUUM
         // prepares its first write to its copy (`vacuum_db`), after the step started with the
         // client there. The VACUUM under way stops, not only one not yet begun.
-        let (dir, mut memory, kept, free) = an_older_memory_with_space_to_give_back("vacuum-during");
+        let (dir, mut memory, rows, free) = an_older_memory_with_space_to_give_back("vacuum-during");
         let mut email = Connection::open_in_memory().unwrap();
         let mut idle = IdleWork::new();
         let flag = Arc::clone(&idle.client_gone);
@@ -2649,8 +2657,38 @@ mod tests {
         assert!(idle.client_gone.load(Ordering::Relaxed), "the fixture must mark the client gone during the VACUUM");
         assert_eq!(pragma(&memory, "auto_vacuum"), 0, "the VACUUM begun with the client there stops once it goes");
         assert_eq!(pragma(&memory, "freelist_count"), free);
-        assert_eq!(memory_db::memory_db_count(&memory).unwrap(), kept, "every row stays");
+        assert!(memory_db::tests::every_row(&memory) == rows, "a row or a rowid changed");
+        assert_eq!(pragma(&memory, "temp_store"), 2, "MEMORY again after the stopped VACUUM");
         assert!(memory.is_autocommit(), "no transaction left open");
+        let memory = reopened(&dir, memory);
+        assert_eq!(pragma(&memory, "auto_vacuum"), 0);
+        assert!(memory_db::tests::every_row(&memory) == rows, "a row or a rowid changed on disk");
+        drop(memory);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_an_idle_incremental_compaction_step_stops_once_the_client_has_gone() {
+        // A new or converted memory gives space back a step at a time (`incremental_vacuum`), one
+        // statement per step: once the client has gone it is interrupted and rolls back too.
+        let (dir, mut memory, rows, free) = a_memory_with_space_to_give_back("incremental", false, 6000, 10);
+        let step = crate::config::memory::COMPACT_STEP_PAGES;
+        assert!(free > step, "the fixture has more than one step to give back: {free} pages");
+        let mut email = Connection::open_in_memory().unwrap();
+        let mut idle = IdleWork::new();
+        idle.client_gone.store(true, Ordering::Relaxed);
+
+        assert!(!idle.step(&mut email, &mut memory), "a stopped compaction leaves nothing to do in this process");
+        assert!(idle.memory_compaction_stopped, "stopped until the next start");
+        assert_eq!(pragma(&memory, "freelist_count"), free, "the step under way rolled back");
+        assert!(memory_db::tests::every_row(&memory) == rows, "a row or a rowid changed");
+        assert!(memory.is_autocommit(), "no transaction left open");
+
+        // Two-sided: with the client still there, the same step frees one step's pages.
+        let mut idle = IdleWork::new();
+        assert!(idle.step(&mut email, &mut memory));
+        assert_eq!(pragma(&memory, "freelist_count"), free - step);
+        assert!(memory_db::tests::every_row(&memory) == rows);
         drop(memory);
         std::fs::remove_dir_all(&dir).unwrap();
     }
