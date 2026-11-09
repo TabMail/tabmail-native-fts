@@ -119,7 +119,7 @@ license = "MIT AND blessing"
 [[libsqlite3-sys.clarify.files]]
 path = "LICENSE"
 license = "MIT"
-checksum = "f59ba65550f2a5adff98ec6478d783402c8e0a3eb515025c0b3438f3d30dc39e"
+checksum = "c10c1f27337546471e5f7e4e97fdd398b35b9d4e126115dcd22de8d8e65abf6f"
 [[libsqlite3-sys.clarify.files]]
 path = "sqlite3/sqlite3.c"
 license = "blessing"

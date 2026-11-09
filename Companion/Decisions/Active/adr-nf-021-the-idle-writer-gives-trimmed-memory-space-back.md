@@ -53,7 +53,9 @@ alias) are read by their real rowid. SQLite documents only that VACUUM "may chan
 the bundled SQLite (3.46, libsqlite3-sys 0.30.1), VACUUM copies each table with `xferOptimization`,
 which writes a new rowid (`OP_NewRowid`) only for a table with neither an INTEGER PRIMARY KEY nor an
 index; every table here without an INTEGER PRIMARY KEY has its PRIMARY KEY's index, so its rowids
-are copied. `test_idle_compaction_converts_an_older_memory_once_keeping_every_row_and_rowid` pins
+are copied. SQLite 3.54.1 (libsqlite3-sys 0.39.1) keeps that copy and adds preconditions for it
+(STRICT tables, CHECK constraints, an authorizer) that nothing here meets.
+`test_idle_compaction_converts_an_older_memory_once_keeping_every_row_and_rowid` pins
 it on the bundled version: every row of every ordinary table with its `_rowid_`, and the search
 results by meaning and by word, are identical before and after (and after a reopen), with rowid
 gaps from removed rows. A SQLite upgrade that changed this fails that test.
