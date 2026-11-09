@@ -102,15 +102,19 @@ fi
 # download leaves an earlier install as it was. The binary goes first, so a binary that cannot be
 # replaced leaves the earlier pair. Unlike a self-update, the pair is not kept when the notices then
 # fail: the installer reports it, and the new binary puts its own notices there on its next hello once
-# the file can be replaced.
-HELPER_DOWNLOAD="$INSTALL_DIR/fts_helper.download"
-NOTICES_DOWNLOAD="$INSTALL_DIR/fts_helper-THIRD_PARTY_NOTICES.txt.download"
-UPDATE_MANIFEST="$INSTALL_DIR/update-manifest.json.download"
+# the file can be replaced. Each run downloads to files of its own (named by its process id), so a
+# second installer running at the same time cannot put its download in place of this one's.
+HELPER_DOWNLOAD="$INSTALL_DIR/fts_helper.download.$$"
+NOTICES_DOWNLOAD="$INSTALL_DIR/fts_helper-THIRD_PARTY_NOTICES.txt.download.$$"
+UPDATE_MANIFEST="$INSTALL_DIR/update-manifest.json.download.$$"
 trap 'rm -f "$HELPER_DOWNLOAD" "$NOTICES_DOWNLOAD" "$UPDATE_MANIFEST"' EXIT
 
 echo -e "Reading the current release..."
 download "$CDN_URL/update-manifest.json" "$UPDATE_MANIFEST"
-VERSION="$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$UPDATE_MANIFEST" | head -n 1)"
+# latest.version, however the JSON is laid out: the manifest without whitespace, then the "latest"
+# object's fields one per line. Any other version in the manifest is not the release to install.
+LATEST="$(tr -d '[:space:]' < "$UPDATE_MANIFEST" | sed -n 's/.*"latest":{\([^}]*\)}.*/\1/p')"
+VERSION="$(printf '%s\n' "$LATEST" | tr ',' '\n' | sed -n 's/^"version":"\([^"]*\)"$/\1/p')"
 if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo -e "${RED}Error: The update manifest names no release version.${NC}"
     exit 1

@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -24,20 +25,36 @@ INSTALL_SH = ROOT / "scripts" / "install.sh"
 INSTALL_PS1 = ROOT / "scripts" / "install.ps1"
 CDN = "https://cdn.tabmail.ai/releases/"
 
-# Stands in for curl: serves https://cdn.tabmail.ai/releases/<path> from $FAKE_CDN/<path>, and
-# fails (as `curl -f` does on a 404) for a file that is not there. Every URL asked for is logged.
+# Stands in for curl: serves https://cdn.tabmail.ai/releases/<path> from $FAKE_CDN/<path>. For a file
+# that is not there it fails only with -f, as curl does on a 404; without -f it saves the error page
+# and succeeds. Every URL asked for is logged. With $FAKE_HOLD set, a notices download waits, after
+# creating $FAKE_HOLD.waiting, until $FAKE_HOLD.go exists.
 FAKE_CURL = """#!/bin/sh
-url="" out=""
+url="" out="" fail=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -o) out="$2"; shift 2 ;;
+        --fail) fail=1; shift ;;
+        --*) shift ;;
+        -*f*) fail=1; shift ;;
         -*) shift ;;
         *) url="$1"; shift ;;
     esac
 done
 echo "$url" >> "$FAKE_LOG"
+case "$url" in
+    *-THIRD_PARTY_NOTICES.txt)
+        if [ -n "$FAKE_HOLD" ]; then
+            : > "$FAKE_HOLD.waiting"
+            while [ ! -f "$FAKE_HOLD.go" ]; do "$SLEEP" 0.1; done
+        fi ;;
+esac
 path="${url#%s}"
-[ "$path" != "$url" ] && [ -f "$FAKE_CDN/$path" ] || { echo "curl: (22) 404 $url" >&2; exit 22; }
+if [ "$path" = "$url" ] || [ ! -f "$FAKE_CDN/$path" ]; then
+    [ -n "$fail" ] && { echo "curl: (22) 404 $url" >&2; exit 22; }
+    echo "404 Not Found" > "$out"
+    exit 0
+fi
 cp "$FAKE_CDN/$path" "$out"
 """ % CDN
 
@@ -68,7 +85,7 @@ exec "$REAL_MV" "$@"
 
 # What install.sh runs besides the download tool: only these are on PATH, so the test decides
 # whether curl or wget is there.
-TOOLS = ("uname", "mkdir", "sed", "head", "chmod", "mv", "rm", "cat", "cp")
+TOOLS = ("uname", "mkdir", "sed", "tr", "chmod", "mv", "rm", "cat", "cp")
 
 
 def executable(path, text):
@@ -123,10 +140,32 @@ class TestInstallSh(unittest.TestCase):
             '    "downloadUrl": "%s%s/fts_helper-0.12.3",\n    "sha256": "00"\n  }\n}\n'
             % (version_json, CDN, self.platform))
 
+    def raw_manifest(self, text):
+        (self.release / "update-manifest.json").write_text(text)
+
+    def env(self, **extra):
+        return {"HOME": str(self.home), "PATH": self.path, "FAKE_CDN": str(self.cdn), "REAL_MV": self.real_mv,
+                "FAKE_LOG": str(self.log), "SLEEP": shutil.which("sleep", path="/usr/bin:/bin"), **extra}
+
     def install(self):
-        env = {"HOME": str(self.home), "PATH": self.path, "FAKE_CDN": str(self.cdn), "REAL_MV": self.real_mv,
-               "FAKE_LOG": str(self.log)}
-        return subprocess.run(["/bin/bash", str(INSTALL_SH)], env=env, capture_output=True, text=True)
+        return subprocess.run(["/bin/bash", str(INSTALL_SH)], env=self.env(), capture_output=True, text=True)
+
+    # An install held before its notices download until `go` is created; waits until it is held.
+    def held_install(self, hold):
+        process = subprocess.Popen(["/bin/bash", str(INSTALL_SH)], env=self.env(FAKE_HOLD=str(hold)),
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.addCleanup(lambda: process.poll() is None and process.kill())
+        for _ in range(300):
+            if Path(f"{hold}.waiting").exists():
+                return process
+            self.assertIsNone(process.poll(), "the install ended before its notices download")
+            time.sleep(0.1)
+        self.fail("the install never reached its notices download")
+
+    def release_held(self, hold, process):
+        Path(f"{hold}.go").touch()
+        output, _ = process.communicate(timeout=60)
+        self.assertEqual(process.returncode, 0, output)
 
     def requested(self):
         return self.log.read_text().splitlines() if self.log.exists() else []
@@ -185,6 +224,40 @@ class TestInstallSh(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Operation not permitted", result.stderr)
         self.assert_pair("0.12.3")
+
+    def test_reads_latest_version_however_the_manifest_is_laid_out(self):
+        for case, text, version in (
+                ("compact", '{"latest":{"version":"0.12.3","sha256":"00"}}', "0.12.3"),
+                ("another version first", '{\n  "metadata": {\n    "version": "0.12.4"\n  },\n'
+                 '  "latest": {\n    "sha256": "00",\n    "version": "0.12.3"\n  }\n}\n', "0.12.3")):
+            with self.subTest(case):
+                self.publish("0.12.4", binary="#!/bin/sh\necho 0.12.4\n", notices="notices of 0.12.4\n")
+                self.raw_manifest(text)
+                result = self.install()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assert_pair(version)
+        with self.subTest("latest names none, another object does"):
+            self.raw_manifest('{\n  "latest": {\n    "version": null\n  },\n'
+                              '  "previous": {\n    "version": "0.12.4"\n  }\n}\n')
+            self.log.unlink(missing_ok=True)
+            result = self.install()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("names no release version", result.stdout + result.stderr)
+            self.assertEqual(self.requested(), [f"{CDN}{self.platform}/update-manifest.json"])
+            self.assert_pair("0.12.3")
+
+    def test_two_installers_at_once_each_put_their_own_pair_in_place(self):
+        # A reads 0.12.3 and is held before its notices download. The manifest then names 0.12.4, and B
+        # is held at the same point, with 0.12.4's binary downloaded. A finishes first, then B.
+        self.publish("0.12.4", binary="#!/bin/sh\necho 0.12.4\n", notices="notices of 0.12.4\n")
+        a = self.held_install(self.tmp / "a")
+        self.manifest('"0.12.4"')
+        b = self.held_install(self.tmp / "b")
+        self.release_held(self.tmp / "a", a)
+        self.assertEqual((self.install_dir / "fts_helper").read_text(), "#!/bin/sh\necho 0.12.3\n")
+        self.assertEqual((self.install_dir / "fts_helper-THIRD_PARTY_NOTICES.txt").read_text(), "notices of 0.12.3\n")
+        self.release_held(self.tmp / "b", b)
+        self.assert_pair("0.12.4")
 
     def test_a_manifest_naming_no_version_installs_nothing(self):
         for version_json in ('""', "null", '"../fts_helper-latest"', '"0.12.3-latest"',

@@ -21,8 +21,10 @@ $InstallDir = "$env:LOCALAPPDATA\TabMail\native"
 $Cdn = "https://cdn.tabmail.ai/releases/windows-x86_64"
 $HelperPath = "$InstallDir\fts_helper.exe"
 $NoticesPath = "$InstallDir\fts_helper-THIRD_PARTY_NOTICES.txt"
-$HelperDownload = "$InstallDir\fts_helper.exe.download"
-$NoticesDownload = "$InstallDir\fts_helper-THIRD_PARTY_NOTICES.txt.download"
+# Each run downloads to files of its own (named by its process id), so a second installer running at
+# the same time cannot put its download in place of this one's.
+$HelperDownload = "$InstallDir\fts_helper.exe.download.$PID"
+$NoticesDownload = "$InstallDir\fts_helper-THIRD_PARTY_NOTICES.txt.download.$PID"
 $ManifestPath = "$InstallDir\tabmail_fts.json"
 $RegistryPath = "HKCU:\Software\Mozilla\NativeMessagingHosts\tabmail_fts"
 
