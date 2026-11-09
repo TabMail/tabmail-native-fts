@@ -103,7 +103,9 @@ fi
 # replaced leaves the earlier pair. Unlike a self-update, the pair is not kept when the notices then
 # fail: the installer reports it, and the new binary puts its own notices there on its next hello once
 # the file can be replaced. Each run downloads to files of its own (named by its process id), so a
-# second installer running at the same time cannot put its download in place of this one's.
+# second installer running at the same time cannot put its download in place of this one's. Two
+# installers that overlap can still leave one's binary beside the other's notices; the next hello
+# puts the binary's own notices there (accepted, 2026-11-08: no lock).
 HELPER_DOWNLOAD="$INSTALL_DIR/fts_helper.download.$$"
 NOTICES_DOWNLOAD="$INSTALL_DIR/fts_helper-THIRD_PARTY_NOTICES.txt.download.$$"
 UPDATE_MANIFEST="$INSTALL_DIR/update-manifest.json.download.$$"
