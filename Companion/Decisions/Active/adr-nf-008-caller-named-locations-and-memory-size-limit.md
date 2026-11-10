@@ -331,7 +331,8 @@ and a helper started in its place could fail its writes on that database meanwhi
   of every table and its rowid (the vector chunks too, on a fixture with vectors and rowid gaps),
   its free pages and `temp_store` MEMORY unchanged, also once reopened; each converts with the
   client present; the client going once the `VACUUM` has begun (set by an authorizer at its first
-  write to its copy, `vacuum_db`) leaves the memory the same way, so a check made only before the
+  write to its copy, which SQLite 3.46 attached as `vacuum_db` and 3.54 attaches as `vacuum_` plus a
+  random suffix) leaves the memory the same way, so a check made only before the
   step starts does not pass; and an incremental step on a memory with more than one step's free
   pages rolls back with the client gone and frees exactly one step with it there. Every fixture
   registers sqlite-vec itself, so each test passes run alone. All five fail with the handler

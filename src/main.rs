@@ -796,9 +796,12 @@ impl IdleWork {
 /// Only the step runs under the check: a request already sent is answered in full.
 fn stopped_once_client_gone<T>(conn: &mut Connection, client_gone: &Arc<AtomicBool>, step: impl FnOnce(&mut Connection) -> T) -> T {
     let gone = Arc::clone(client_gone);
-    conn.progress_handler(crate::config::sqlite::IDLE_STOP_CHECK_INSTRUCTIONS, Some(move || gone.load(Ordering::Relaxed)));
+    // rusqlite keeps the handler as SQLite client data, which only running out of memory can fail.
+    conn.progress_handler(crate::config::sqlite::IDLE_STOP_CHECK_INSTRUCTIONS, Some(move || gone.load(Ordering::Relaxed)))
+        .expect("install idle cancellation handler");
     let result = step(conn);
-    conn.progress_handler(0, None::<fn() -> bool>);
+    conn.progress_handler(0, None::<fn() -> bool>)
+        .expect("clear idle cancellation handler before serving requests");
     result
 }
 
@@ -2639,22 +2642,28 @@ mod tests {
     #[test]
     fn test_an_idle_memory_conversion_stops_when_the_client_goes_during_it() {
         // The client goes once the VACUUM has begun: an authorizer sets the flag when the VACUUM
-        // prepares its first write to its copy (`vacuum_db`), after the step started with the
-        // client there. The VACUUM under way stops, not only one not yet begun.
+        // prepares its first write to its copy, after the step started with the client there.
+        // The VACUUM under way stops, not only one not yet begun. SQLite 3.46 attached the copy as
+        // `vacuum_db`; 3.54 attaches it as `vacuum_` and a random suffix.
         let (dir, mut memory, rows, free) = an_older_memory_with_space_to_give_back("vacuum-during");
         let mut email = Connection::open_in_memory().unwrap();
         let mut idle = IdleWork::new();
         let flag = Arc::clone(&idle.client_gone);
-        memory.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
-            if ctx.database_name == Some("vacuum_db") && matches!(ctx.action, rusqlite::hooks::AuthAction::Insert { .. }) {
-                flag.store(true, Ordering::Relaxed);
-            }
-            rusqlite::hooks::Authorization::Allow
-        }));
+        memory
+            .authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+                if ctx.database_name.is_some_and(|name| name.starts_with("vacuum_"))
+                    && matches!(ctx.action, rusqlite::hooks::AuthAction::Insert { .. })
+                {
+                    flag.store(true, Ordering::Relaxed);
+                }
+                rusqlite::hooks::Authorization::Allow
+            }))
+            .unwrap();
 
-        assert!(!idle.step(&mut email, &mut memory), "a stopped conversion leaves nothing to do in this process");
-        memory.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>);
+        let more = idle.step(&mut email, &mut memory);
+        memory.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>).unwrap();
         assert!(idle.client_gone.load(Ordering::Relaxed), "the fixture must mark the client gone during the VACUUM");
+        assert!(!more, "a stopped conversion leaves nothing to do in this process");
         assert_eq!(pragma(&memory, "auto_vacuum"), 0, "the VACUUM begun with the client there stops once it goes");
         assert_eq!(pragma(&memory, "freelist_count"), free);
         assert!(memory_db::tests::every_row(&memory) == rows, "a row or a rowid changed");
