@@ -4404,7 +4404,7 @@ Copyright notices are retained in src/* files where relevant.
 ================================================================================
 Mozilla Public License 2.0 (MPL-2.0)
 Used by:
-- tabmail-native-fts 0.12.3
+- tabmail-native-fts 0.12.4
 --------------------------------------------------------------------------------
 
 Mozilla Public License Version 2.0
