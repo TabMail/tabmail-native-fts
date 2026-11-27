@@ -83,6 +83,29 @@ index's).
   Test: the process test `test_a_corrupt_memory_page_never_stops_init_and_clear_recovers_it` (a
   healthy control and a corrupt schema page, `memory_meta`, `memory_fts_content`, `_data`,
   `_docsize`, `_idx`, `_config`; two starts, entries kept before the clear, then recovery).*
+  *Amended 2026-11-27 (#42): deciding "existing memory" by `memory_meta` left one narrower window. A
+  first setup that stopped after `memory_meta` but before `memory_ids` (each schema statement
+  commits on its own) counted as existing, so `memory_ids` was never created and every write failed
+  with "no such table: memory_ids" until the user cleared the memory. Every open of an existing
+  memory now also runs the three entry tables' `CREATE … IF NOT EXISTS` statements
+  (`create_memory_tables`, shared with `init_memory_database`), so such a memory is completed on its
+  next open and keeps whatever it held. That open already added `memory_vec` when it was missing
+  (`ensure_memory_vector_tables`, with `embed_cache` alongside) and builds the date index. A setup
+  that stopped between `memory_vec` and `embed_cache` stays without `embed_cache`, which is
+  harmless: memory embeddings are computed directly and the memory's two cache deletes ignore a
+  missing table. Such a memory keeps FTS5's default merge settings, because the setup stopped before
+  `init_memory_database` set them. That changes how often index segments merge (I/O and file size),
+  never what a write stores; under a size limit a trim may also reach the oldest entries slightly
+  sooner, as it already could on a setup that stopped after `memory_ids`. On an intact memory the
+  statements change nothing. Considered and not taken: deciding "existing" by `memory_ids` instead
+  (one word, but it ties the check to whichever table is created last), and one transaction around
+  the first setup (it closes every window for new memories but cannot repair a file already left
+  broken). Tests: `a_memory_whose_creation_stopped_after_memory_meta_opens_and_takes_writes` (the
+  disk fills right after `memory_meta`) and
+  `a_memory_an_earlier_open_left_without_memory_ids_opens_and_takes_writes` (an earlier helper that
+  also decides by `memory_meta` already opened it and added the vector tables and the date index; a
+  helper that decides by `memory_fts` adds only the vector tables); in both the next open takes
+  writes, and the writer and a separate reader read them back.*
 - **Build cost on an existing memory:** once, on the first open. It reads the dates alone: about
   0.1 s for 300,000 dates on an Apple Silicon Mac.
 - **Ongoing cost:** each memory write and removal also updates the index. The index takes about 15
