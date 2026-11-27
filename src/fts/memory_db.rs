@@ -55,38 +55,7 @@ pub fn init_memory_database(conn: &Connection) -> anyhow::Result<()> {
     log::info!("Initializing memory database schema");
 
     set_memory_writer_pragmas(conn)?;
-
-    // Memory schema: simpler than email (no cc, bcc, attachments, etc.)
-    // Fields:
-    // - memId: unique identifier (e.g., "chat:sessionId:turnIndex" or "kb:hash")
-    // - role: "user" or "assistant" (or "kb" for knowledge base entries)
-    // - content: the actual text content
-    // - sessionId: chat session identifier (for grouping turns)
-    conn.execute_batch(&format!(
-        r#"
-        CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
-            memId,
-            role,
-            content,
-            sessionId,
-            tokenize = "{tokenize}",
-            prefix = '{prefix}'
-        );
-
-        CREATE TABLE IF NOT EXISTS memory_meta (
-            rowid INTEGER PRIMARY KEY,
-            dateMs INTEGER NOT NULL,
-            sessionId TEXT,
-            turnIndex INTEGER
-        );
-
-        CREATE TABLE IF NOT EXISTS memory_ids (
-            memId TEXT PRIMARY KEY
-        );
-        "#,
-        tokenize = config::sqlite::FTS_TOKENIZE,
-        prefix = config::sqlite::FTS_PREFIXES
-    ))?;
+    create_memory_tables(conn)?;
     conn.execute_batch(MEMORY_META_DATE_INDEX)?;
 
     // FTS5 automerge settings
@@ -118,6 +87,45 @@ pub fn init_memory_database(conn: &Connection) -> anyhow::Result<()> {
     ))?;
 
     log::info!("Memory database schema initialized (5 tables: memory_fts, memory_meta, memory_ids, memory_vec, embed_cache)");
+    Ok(())
+}
+
+/// Creates the memory's three entry tables, each only if it is missing. A new memory gets them in
+/// `init_memory_database`; every open of an existing one runs them again, so a memory whose first
+/// setup stopped partway (a full disk, a crash: each statement commits on its own) is completed
+/// instead of failing every write (#42).
+fn create_memory_tables(conn: &Connection) -> anyhow::Result<()> {
+    // Memory schema: simpler than email (no cc, bcc, attachments, etc.)
+    // Fields:
+    // - memId: unique identifier (e.g., "chat:sessionId:turnIndex" or "kb:hash")
+    // - role: "user" or "assistant" (or "kb" for knowledge base entries)
+    // - content: the actual text content
+    // - sessionId: chat session identifier (for grouping turns)
+    conn.execute_batch(&format!(
+        r#"
+        CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+            memId,
+            role,
+            content,
+            sessionId,
+            tokenize = "{tokenize}",
+            prefix = '{prefix}'
+        );
+
+        CREATE TABLE IF NOT EXISTS memory_meta (
+            rowid INTEGER PRIMARY KEY,
+            dateMs INTEGER NOT NULL,
+            sessionId TEXT,
+            turnIndex INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS memory_ids (
+            memId TEXT PRIMARY KEY
+        );
+        "#,
+        tokenize = config::sqlite::FTS_TOKENIZE,
+        prefix = config::sqlite::FTS_PREFIXES
+    ))?;
     Ok(())
 }
 
@@ -201,7 +209,8 @@ pub fn open_or_create_memory_db(fts_dir: &Path) -> anyhow::Result<(PathBuf, Conn
 
     // Check if schema exists. memory_meta is created after memory_fts, so a memory whose creation
     // stopped between them (a full disk, a crash) is completed by init's IF NOT EXISTS statements
-    // instead of failing the date index below on every start.
+    // instead of failing the date index below on every start. One that stopped after memory_meta
+    // is completed by `create_memory_tables` below (#42).
     let exists: Option<String> = conn
         .query_row(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='memory_meta'",
@@ -216,6 +225,8 @@ pub fn open_or_create_memory_db(fts_dir: &Path) -> anyhow::Result<(PathBuf, Conn
     } else {
         log::info!("Using existing memory database schema");
         set_memory_writer_pragmas(&conn)?;
+        // A first setup that stopped after memory_meta left memory_ids out, and every write needs it.
+        create_memory_tables(&conn)?;
         // Migrate: add vector tables if missing (pre-v0.7.0 databases)
         ensure_memory_vector_tables(&conn)?;
         // A memory written before the date index gets it here, built once from the dates alone.
@@ -3169,6 +3180,75 @@ pub(crate) mod tests {
         assert_eq!(listed.iter().map(|r| r["memId"].as_str().unwrap()).collect::<Vec<_>>(), ["turn:1", "turn:0"]);
         assert_eq!(memory_read_by_timestamp(&conn, now, 0).unwrap()[0]["content"], "exchange 0");
         drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The names of the schema objects of `kind` among `names` in `conn`'s file, sorted.
+    fn schema_names(conn: &Connection, kind: &str, names: &[&str]) -> Vec<String> {
+        let mut found: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = ?1").unwrap()
+            .query_map([kind], |r| r.get(0)).unwrap().map(|r| r.unwrap())
+            .filter(|name: &String| names.contains(&name.as_str()))
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// A memory whose first setup stopped after `memory_meta`: the disk filled before `memory_ids`.
+    /// Returns its folder and its file.
+    fn memory_stopped_after_meta(name: &str) -> (PathBuf, PathBuf) {
+        let (dir, conn) = temp_memory_db(name);
+        drop(conn);
+        let db = dir.join("memory.db");
+        crate::fts::db::delete_database_files(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("PRAGMA max_page_count = 7;").unwrap();
+        assert!(init_memory_database(&conn).is_err(), "the disk fills during creation");
+        let tables = schema_names(&conn, "table", &["memory_fts", "memory_meta", "memory_ids"]);
+        assert_eq!(tables, ["memory_fts", "memory_meta"], "the creation stopped after memory_meta");
+        (dir, db)
+    }
+
+    /// The writer's open of the memory in `dir` takes two entries; the writer and a separate reader
+    /// both read them back.
+    fn open_takes_writes_and_a_reader_sees_them(dir: &Path, db: &Path) {
+        let (_path, mut conn) = open_or_create_memory_db(dir).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        short_entries(&mut conn, now, 2);
+        let listing = serde_json::json!({ "ignoreDate": true, "limit": 10 });
+        let listed = memory_search(&conn, "", &listing, &SynonymLookup::new(), None).unwrap();
+        assert_eq!(listed.iter().map(|r| r["memId"].as_str().unwrap()).collect::<Vec<_>>(), ["turn:1", "turn:0"]);
+        assert_eq!(memory_read_by_timestamp(&conn, now + 1, 0).unwrap()[0]["content"], "exchange 1");
+        let reader = open_read_only_memory_connection(db).unwrap();
+        let seen = memory_search(&reader, "", &listing, &SynonymLookup::new(), None).unwrap();
+        assert_eq!(seen.iter().map(|r| r["memId"].as_str().unwrap()).collect::<Vec<_>>(), ["turn:1", "turn:0"],
+            "a separate reader sees the committed entries");
+    }
+
+    /// A memory whose first setup stopped after `memory_meta` counts as an existing memory, so the
+    /// open must still give it the tables every write needs: the next open takes writes, without a
+    /// clear (#42).
+    #[test]
+    fn a_memory_whose_creation_stopped_after_memory_meta_opens_and_takes_writes() {
+        let (dir, db) = memory_stopped_after_meta("stopped-after-meta");
+        open_takes_writes_and_a_reader_sees_them(&dir, &db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The same memory after an earlier helper's open, which added the vector tables and the date
+    /// index but still left `memory_ids` out: a file users may already have. The open completes it
+    /// too (#42).
+    #[test]
+    fn a_memory_an_earlier_open_left_without_memory_ids_opens_and_takes_writes() {
+        let (dir, db) = memory_stopped_after_meta("opened-without-ids");
+        let conn = Connection::open(&db).unwrap();
+        ensure_memory_vector_tables(&conn).unwrap();
+        conn.execute_batch(MEMORY_META_DATE_INDEX).unwrap();
+        let tables = schema_names(&conn, "table", &["memory_vec", "embed_cache", "memory_ids"]);
+        assert_eq!(tables, ["embed_cache", "memory_vec"], "the earlier open added the vector tables, not memory_ids");
+        assert_eq!(schema_names(&conn, "index", &["memory_meta_dateMs"]), ["memory_meta_dateMs"], "and the date index");
+        drop(conn);
+        open_takes_writes_and_a_reader_sees_them(&dir, &db);
         let _ = std::fs::remove_dir_all(dir);
     }
 
